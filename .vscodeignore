@@ -1,0 +1,9 @@
+.vscode/**
+src/**
+webview/**
+esbuild.mjs
+tsconfig.json
+.gitignore
+ai-dev-environment.md
+dist/**/*.map
+**/*.vsix

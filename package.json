@@ -1,0 +1,254 @@
+{
+  "name": "agent-hub",
+  "displayName": "Agent Hub",
+  "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
+  "version": "0.0.15",
+  "publisher": "marse",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentHub",
+          "title": "Agent Hub",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "agentHub": [
+        {
+          "type": "webview",
+          "id": "agentHub.chat",
+          "name": "Чат"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "agentHub.newSession",
+        "title": "Agent Hub: Новая сессия",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agentHub.addProject",
+        "title": "Agent Hub: Добавить проект"
+      },
+      {
+        "command": "agentHub.setServerPassword",
+        "title": "Agent Hub: Задать пароль сервера проекта"
+      },
+      {
+        "command": "agentHub.editProject",
+        "title": "Agent Hub: Настройки проекта"
+      },
+      {
+        "command": "agentHub.exportSettings",
+        "title": "Agent Hub: Экспорт настроек в JSON"
+      },
+      {
+        "command": "agentHub.importSettings",
+        "title": "Agent Hub: Импорт настроек из JSON"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "agentHub.newSession",
+          "when": "view == agentHub.chat",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Agent Hub",
+      "properties": {
+        "agentHub.autoAllowTools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Имена инструментов, которые разрешаются без подтверждения (например WebSearch, WebFetch)."
+        },
+        "agentHub.projects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Название проекта"
+              },
+              "path": {
+                "type": "string",
+                "description": "Абсолютный путь к папке проекта (можно с ~)"
+              },
+              "githubRepo": {
+                "type": "string",
+                "description": "GitHub-репозиторий проекта (URL или git@…)"
+              },
+              "branch": {
+                "type": "string",
+                "description": "Основная рабочая ветка git, например main или develop"
+              },
+              "serverHost": {
+                "type": "string",
+                "description": "Хост или SSH-алиас сервера, например «1.2.3.4» или «proj1»"
+              },
+              "serverUser": {
+                "type": "string",
+                "description": "Логин на сервере, например «deploy»"
+              },
+              "server": {
+                "type": "string",
+                "description": "Заметки о сервере: логи, способ деплоя и т.п. Пароль здесь не хранить — используйте команду «Agent Hub: Задать пароль сервера проекта»"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          },
+          "default": [],
+          "description": "Реестр проектов: папка, GitHub-репозиторий, сервер. Папки открытого workspace добавляются в список автоматически."
+        },
+        "agentHub.claude.model": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Модель Claude для агента. Пусто — как настроено в CLI `claude`. Примеры: `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5`."
+        },
+        "agentHub.claude.effort": {
+          "type": "string",
+          "enum": [
+            "",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "",
+          "description": "Уровень усилий (глубина размышлений) Claude. Пусто — по умолчанию."
+        },
+        "agentHub.claude.permissionMode": {
+          "type": "string",
+          "enum": [
+            "default",
+            "acceptEdits",
+            "bypassPermissions"
+          ],
+          "enumDescriptions": [
+            "Подтверждение всех опасных операций (карточки)",
+            "Правки файлов без подтверждения, остальное — с карточками",
+            "БЕЗ каких-либо подтверждений (опасно!)"
+          ],
+          "default": "default",
+          "description": "Режим разрешений Claude."
+        },
+        "agentHub.claude.maxTurns": {
+          "type": "number",
+          "default": 0,
+          "description": "Максимум шагов агента Claude за один ход. 0 — без лимита."
+        },
+        "agentHub.claude.contextWindow": {
+          "type": "number",
+          "default": 0,
+          "description": "Окно контекста Claude в токенах для индикатора. 0 — автоматически по модели (haiku — 200k, остальные — 1M)."
+        },
+        "agentHub.codex.model": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Модель для Codex (`codex exec -m …`). Пусто — как настроено в `~/.codex/config.toml`."
+        },
+        "agentHub.codex.effort": {
+          "type": "string",
+          "enum": [
+            "",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "default": "",
+          "description": "model_reasoning_effort для Codex. Пусто — по умолчанию."
+        },
+        "agentHub.codex.yolo": {
+          "type": "boolean",
+          "default": false,
+          "description": "YOLO-режим Codex: --dangerously-bypass-approvals-and-sandbox — команды выполняются БЕЗ песочницы и подтверждений. Опасно! Перекрывает настройку sandbox."
+        },
+        "agentHub.codex.sandbox": {
+          "type": "string",
+          "enum": [
+            "read-only",
+            "workspace-write",
+            "danger-full-access"
+          ],
+          "default": "workspace-write",
+          "description": "Песочница Codex: read-only — только чтение; workspace-write — запись в папку проекта; danger-full-access — без ограничений (опасно!)."
+        },
+        "agentHub.codex.contextWindow": {
+          "type": "number",
+          "default": 0,
+          "description": "Окно контекста Codex в токенах для индикатора. 0 — автоматически (400k)."
+        },
+        "agentHub.journalDir": {
+          "type": "string",
+          "default": "docs/journal",
+          "description": "Папка журнала сессий относительно корня проекта. Журнал — общая память между агентами и устройствами."
+        },
+        "agentHub.journalContextEntries": {
+          "type": "number",
+          "default": 3,
+          "description": "Сколько последних записей журнала подкладывать в контекст новой сессии."
+        },
+        "agentHub.autoAllowBash": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "git status",
+            "git diff",
+            "git log",
+            "ls"
+          ],
+          "description": "Префиксы bash-команд, которые разрешаются без подтверждения. Точное совпадение или префикс до пробела: «git status» разрешит «git status -s», но не «git statusx»."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.228",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@types/vscode": "^1.125.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}
