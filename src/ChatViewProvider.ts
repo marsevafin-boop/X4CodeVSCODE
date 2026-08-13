@@ -190,7 +190,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return `agentHub.serverPassword:${projectPath}`;
   }
 
-  /** Диалог добавления проекта: папка → имя → GitHub → ветка → сервер → доступ. */
+  /**
+   * Добавление проекта: единственный нативный шаг — выбор папки. Запись
+   * создаётся сразу, дальше все поля заполняются в форме настроек панели —
+   * она не сбрасывается при переключении окон.
+   */
   async addProject() {
     const picked = await vscode.window.showOpenDialog({
       canSelectFiles: false,
@@ -201,101 +205,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!picked?.[0]) return;
     const path = picked[0].fsPath;
 
-    const name = await vscode.window.showInputBox({
-      prompt: "Название проекта",
-      value: nodePath.basename(path),
-    });
-    if (name === undefined) return;
-
-    const githubRepo = await vscode.window.showInputBox({
-      prompt: "GitHub-репозиторий (необязательно)",
-      placeHolder: "https://github.com/user/repo или git@github.com:user/repo.git",
-    });
-    if (githubRepo === undefined) return;
-
-    const branch = await vscode.window.showInputBox({
-      prompt: "Основная рабочая ветка git (необязательно)",
-      placeHolder: "например: main или develop",
-    });
-    if (branch === undefined) return;
-
-    const serverHost = await vscode.window.showInputBox({
-      prompt: "Сервер проекта: хост или SSH-алиас (необязательно)",
-      placeHolder: "например: 1.2.3.4 или proj1 из ~/.ssh/config",
-    });
-    if (serverHost === undefined) return;
-
-    let serverProtocol: ProjectInfo["serverProtocol"];
-    let serverPort: number | undefined;
-    let serverUser: string | undefined;
-    let password: string | undefined;
-    if (serverHost) {
-      const protoPick = await vscode.window.showQuickPick(
-        [
-          { label: "SSH", description: "полный доступ к шеллу (по умолчанию)", value: "ssh" as const },
-          { label: "SFTP", description: "передача файлов поверх SSH (шелла может не быть)", value: "sftp" as const },
-          { label: "FTP", description: "классический FTP (обычный хостинг)", value: "ftp" as const },
-        ],
-        { placeHolder: "Протокол доступа к серверу" },
-      );
-      if (!protoPick) return;
-      serverProtocol = protoPick.value;
-
-      const portStr = await vscode.window.showInputBox({
-        prompt: "Порт (необязательно; пусто — стандартный)",
-        placeHolder: serverProtocol === "ftp" ? "21" : "22",
-        validateInput: (v) =>
-          v && (!/^\d+$/.test(v) || +v < 1 || +v > 65535) ? "Порт: число 1–65535" : null,
-      });
-      if (portStr === undefined) return;
-      if (portStr) serverPort = parseInt(portStr, 10);
-    }
-    if (serverHost) {
-      serverUser = await vscode.window.showInputBox({
-        prompt: "Логин на сервере (необязательно)",
-        placeHolder: "например: deploy",
-      });
-      if (serverUser === undefined) return;
-
-      password = await vscode.window.showInputBox({
-        prompt:
-          "Пароль сервера (необязательно; хранится в защищённом хранилище VS Code, в диалог агента не попадает)",
-        password: true,
-        placeHolder: "пусто — без пароля (SSH-ключи предпочтительнее)",
-      });
-      if (password === undefined) return;
-    }
-
-    const server = await vscode.window.showInputBox({
-      prompt: "Заметки о сервере (необязательно)",
-      placeHolder: "например: прод, логи в /var/log/app, деплой ./deploy.sh",
-    });
-    if (server === undefined) return;
-
     const cfg = vscode.workspace.getConfiguration("agentHub");
     const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
-    const entry: ProjectInfo = {
-      name: name || nodePath.basename(path),
-      path,
-      ...(githubRepo ? { githubRepo } : {}),
-      ...(branch ? { branch } : {}),
-      ...(serverHost ? { serverHost } : {}),
-      ...(serverProtocol && serverProtocol !== "ssh" ? { serverProtocol } : {}),
-      ...(serverPort ? { serverPort } : {}),
-      ...(serverUser ? { serverUser } : {}),
-      ...(server ? { server } : {}),
-    };
     const existing = list.findIndex((p) => p.path === path);
-    if (existing >= 0) list[existing] = entry;
-    else list.push(entry);
-
-    await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
-    if (password) {
-      await this.context.secrets.store(this.passwordKey(path), password);
+    if (existing < 0) {
+      list.push({ name: nodePath.basename(path), path });
+      await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
     }
     await this.context.globalState.update(ACTIVE_PROJECT_KEY, path);
     this.postFullState();
-    this.post({ type: "info", text: `Проект «${entry.name}» добавлен и выбран.` });
+    await this.postSettings();
+    // Открываем экран настроек панели: название, GitHub, ветка, сервер,
+    // пароль — всё заполняется там, без риска потерять ввод.
+    this.post({ type: "openSettingsScreen" });
+    this.post({
+      type: "info",
+      text: `Проект «${nodePath.basename(path)}» добавлен и выбран. Заполните детали в настройках (⚙) и нажмите «Сохранить».`,
+    });
   }
 
   /** Ручное редактирование полей активного проекта. */
@@ -338,7 +264,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           action: "delete" as const,
         },
       ],
-      { placeHolder: `Проект «${active.name}» — что изменить?` },
+      { placeHolder: `Проект «${active.name}» — что изменить?`, ignoreFocusOut: true },
     );
     if (!pick) return;
 
@@ -355,7 +281,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           { label: "SFTP", description: "файлы поверх SSH", value: "sftp" as const },
           { label: "FTP", description: "классический FTP", value: "ftp" as const },
         ],
-        { placeHolder: `Протокол сервера для «${active.name}»` },
+        { placeHolder: `Протокол сервера для «${active.name}»`, ignoreFocusOut: true },
       );
       if (!protoPick) return;
       const entry: ProjectInfo = idx >= 0 ? { ...list[idx] } : { ...active };
@@ -391,6 +317,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       prompt: `${field.label} — проект «${active.name}» (пусто — очистить поле)`,
       value: String(active[field.key] ?? ""),
       placeHolder: field.placeholder,
+      ignoreFocusOut: true,
       validateInput:
         field.key === "serverPort"
           ? (v) => (v && (!/^\d+$/.test(v) || +v < 1 || +v > 65535) ? "Порт: число 1–65535" : null)
@@ -791,13 +718,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     const pick = await vscode.window.showQuickPick(
       projects.map((p) => ({ label: p.name, description: p.serverHost ?? p.path, path: p.path })),
-      { placeHolder: "Проект, для которого задать пароль сервера" },
+      { placeHolder: "Проект, для которого задать пароль сервера", ignoreFocusOut: true },
     );
     if (!pick) return;
 
     const password = await vscode.window.showInputBox({
       prompt: `Пароль сервера для «${pick.label}» (пусто — удалить сохранённый)`,
       password: true,
+      ignoreFocusOut: true,
     });
     if (password === undefined) return;
 

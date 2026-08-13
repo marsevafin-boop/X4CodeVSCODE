@@ -263,6 +263,9 @@ export function App() {
         case "configJsonResult":
           setConfigResult({ ok: msg.ok, message: msg.message });
           break;
+        case "openSettingsScreen":
+          setSettingsOpen(true);
+          break;
         case "attachmentAdded":
           setPending((prev) => [
             ...prev,

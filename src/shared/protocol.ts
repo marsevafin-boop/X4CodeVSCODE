@@ -98,7 +98,8 @@ export type HostToWebview =
   | { type: "attachmentAdded"; files: Attachment[] }
   | { type: "serverTestResult"; ok: boolean; message: string }
   | { type: "configJson"; json: string }
-  | { type: "configJsonResult"; ok: boolean; message: string };
+  | { type: "configJsonResult"; ok: boolean; message: string }
+  | { type: "openSettingsScreen" };
 
 /** Снимок всех настроек для экрана настроек внутри панели. */
 export interface SettingsSnapshot {
