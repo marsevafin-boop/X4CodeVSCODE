@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as nodePath from "node:path";
@@ -57,6 +57,32 @@ function buildAttachmentsBlock(attachments: Attachment[]): string {
     (a) => `- ${a.path}${isImagePath(a.path) ? " (изображение — открой и рассмотри)" : ""}`,
   );
   return `Приложенные файлы:\n${lines.join("\n")}`;
+}
+
+/** Валидация и нормализация списка проектов из внешнего JSON. */
+function normalizeProjects(raw: unknown[]): ProjectInfo[] {
+  const out: ProjectInfo[] = [];
+  for (const item of raw) {
+    const p = item as Partial<ProjectInfo>;
+    if (!p || typeof p.path !== "string" || !p.path.trim()) continue;
+    const proto = p.serverProtocol;
+    const port =
+      typeof p.serverPort === "number" && p.serverPort >= 1 && p.serverPort <= 65535
+        ? p.serverPort
+        : undefined;
+    out.push({
+      name: typeof p.name === "string" && p.name ? p.name : nodePath.basename(p.path),
+      path: p.path,
+      ...(typeof p.githubRepo === "string" && p.githubRepo ? { githubRepo: p.githubRepo } : {}),
+      ...(typeof p.branch === "string" && p.branch ? { branch: p.branch } : {}),
+      ...(typeof p.serverHost === "string" && p.serverHost ? { serverHost: p.serverHost } : {}),
+      ...(proto === "ssh" || proto === "sftp" || proto === "ftp" ? { serverProtocol: proto } : {}),
+      ...(port ? { serverPort: port } : {}),
+      ...(typeof p.serverUser === "string" && p.serverUser ? { serverUser: p.serverUser } : {}),
+      ...(typeof p.server === "string" && p.server ? { server: p.server } : {}),
+    });
+  }
+  return out;
 }
 
 /** Сессия «непустая», только если пользователь что-то написал (служебные строки не в счёт). */
@@ -136,6 +162,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         githubRepo: p.githubRepo,
         branch: p.branch,
         serverHost: p.serverHost,
+        serverProtocol: p.serverProtocol,
+        serverPort: p.serverPort,
         serverUser: p.serverUser,
         server: p.server,
       });
@@ -197,8 +225,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
     if (serverHost === undefined) return;
 
+    let serverProtocol: ProjectInfo["serverProtocol"];
+    let serverPort: number | undefined;
     let serverUser: string | undefined;
     let password: string | undefined;
+    if (serverHost) {
+      const protoPick = await vscode.window.showQuickPick(
+        [
+          { label: "SSH", description: "полный доступ к шеллу (по умолчанию)", value: "ssh" as const },
+          { label: "SFTP", description: "передача файлов поверх SSH (шелла может не быть)", value: "sftp" as const },
+          { label: "FTP", description: "классический FTP (обычный хостинг)", value: "ftp" as const },
+        ],
+        { placeHolder: "Протокол доступа к серверу" },
+      );
+      if (!protoPick) return;
+      serverProtocol = protoPick.value;
+
+      const portStr = await vscode.window.showInputBox({
+        prompt: "Порт (необязательно; пусто — стандартный)",
+        placeHolder: serverProtocol === "ftp" ? "21" : "22",
+        validateInput: (v) =>
+          v && (!/^\d+$/.test(v) || +v < 1 || +v > 65535) ? "Порт: число 1–65535" : null,
+      });
+      if (portStr === undefined) return;
+      if (portStr) serverPort = parseInt(portStr, 10);
+    }
     if (serverHost) {
       serverUser = await vscode.window.showInputBox({
         prompt: "Логин на сервере (необязательно)",
@@ -229,6 +280,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ...(githubRepo ? { githubRepo } : {}),
       ...(branch ? { branch } : {}),
       ...(serverHost ? { serverHost } : {}),
+      ...(serverProtocol && serverProtocol !== "ssh" ? { serverProtocol } : {}),
+      ...(serverPort ? { serverPort } : {}),
       ...(serverUser ? { serverUser } : {}),
       ...(server ? { server } : {}),
     };
@@ -259,6 +312,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       { key: "githubRepo", label: "GitHub-репозиторий", placeholder: "https://github.com/user/repo" },
       { key: "branch", label: "Рабочая ветка git", placeholder: "main" },
       { key: "serverHost", label: "Хост / SSH-алиас сервера", placeholder: "1.2.3.4 или proj1" },
+      { key: "serverPort", label: "Порт сервера", placeholder: "пусто — стандартный (22 / 21)" },
       { key: "serverUser", label: "Логин на сервере", placeholder: "deploy" },
       { key: "server", label: "Заметки о сервере", placeholder: "прод, логи, деплой…" },
     ];
@@ -267,10 +321,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       [
         ...fields.map((f) => ({
           label: f.label,
-          description: (active[f.key] as string | undefined) || "— не задано —",
+          description: String(active[f.key] ?? "") || "— не задано —",
           field: f as Field | null,
           action: "edit" as const,
         })),
+        {
+          label: "Протокол сервера",
+          description: (active.serverProtocol ?? "ssh").toUpperCase(),
+          field: null,
+          action: "protocol" as const,
+        },
         {
           label: "$(trash) Удалить проект из списка",
           description: "файлы на диске не трогаем",
@@ -287,6 +347,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const idx = list.findIndex(
       (p) => p.path?.replace(/^~(?=\/|$)/, os.homedir()) === active.path,
     );
+
+    if (pick.action === "protocol") {
+      const protoPick = await vscode.window.showQuickPick(
+        [
+          { label: "SSH", description: "полный доступ к шеллу", value: "ssh" as const },
+          { label: "SFTP", description: "файлы поверх SSH", value: "sftp" as const },
+          { label: "FTP", description: "классический FTP", value: "ftp" as const },
+        ],
+        { placeHolder: `Протокол сервера для «${active.name}»` },
+      );
+      if (!protoPick) return;
+      const entry: ProjectInfo = idx >= 0 ? { ...list[idx] } : { ...active };
+      if (protoPick.value === "ssh") delete entry.serverProtocol;
+      else entry.serverProtocol = protoPick.value;
+      if (idx >= 0) list[idx] = entry;
+      else list.push(entry);
+      await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
+      this.postFullState();
+      this.post({ type: "info", text: `Протокол сервера: ${protoPick.label}.` });
+      return;
+    }
 
     if (pick.action === "delete") {
       const ok = await vscode.window.showWarningMessage(
@@ -308,15 +389,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const field = pick.field!;
     const value = await vscode.window.showInputBox({
       prompt: `${field.label} — проект «${active.name}» (пусто — очистить поле)`,
-      value: (active[field.key] as string | undefined) ?? "",
+      value: String(active[field.key] ?? ""),
       placeHolder: field.placeholder,
+      validateInput:
+        field.key === "serverPort"
+          ? (v) => (v && (!/^\d+$/.test(v) || +v < 1 || +v > 65535) ? "Порт: число 1–65535" : null)
+          : undefined,
     });
     if (value === undefined) return;
 
     // Папки workspace, не записанные в реестр, при первом изменении попадают в него.
     const entry: ProjectInfo = idx >= 0 ? { ...list[idx] } : { ...active };
     if (value) {
-      (entry as unknown as Record<string, unknown>)[field.key] = value;
+      (entry as unknown as Record<string, unknown>)[field.key] =
+        field.key === "serverPort" ? parseInt(value, 10) : value;
     } else if (field.key === "name") {
       entry.name = nodePath.basename(active.path);
     } else {
@@ -333,46 +419,103 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // ---------- Проверка соединения с сервером ----------
 
   /**
-   * Пробуем ssh по ключам (BatchMode), при неудаче — по паролю через sshpass.
-   * Пароль уходит только в окружение процесса (SSHPASS), не в argv.
+   * Проверка соединения по выбранному протоколу.
+   * SSH/SFTP: сначала ключи (BatchMode), затем пароль через sshpass (env SSHPASS).
+   * FTP: curl, логин/пароль уходят через конфиг на stdin (-K -), не в argv.
    */
-  private async testServer(host: string, user?: string, formPassword?: string) {
+  private async testServer(
+    host: string,
+    user?: string,
+    formPassword?: string,
+    protocol: "ssh" | "sftp" | "ftp" = "ssh",
+    port?: number,
+  ) {
     const target = user ? `${user}@${host}` : host;
-    const probe = "echo AGENT_HUB_OK && uname -sr";
     const shortErr = (s: string) => {
       const line = s.trim().split("\n").filter(Boolean).pop() ?? "неизвестная ошибка";
       return line.length > 220 ? line.slice(0, 220) + "…" : line;
     };
-    const run = (
-      cmd: string,
-      args: string[],
-      env?: NodeJS.ProcessEnv,
-    ): Promise<{ code: number; out: string; err: string; timedOut: boolean }> =>
-      new Promise((resolve) => {
-        execFile(cmd, args, { timeout: 15000, env: env ?? process.env }, (error, stdout, stderr) => {
-          const killed = Boolean(error && (error as { killed?: boolean }).killed);
-          resolve({
-            code: error ? 1 : 0,
-            out: String(stdout),
-            err: String(stderr),
-            timedOut: killed,
-          });
-        });
-      });
     const report = (ok: boolean, message: string) =>
       this.post({ type: "serverTestResult", ok, message });
 
-    // 1) SSH-ключи / алиас из ~/.ssh/config.
-    const key = await run("ssh", [
-      "-o", "BatchMode=yes",
+    const spawnRun = (
+      cmd: string,
+      args: string[],
+      opts?: { stdin?: string; env?: NodeJS.ProcessEnv },
+    ): Promise<{ code: number; out: string; err: string; timedOut: boolean }> =>
+      new Promise((resolve) => {
+        const child = spawn(cmd, args, { env: opts?.env ?? process.env });
+        let out = "";
+        let err = "";
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGKILL");
+        }, 15000);
+        child.stdout.on("data", (d: Buffer) => (out += d.toString()));
+        child.stderr.on("data", (d: Buffer) => (err += d.toString()));
+        child.on("error", (e: Error) => {
+          clearTimeout(timer);
+          resolve({ code: 127, out, err: String(e), timedOut });
+        });
+        child.on("close", (code: number | null) => {
+          clearTimeout(timer);
+          resolve({ code: code ?? 1, out, err, timedOut });
+        });
+        if (opts?.stdin !== undefined) child.stdin.write(opts.stdin);
+        child.stdin.end();
+      });
+
+    const project = this.getActiveProject();
+    const password =
+      formPassword ||
+      (project ? await this.context.secrets.get(this.passwordKey(project.path)) : undefined);
+
+    // ---------- FTP ----------
+    if (protocol === "ftp") {
+      const hostPort = `${host}:${port ?? 21}`;
+      const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      const config = [
+        `url = "ftp://${hostPort}/"`,
+        `user = "${esc(user ?? "anonymous")}:${esc(password ?? "")}"`,
+        "list-only",
+        "connect-timeout = 8",
+        "silent",
+        "show-error",
+      ].join("\n");
+      const r = await spawnRun("curl", ["--max-time", "15", "-K", "-"], { stdin: config });
+      if (r.code === 0) {
+        const entries = r.out.split("\n").filter(Boolean).length;
+        report(true, `FTP ${hostPort} — соединение и логин OK (в корне записей: ${entries})`);
+      } else if (r.timedOut || r.code === 28) {
+        report(false, `FTP ${hostPort} — таймаут: хост недоступен или порт закрыт.`);
+      } else if (r.code === 67) {
+        report(false, `FTP ${hostPort} — сервер отверг логин/пароль.`);
+      } else if (r.code === 6 || r.code === 7) {
+        report(false, `FTP ${hostPort} — хост не найден или соединение отклонено.`);
+      } else {
+        report(false, `FTP ${hostPort} — ошибка: ${shortErr(r.err)}`);
+      }
+      return;
+    }
+
+    // ---------- SSH / SFTP ----------
+    const isSftp = protocol === "sftp";
+    const portArgs = port ? (isSftp ? ["-P", String(port)] : ["-p", String(port)]) : [];
+    const commonOpts = [
       "-o", "ConnectTimeout=8",
       "-o", "StrictHostKeyChecking=accept-new",
-      target,
-      probe,
-    ]);
-    if (key.out.includes("AGENT_HUB_OK")) {
+    ];
+    const probe = "echo AGENT_HUB_OK && uname -sr";
+
+    // 1) Ключи / алиас из ~/.ssh/config.
+    const key = isSftp
+      ? await spawnRun("sftp", ["-o", "BatchMode=yes", ...commonOpts, ...portArgs, "-b", "/dev/null", target])
+      : await spawnRun("ssh", ["-o", "BatchMode=yes", ...commonOpts, ...portArgs, target, probe]);
+    const keyOk = isSftp ? key.code === 0 : key.out.includes("AGENT_HUB_OK");
+    if (keyOk) {
       const uname = key.out.split("\n").map((l) => l.trim()).filter((l) => l && l !== "AGENT_HUB_OK")[0];
-      report(true, `${target} — доступ по SSH-ключу${uname ? ` · ${uname}` : ""}`);
+      report(true, `${protocol.toUpperCase()} ${target} — доступ по SSH-ключу${uname ? ` · ${uname}` : ""}`);
       return;
     }
     if (key.timedOut) {
@@ -380,17 +523,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // 2) Пароль: из формы или из Keychain.
-    const project = this.getActiveProject();
-    const password =
-      formPassword ||
-      (project ? await this.context.secrets.get(this.passwordKey(project.path)) : undefined);
+    // 2) Пароль через sshpass.
     if (!password) {
       report(false, `${target} — по ключу не подключилось: ${shortErr(key.err)}`);
       return;
     }
-
-    const which = await run("which", ["sshpass"]);
+    const which = await spawnRun("which", ["sshpass"]);
     if (which.code !== 0) {
       report(
         false,
@@ -400,21 +538,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const pw = await run(
-      "sshpass",
-      [
-        "-e", "ssh",
-        "-o", "ConnectTimeout=8",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "PreferredAuthentications=password,keyboard-interactive",
-        target,
-        probe,
-      ],
-      { ...process.env, SSHPASS: password },
-    );
-    if (pw.out.includes("AGENT_HUB_OK")) {
+    const env = { ...process.env, SSHPASS: password };
+    const pw = isSftp
+      ? await spawnRun(
+          "sshpass",
+          ["-e", "sftp", "-o", "BatchMode=no", ...commonOpts, ...portArgs, "-b", "-", target],
+          { stdin: "bye\n", env },
+        )
+      : await spawnRun(
+          "sshpass",
+          [
+            "-e", "ssh",
+            ...commonOpts,
+            "-o", "PreferredAuthentications=password,keyboard-interactive",
+            ...portArgs,
+            target,
+            probe,
+          ],
+          { env },
+        );
+    const pwOk = isSftp ? pw.code === 0 : pw.out.includes("AGENT_HUB_OK");
+    if (pwOk) {
       const uname = pw.out.split("\n").map((l) => l.trim()).filter((l) => l && l !== "AGENT_HUB_OK")[0];
-      report(true, `${target} — доступ по паролю${uname ? ` · ${uname}` : ""}`);
+      report(true, `${protocol.toUpperCase()} ${target} — доступ по паролю${uname && !isSftp ? ` · ${uname}` : ""}`);
       return;
     }
     report(
@@ -452,6 +598,91 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // Реестр + папки workspace — на другой машине всё станет реестром.
       projects: this.getProjects(),
     };
+  }
+
+  /** Применить блок настроек (без проектов) из внешнего объекта. */
+  private async applySettingsFields(settings: Record<string, unknown>) {
+    const cfg = vscode.workspace.getConfiguration("agentHub");
+    const g = vscode.ConfigurationTarget.Global;
+    const claude = settings.claude as Record<string, unknown> | undefined;
+    const codex = settings.codex as Record<string, unknown> | undefined;
+    const setIf = async (key: string, value: unknown, type: string) => {
+      if (typeof value === type) await cfg.update(key, value, g);
+    };
+    if (claude) {
+      await setIf("claude.model", claude.model, "string");
+      await setIf("claude.effort", claude.effort, "string");
+      await setIf("claude.permissionMode", claude.permissionMode, "string");
+      await setIf("claude.maxTurns", claude.maxTurns, "number");
+      await setIf("claude.contextWindow", claude.contextWindow, "number");
+    }
+    if (codex) {
+      await setIf("codex.model", codex.model, "string");
+      await setIf("codex.effort", codex.effort, "string");
+      await setIf("codex.sandbox", codex.sandbox, "string");
+      await setIf("codex.yolo", codex.yolo, "boolean");
+      await setIf("codex.contextWindow", codex.contextWindow, "number");
+    }
+    await setIf("journalDir", settings.journalDir, "string");
+    await setIf("journalContextEntries", settings.journalContextEntries, "number");
+    if (Array.isArray(settings.autoAllowTools)) {
+      await cfg.update("autoAllowTools", settings.autoAllowTools, g);
+    }
+    if (Array.isArray(settings.autoAllowBash)) {
+      await cfg.update("autoAllowBash", settings.autoAllowBash, g);
+    }
+  }
+
+  /**
+   * Применить конфиг, отредактированный прямо в настройках (JSON-редактор).
+   * Настройки перезаписываются; список проектов ЗАМЕНЯЕТСЯ целиком.
+   */
+  async applyConfigJson(json: string) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(json);
+    } catch (err) {
+      this.post({
+        type: "configJsonResult",
+        ok: false,
+        message: `Некорректный JSON: ${err instanceof Error ? err.message : err}`,
+      });
+      return;
+    }
+
+    // Принимаем и обёртку {settings: {...}}, и «голый» объект настроек.
+    const wrapped = (parsed as { settings?: unknown }).settings;
+    const settings =
+      wrapped && typeof wrapped === "object"
+        ? (wrapped as Record<string, unknown>)
+        : (parsed as Record<string, unknown>);
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+      this.post({
+        type: "configJsonResult",
+        ok: false,
+        message: "Ожидается объект настроек (как в поле выше) или {\"settings\": {...}}.",
+      });
+      return;
+    }
+
+    await this.applySettingsFields(settings);
+
+    let projectsNote = "";
+    if (Array.isArray(settings.projects)) {
+      const list = normalizeProjects(settings.projects);
+      await vscode.workspace
+        .getConfiguration("agentHub")
+        .update("projects", list, vscode.ConfigurationTarget.Global);
+      projectsNote = ` Проектов в реестре: ${list.length}.`;
+    }
+
+    this.postFullState();
+    await this.postSettings();
+    this.post({
+      type: "configJsonResult",
+      ok: true,
+      message: `Конфиг применён.${projectsNote}`,
+    });
   }
 
   /** Экспорт абсолютно всех настроек в JSON-файл. */
@@ -505,33 +736,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const g = vscode.ConfigurationTarget.Global;
 
     if (settings && typeof settings === "object") {
-      const claude = settings.claude as Record<string, unknown> | undefined;
-      const codex = settings.codex as Record<string, unknown> | undefined;
-      const setIf = async (key: string, value: unknown, type: string) => {
-        if (typeof value === type) await cfg.update(key, value, g);
-      };
-      if (claude) {
-        await setIf("claude.model", claude.model, "string");
-        await setIf("claude.effort", claude.effort, "string");
-        await setIf("claude.permissionMode", claude.permissionMode, "string");
-        await setIf("claude.maxTurns", claude.maxTurns, "number");
-        await setIf("claude.contextWindow", claude.contextWindow, "number");
-      }
-      if (codex) {
-        await setIf("codex.model", codex.model, "string");
-        await setIf("codex.effort", codex.effort, "string");
-        await setIf("codex.sandbox", codex.sandbox, "string");
-        await setIf("codex.yolo", codex.yolo, "boolean");
-        await setIf("codex.contextWindow", codex.contextWindow, "number");
-      }
-      await setIf("journalDir", settings.journalDir, "string");
-      await setIf("journalContextEntries", settings.journalContextEntries, "number");
-      if (Array.isArray(settings.autoAllowTools)) {
-        await cfg.update("autoAllowTools", settings.autoAllowTools, g);
-      }
-      if (Array.isArray(settings.autoAllowBash)) {
-        await cfg.update("autoAllowBash", settings.autoAllowBash, g);
-      }
+      await this.applySettingsFields(settings);
     }
 
     const raw = Array.isArray(parsed)
@@ -542,20 +747,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           ? (root.projects as unknown[])
           : [];
 
-    const incoming: ProjectInfo[] = [];
-    for (const item of raw) {
-      const p = item as Partial<ProjectInfo>;
-      if (!p || typeof p.path !== "string" || !p.path.trim()) continue;
-      incoming.push({
-        name: typeof p.name === "string" && p.name ? p.name : nodePath.basename(p.path),
-        path: p.path,
-        ...(typeof p.githubRepo === "string" && p.githubRepo ? { githubRepo: p.githubRepo } : {}),
-        ...(typeof p.branch === "string" && p.branch ? { branch: p.branch } : {}),
-        ...(typeof p.serverHost === "string" && p.serverHost ? { serverHost: p.serverHost } : {}),
-        ...(typeof p.serverUser === "string" && p.serverUser ? { serverUser: p.serverUser } : {}),
-        ...(typeof p.server === "string" && p.server ? { server: p.server } : {}),
-      });
-    }
+    const incoming = normalizeProjects(raw);
 
     let added = 0;
     let updated = 0;
@@ -628,15 +820,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       );
     }
     if (p.serverHost) {
+      const proto = p.serverProtocol ?? "ssh";
       const target = p.serverUser ? `${p.serverUser}@${p.serverHost}` : p.serverHost;
-      lines.push(`Сервер проекта: ${target} (подключение по ssh).`);
-      const password = await this.context.secrets.get(this.passwordKey(p.path));
-      if (password) {
+      const hasPassword = Boolean(await this.context.secrets.get(this.passwordKey(p.path)));
+      const passwordNote =
+        "Пароль доступен в переменных окружения AGENT_HUB_SERVER_PASSWORD и LFTP_PASSWORD — " +
+        "в текст диалога его никогда не выводи; sshpass -e и lftp --env-password берут его из окружения сами.";
+
+      if (proto === "ssh") {
+        const portFlag = p.serverPort ? ` -p ${p.serverPort}` : "";
+        lines.push(`Сервер проекта: ${target}${p.serverPort ? `, порт ${p.serverPort}` : ""} (доступ по SSH).`);
+        if (hasPassword) {
+          lines.push(
+            `${passwordNote} Для ssh с паролем: sshpass -e ssh${portFlag} ${target} '<команда>'. ` +
+              `Если sshpass недоступен — предложи установить его или настроить SSH-ключи.`,
+          );
+        }
+      } else if (proto === "sftp") {
+        const portFlag = p.serverPort ? ` -P ${p.serverPort}` : "";
         lines.push(
-          `Пароль сервера доступен в переменной окружения AGENT_HUB_SERVER_PASSWORD ` +
-            `(в текст диалога его не выводи). Для ssh с паролем используй, например: ` +
-            `sshpass -p "$AGENT_HUB_SERVER_PASSWORD" ssh ${target} '<команда>'. ` +
-            `Если sshpass недоступен — предложи установить его или настроить SSH-ключи.`,
+          `Сервер проекта: SFTP ${target}${p.serverPort ? `, порт ${p.serverPort}` : ""}. ` +
+            `Shell-доступа может не быть — работай передачей файлов.`,
+        );
+        lines.push(
+          (hasPassword ? `${passwordNote} ` : "") +
+            `Подключение: sshpass -e sftp${portFlag} ${target} (батч-команды через -b) ` +
+            `или lftp --env-password -u ${p.serverUser ?? "user"} sftp://${p.serverHost}${p.serverPort ? `:${p.serverPort}` : ""}.`,
+        );
+      } else {
+        const hostPort = `${p.serverHost}${p.serverPort ? `:${p.serverPort}` : ""}`;
+        lines.push(`Сервер проекта: FTP ${hostPort}, логин ${p.serverUser ?? "anonymous"}.`);
+        lines.push(
+          (hasPassword ? `${passwordNote} ` : "") +
+            `Работай через curl: скачать — curl --user '${p.serverUser ?? "anonymous"}:'"$AGENT_HUB_SERVER_PASSWORD" ftp://${hostPort}/путь -o файл; ` +
+            `залить — curl -T файл --user '${p.serverUser ?? "anonymous"}:'"$AGENT_HUB_SERVER_PASSWORD" ftp://${hostPort}/папка/; ` +
+            `листинг — тот же curl без -o/-T. Либо lftp --env-password -u ${p.serverUser ?? "anonymous"} ftp://${hostPort}.`,
         );
       }
     }
@@ -803,6 +1021,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async postSettings() {
     this.post({ type: "settings", settings: await this.buildSettingsSnapshot() });
+    this.post({
+      type: "configJson",
+      json: JSON.stringify(this.collectAllSettings(), null, 2),
+    });
   }
 
   private async applySettings(s: import("./shared/protocol").SettingsSave) {
@@ -1099,10 +1321,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.exportSettings();
         break;
       case "testServer":
-        await this.testServer(msg.host, msg.user, msg.password);
+        await this.testServer(msg.host, msg.user, msg.password, msg.protocol, msg.port);
         break;
       case "importSettings":
         await this.importSettings();
+        break;
+      case "applyConfigJson":
+        await this.applyConfigJson(msg.json);
         break;
       case "saveSettings":
         await this.applySettings(msg.settings);
@@ -1217,7 +1442,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         cwd,
         resumeSessionId: sessions[agent] ?? undefined,
         signal: this.abort.signal,
-        extraEnv: serverPassword ? { AGENT_HUB_SERVER_PASSWORD: serverPassword } : undefined,
+        extraEnv: serverPassword
+          ? { AGENT_HUB_SERVER_PASSWORD: serverPassword, LFTP_PASSWORD: serverPassword }
+          : undefined,
         config: this.buildAgentConfig(agent),
         attachments: attachments.map((a) => ({ path: a.path, isImage: isImagePath(a.path) })),
         confirmTool: (toolName, input) => this.confirmTool(toolName, input),

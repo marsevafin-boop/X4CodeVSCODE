@@ -109,6 +109,8 @@ export function App() {
     status: "idle" | "pending" | "ok" | "fail";
     message: string;
   }>({ status: "idle", message: "" });
+  const [configJson, setConfigJson] = useState("");
+  const [configResult, setConfigResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [agent, setAgent] = useState<AgentId>("claude");
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState<Attachment[]>([]);
@@ -254,6 +256,12 @@ export function App() {
           break;
         case "serverTestResult":
           setServerTest({ status: msg.ok ? "ok" : "fail", message: msg.message });
+          break;
+        case "configJson":
+          setConfigJson(msg.json);
+          break;
+        case "configJsonResult":
+          setConfigResult({ ok: msg.ok, message: msg.message });
           break;
         case "attachmentAdded":
           setPending((prev) => [
@@ -482,6 +490,37 @@ export function App() {
                     />
                   </label>
                   <label className="set-row">
+                    <span>Протокол</span>
+                    <select
+                      value={form.project.serverProtocol ?? "ssh"}
+                      onChange={(e) =>
+                        up((f) => {
+                          const v = e.target.value as "ssh" | "sftp" | "ftp";
+                          f.project!.serverProtocol = v === "ssh" ? undefined : v;
+                        })
+                      }
+                    >
+                      <option value="ssh">SSH — полный доступ к шеллу</option>
+                      <option value="sftp">SFTP — файлы поверх SSH</option>
+                      <option value="ftp">FTP — классический хостинг</option>
+                    </select>
+                  </label>
+                  <label className="set-row">
+                    <span>Порт</span>
+                    <input
+                      type="number"
+                      value={form.project.serverPort ?? ""}
+                      placeholder={form.project.serverProtocol === "ftp" ? "21" : "22"}
+                      onChange={(e) =>
+                        up((f) => {
+                          const n = parseInt(e.target.value, 10);
+                          f.project!.serverPort =
+                            Number.isFinite(n) && n >= 1 && n <= 65535 ? n : undefined;
+                        })
+                      }
+                    />
+                  </label>
+                  <label className="set-row">
                     <span>Логин</span>
                     <input
                       value={form.project.serverUser ?? ""}
@@ -529,6 +568,8 @@ export function App() {
                           host: form.project!.serverHost!,
                           user: form.project!.serverUser,
                           password: newPassword || undefined,
+                          protocol: form.project!.serverProtocol ?? "ssh",
+                          port: form.project!.serverPort,
                         });
                       }}
                     >
@@ -725,6 +766,49 @@ export function App() {
               </section>
 
               <section>
+                <h3>JSON-конфиг (продвинутое)</h3>
+                <div className="set-hint">
+                  Весь текущий конфиг: настройки агентов, allowlist, журнал и все
+                  проекты. Правьте и нажмите «Применить» — проекты заменяются
+                  списком из JSON целиком. Пароли сюда не входят.
+                </div>
+                <textarea
+                  className="config-json"
+                  rows={16}
+                  spellCheck={false}
+                  value={configJson}
+                  onChange={(e) => {
+                    setConfigJson(e.target.value);
+                    setConfigResult(null);
+                  }}
+                />
+                <div className="set-actions" style={{ paddingBottom: 0 }}>
+                  <button
+                    className="send set-save"
+                    onClick={() => vscode.postMessage({ type: "applyConfigJson", json: configJson })}
+                  >
+                    Применить JSON
+                  </button>
+                  <button
+                    className="finish-btn"
+                    title="Вернуть текущее сохранённое состояние"
+                    onClick={() => {
+                      setConfigResult(null);
+                      vscode.postMessage({ type: "getSettings" });
+                    }}
+                  >
+                    Сбросить
+                  </button>
+                </div>
+                {configResult && (
+                  <div className={configResult.ok ? "test-ok" : "danger-hint"} style={{ paddingLeft: 0 }}>
+                    {configResult.ok ? "✓ " : "✗ "}
+                    {configResult.message}
+                  </div>
+                )}
+              </section>
+
+              <section>
                 <h3>Перенос настроек</h3>
                 <div className="set-actions" style={{ paddingBottom: 0 }}>
                   <button
@@ -780,7 +864,7 @@ export function App() {
                   activeProject.githubRepo,
                   activeProject.branch && `ветка: ${activeProject.branch}`,
                   activeProject.serverHost &&
-                    `сервер: ${activeProject.serverUser ? activeProject.serverUser + "@" : ""}${activeProject.serverHost}`,
+                    `сервер: ${(activeProject.serverProtocol ?? "ssh").toUpperCase()} ${activeProject.serverUser ? activeProject.serverUser + "@" : ""}${activeProject.serverHost}${activeProject.serverPort ? ":" + activeProject.serverPort : ""}`,
                 ]
                   .filter(Boolean)
                   .join("\n")

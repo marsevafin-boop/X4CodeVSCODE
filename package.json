@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.15",
+  "version": "0.0.16",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -105,6 +105,15 @@
               "serverHost": {
                 "type": "string",
                 "description": "Хост или SSH-алиас сервера, например «1.2.3.4» или «proj1»"
+              },
+              "serverProtocol": {
+                "type": "string",
+                "enum": ["ssh", "sftp", "ftp"],
+                "description": "Протокол доступа к серверу: ssh (по умолчанию), sftp или ftp"
+              },
+              "serverPort": {
+                "type": "number",
+                "description": "Порт сервера (пусто — стандартный: 22 для ssh/sftp, 21 для ftp)"
               },
               "serverUser": {
                 "type": "string",

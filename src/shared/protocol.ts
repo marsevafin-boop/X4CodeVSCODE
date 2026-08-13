@@ -15,6 +15,10 @@ export interface ProjectInfo {
   branch?: string;
   /** Хост или SSH-алиас сервера, например «1.2.3.4» или «proj1». */
   serverHost?: string;
+  /** Протокол доступа: ssh (по умолчанию), sftp или ftp. */
+  serverProtocol?: "ssh" | "sftp" | "ftp";
+  /** Порт (пусто — стандартный: 22 для ssh/sftp, 21 для ftp). */
+  serverPort?: number;
   /** Логин на сервере, например «deploy». */
   serverUser?: string;
   /** Свободные заметки о сервере: пути к логам, как деплоить и т.п. */
@@ -43,7 +47,15 @@ export type WebviewToHost =
   | { type: "getSettings" }
   | { type: "exportSettings" }
   | { type: "importSettings" }
-  | { type: "testServer"; host: string; user?: string; password?: string }
+  | { type: "applyConfigJson"; json: string }
+  | {
+      type: "testServer";
+      host: string;
+      user?: string;
+      password?: string;
+      protocol?: "ssh" | "sftp" | "ftp";
+      port?: number;
+    }
   | { type: "saveSettings"; settings: SettingsSave }
   | { type: "cycleSafety"; agent: AgentId }
   | { type: "saveTranscript"; path: string; items: unknown[] };
@@ -84,7 +96,9 @@ export type HostToWebview =
   | { type: "settings"; settings: SettingsSnapshot }
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }
   | { type: "attachmentAdded"; files: Attachment[] }
-  | { type: "serverTestResult"; ok: boolean; message: string };
+  | { type: "serverTestResult"; ok: boolean; message: string }
+  | { type: "configJson"; json: string }
+  | { type: "configJsonResult"; ok: boolean; message: string };
 
 /** Снимок всех настроек для экрана настроек внутри панели. */
 export interface SettingsSnapshot {
