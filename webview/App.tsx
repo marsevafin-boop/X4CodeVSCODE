@@ -84,26 +84,45 @@ function pluralActions(n: number): string {
   return "действий";
 }
 
+const NO_SESSIONS: Record<AgentId, string | null> = { claude: null, codex: null };
+const NO_CTX: Record<AgentId, { used: number; max: number } | null> = {
+  claude: null,
+  codex: null,
+};
+const NO_MODELS: Record<AgentId, { model: string; fallbackFrom?: string }> = {
+  claude: { model: "" },
+  codex: { model: "" },
+};
+
 export function App() {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [activePath, setActivePath] = useState<string>("");
   const [itemsByProject, setItemsByProject] = useState<Record<string, ChatItem[]>>({});
-  const [busy, setBusy] = useState(false);
-  const [activity, setActivity] = useState<string | null>(null);
-  const [elapsed, setElapsed] = useState(0);
-  const [sessions, setSessions] = useState<Record<AgentId, string | null>>({
-    claude: null,
-    codex: null,
-  });
-  const [contextUsage, setContextUsage] = useState<
-    Record<AgentId, { used: number; max: number } | null>
-  >({ claude: null, codex: null });
-  const [models, setModels] = useState<
-    Record<AgentId, { model: string; fallbackFrom?: string }>
-  >({ claude: { model: "" }, codex: { model: "" } });
+
+  // Все рабочие состояния — по проектам: ходы идут параллельно.
+  const [busyBy, setBusyBy] = useState<Record<string, boolean>>({});
+  const [activityBy, setActivityBy] = useState<Record<string, string | null>>({});
+  const [busyStartBy, setBusyStartBy] = useState<Record<string, number>>({});
+  const [queueBy, setQueueBy] = useState<
+    Record<string, { text: string; attachments: Attachment[]; agent: AgentId }[]>
+  >({});
+  const [sessionsBy, setSessionsBy] = useState<
+    Record<string, Record<AgentId, string | null>>
+  >({});
+  const [ctxBy, setCtxBy] = useState<
+    Record<string, Record<AgentId, { used: number; max: number } | null>>
+  >({});
+  const [modelsBy, setModelsBy] = useState<
+    Record<string, Record<AgentId, { model: string; fallbackFrom?: string }>>
+  >({});
+  const [clock, setClock] = useState(() => Date.now());
+
   const [safety, setSafety] = useState<
     Record<AgentId, { label: string; dangerous: boolean } | null>
   >({ claude: null, codex: null });
+  const [agent, setAgent] = useState<AgentId>("claude");
+  const [draft, setDraft] = useState("");
+  const [pending, setPending] = useState<Attachment[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [form, setForm] = useState<SettingsSnapshot | null>(null);
   const [newPassword, setNewPassword] = useState<string | undefined>(undefined);
@@ -113,23 +132,31 @@ export function App() {
   }>({ status: "idle", message: "" });
   const [configJson, setConfigJson] = useState("");
   const [configResult, setConfigResult] = useState<{ ok: boolean; message: string } | null>(null);
-  const [agent, setAgent] = useState<AgentId>("claude");
-  const [draft, setDraft] = useState("");
-  const [pending, setPending] = useState<Attachment[]>([]);
-  /** Сообщения, отправленные во время работы агента, — уходят после ответа. */
-  const [queue, setQueue] = useState<{ text: string; attachments: Attachment[] }[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const queueRef = useRef(queue);
-  queueRef.current = queue;
-  const agentRef = useRef(agent);
-  agentRef.current = agent;
 
   const activeRef = useRef(activePath);
   activeRef.current = activePath;
+  const queueRef = useRef(queueBy);
+  queueRef.current = queueBy;
+  const busyRef = useRef(busyBy);
+  busyRef.current = busyBy;
+  /** Прошлые ссылки лент — сохраняем на хост только реально изменившиеся. */
+  const prevItemsRef = useRef<Record<string, ChatItem[]>>({});
 
+  // Производные значения активного проекта.
   const items = itemsByProject[activePath] ?? [];
+  const busy = !!busyBy[activePath];
+  const activity = activityBy[activePath] ?? null;
+  const sessions = sessionsBy[activePath] ?? NO_SESSIONS;
+  const contextUsage = ctxBy[activePath] ?? NO_CTX;
+  const models = modelsBy[activePath] ?? NO_MODELS;
+  const queue = queueBy[activePath] ?? [];
   const sessionId = sessions[agent];
   const activeProject = projects.find((p) => p.path === activePath);
+  const elapsed = busy && busyStartBy[activePath]
+    ? Math.max(0, Math.floor((clock - busyStartBy[activePath]) / 1000))
+    : 0;
+
   const [openGroups, setOpenGroups] = useState<Record<number, boolean>>({});
 
   /** Лента для рендера: подряд идущие tool-чипы собраны в группы. */
@@ -150,21 +177,29 @@ export function App() {
     return out;
   }, [items]);
 
-  const toggleGroup = (id: number) =>
-    setOpenGroups((p) => ({ ...p, [id]: !p[id] }));
+  const toggleGroup = (id: number) => setOpenGroups((p) => ({ ...p, [id]: !p[id] }));
 
-  /** Все мутации ленты идут в массив активного проекта. */
-  const mutateItems = useCallback((updater: (prev: ChatItem[]) => ChatItem[]) => {
-    setItemsByProject((prev) => {
-      const path = activeRef.current;
-      if (!path) return prev;
-      return { ...prev, [path]: updater(prev[path] ?? []) };
-    });
-  }, []);
+  /** Проекты с ожидающей карточкой подтверждения/вопроса — метка ⚠️ в списке. */
+  const attentionBy = useMemo(() => {
+    const m: Record<string, boolean> = {};
+    for (const [path, list] of Object.entries(itemsByProject)) {
+      m[path] = list.some((it) => it.role === "permission" && it.status === "pending");
+    }
+    return m;
+  }, [itemsByProject]);
+
+  /** Мутация ленты УКАЗАННОГО проекта (события фоновых ходов идут в свои ленты). */
+  const mutateItems = useCallback(
+    (path: string, updater: (prev: ChatItem[]) => ChatItem[]) => {
+      if (!path) return;
+      setItemsByProject((prev) => ({ ...prev, [path]: updater(prev[path] ?? []) }));
+    },
+    [],
+  );
 
   const appendDelta = useCallback(
-    (text: string) => {
-      mutateItems((prev) => {
+    (path: string, text: string) => {
+      mutateItems(path, (prev) => {
         const last = prev[prev.length - 1];
         if (last && last.role === "assistant" && last.streaming) {
           const updated = { ...last, text: last.text + text };
@@ -176,18 +211,21 @@ export function App() {
     [mutateItems],
   );
 
-  const finalizeStreaming = useCallback(() => {
-    mutateItems((prev) =>
-      prev.map((it) =>
-        it.role === "assistant" && it.streaming ? { ...it, streaming: false } : it,
-      ),
-    );
-  }, [mutateItems]);
+  const finalizeStreaming = useCallback(
+    (path: string) => {
+      mutateItems(path, (prev) =>
+        prev.map((it) =>
+          it.role === "assistant" && it.streaming ? { ...it, streaming: false } : it,
+        ),
+      );
+    },
+    [mutateItems],
+  );
 
-  /** Фактическая отправка: пузырь в ленту + сообщение хосту. */
+  /** Фактическая отправка: пузырь в ленту проекта + сообщение хосту с меткой проекта. */
   const dispatchSend = useCallback(
-    (text: string, attachments: Attachment[]) => {
-      mutateItems((p) => [
+    (path: string, text: string, attachments: Attachment[], agentId: AgentId) => {
+      mutateItems(path, (p) => [
         ...p,
         {
           id: nextId++,
@@ -196,7 +234,7 @@ export function App() {
           ...(attachments.length ? { attachments: attachments.map((a) => a.name) } : {}),
         },
       ]);
-      vscode.postMessage({ type: "send", text, agent: agentRef.current, attachments });
+      vscode.postMessage({ type: "send", text, agent: agentId, attachments, path });
     },
     [mutateItems],
   );
@@ -204,23 +242,27 @@ export function App() {
   useEffect(() => {
     const onMessage = (e: MessageEvent<HostToWebview>) => {
       const msg = e.data;
+      // Адресат события: свой проект или активный, если метки нет.
+      const p = ("path" in msg && msg.path) || activeRef.current;
       switch (msg.type) {
         case "busy":
-          setBusy(msg.value);
-          if (!msg.value) {
-            setActivity(null);
-            finalizeStreaming();
-            // Очередь «вдогонку»: следующий промпт уходит сам.
-            const q = queueRef.current;
+          setBusyBy((prev) => ({ ...prev, [p]: msg.value }));
+          if (msg.value) {
+            setBusyStartBy((prev) => ({ ...prev, [p]: Date.now() }));
+          } else {
+            setActivityBy((prev) => ({ ...prev, [p]: null }));
+            finalizeStreaming(p);
+            // Очередь «вдогонку» этого проекта: следующий промпт уходит сам.
+            const q = queueRef.current[p] ?? [];
             if (q.length > 0) {
               const [next, ...rest] = q;
-              setQueue(rest);
-              setTimeout(() => dispatchSend(next.text, next.attachments), 60);
+              setQueueBy((prev) => ({ ...prev, [p]: rest }));
+              setTimeout(() => dispatchSend(p, next.text, next.attachments, next.agent), 60);
             }
           }
           break;
         case "activity":
-          setActivity(msg.label);
+          setActivityBy((prev) => ({ ...prev, [p]: msg.label }));
           break;
         case "projects":
           setProjects(msg.projects);
@@ -230,22 +272,37 @@ export function App() {
           const restored = msg.items as ChatItem[];
           const maxId = restored.reduce((m, it) => Math.max(m, it?.id ?? 0), 0);
           if (maxId >= nextId) nextId = maxId + 1;
-          setItemsByProject((prev) => ({ ...prev, [msg.path]: restored }));
+          setItemsByProject((prev) => {
+            // Проект стримит и локальная лента не пуста — она свежее снапшота.
+            if (busyRef.current[msg.path] && (prev[msg.path]?.length ?? 0) > 0) {
+              return prev;
+            }
+            return { ...prev, [msg.path]: restored };
+          });
           break;
         }
         case "sessionInfo":
-          setSessions((prev) => ({ ...prev, [msg.agent]: msg.sessionId }));
+          setSessionsBy((prev) => ({
+            ...prev,
+            [p]: { ...(prev[p] ?? NO_SESSIONS), [msg.agent]: msg.sessionId },
+          }));
           break;
         case "contextUsage":
-          setContextUsage((prev) => ({
+          setCtxBy((prev) => ({
             ...prev,
-            [msg.agent]: msg.max > 0 ? { used: msg.used, max: msg.max } : null,
+            [p]: {
+              ...(prev[p] ?? NO_CTX),
+              [msg.agent]: msg.max > 0 ? { used: msg.used, max: msg.max } : null,
+            },
           }));
           break;
         case "modelInfo":
-          setModels((prev) => ({
+          setModelsBy((prev) => ({
             ...prev,
-            [msg.agent]: { model: msg.model, fallbackFrom: msg.fallbackFrom },
+            [p]: {
+              ...(prev[p] ?? NO_MODELS),
+              [msg.agent]: { model: msg.model, fallbackFrom: msg.fallbackFrom },
+            },
           }));
           break;
         case "safetyInfo":
@@ -274,27 +331,27 @@ export function App() {
         case "attachmentAdded":
           setPending((prev) => [
             ...prev,
-            ...msg.files.filter((f) => !prev.some((p) => p.path === f.path)),
+            ...msg.files.filter((f) => !prev.some((x) => x.path === f.path)),
           ]);
           break;
         case "textDelta":
-          appendDelta(msg.text);
+          appendDelta(p, msg.text);
           break;
         case "assistantText":
-          finalizeStreaming();
-          mutateItems((p) => [...p, { id: nextId++, role: "assistant", text: msg.text }]);
+          finalizeStreaming(p);
+          mutateItems(p, (x) => [...x, { id: nextId++, role: "assistant", text: msg.text }]);
           break;
         case "toolUse":
-          finalizeStreaming();
-          mutateItems((p) => [
-            ...p,
+          finalizeStreaming(p);
+          mutateItems(p, (x) => [
+            ...x,
             { id: nextId++, role: "tool", toolName: msg.toolName, summary: msg.summary },
           ]);
           break;
         case "turnResult":
-          finalizeStreaming();
-          mutateItems((p) => [
-            ...p,
+          finalizeStreaming(p);
+          mutateItems(p, (x) => [
+            ...x,
             {
               id: nextId++,
               role: "meta",
@@ -306,19 +363,20 @@ export function App() {
           ]);
           break;
         case "info":
-          mutateItems((p) => [...p, { id: nextId++, role: "info", text: msg.text }]);
+          mutateItems(p, (x) => [...x, { id: nextId++, role: "info", text: msg.text }]);
           break;
         case "error":
-          finalizeStreaming();
-          mutateItems((p) => [...p, { id: nextId++, role: "error", text: msg.message }]);
+          finalizeStreaming(p);
+          mutateItems(p, (x) => [...x, { id: nextId++, role: "error", text: msg.message }]);
           break;
         case "reset":
-          mutateItems(() => []);
+          mutateItems(p, () => []);
+          setQueueBy((prev) => ({ ...prev, [p]: [] }));
           break;
         case "permissionRequest":
-          finalizeStreaming();
-          mutateItems((p) => [
-            ...p,
+          finalizeStreaming(p);
+          mutateItems(p, (x) => [
+            ...x,
             {
               id: nextId++,
               role: "permission",
@@ -333,8 +391,8 @@ export function App() {
           ]);
           break;
         case "permissionResolved":
-          mutateItems((p) =>
-            p.map((it) =>
+          mutateItems(p, (x) =>
+            x.map((it) =>
               it.role === "permission" && it.requestId === msg.requestId && it.status === "pending"
                 ? { ...it, status: msg.allow ? "allowed" : "denied" }
                 : it,
@@ -348,39 +406,43 @@ export function App() {
     return () => window.removeEventListener("message", onMessage);
   }, [appendDelta, finalizeStreaming, mutateItems, dispatchSend]);
 
-  // Лента сохраняется на хосте (globalState) — переживает перезапуски VS Code.
+  // Ленты сохраняются на хосте; шлём ТОЛЬКО изменившиеся (по ссылке) —
+  // иначе фоновый стрим мог бы перезаписать только что переключённую сессию
+  // другого проекта устаревшей копией (баг из ревью).
   useEffect(() => {
-    if (!activePath) return;
-    vscode.postMessage({
-      type: "saveTranscript",
-      path: activePath,
-      items: itemsByProject[activePath] ?? [],
-    });
-  }, [itemsByProject, activePath]);
-
-  // Секундомер для строки активности.
-  useEffect(() => {
-    if (!busy) {
-      setElapsed(0);
-      return;
+    for (const [path, projItems] of Object.entries(itemsByProject)) {
+      if (prevItemsRef.current[path] !== projItems) {
+        vscode.postMessage({ type: "saveTranscript", path, items: projItems });
+      }
     }
-    const startedAt = Date.now();
-    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
+    prevItemsRef.current = itemsByProject;
+  }, [itemsByProject]);
+
+  // Секундомер виден только у активного проекта — и тикаем только для него,
+  // чтобы фоновый ход не перерисовывал ленту каждую секунду.
+  useEffect(() => {
+    if (!busyBy[activePath]) return;
+    const timer = setInterval(() => setClock(Date.now()), 1000);
     return () => clearInterval(timer);
-  }, [busy]);
+  }, [busyBy, activePath]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [items, activity]);
 
   const answerPermission = (requestId: string, allow: boolean, answer?: string) => {
-    mutateItems((p) =>
-      p.map((it) =>
-        it.role === "permission" && it.requestId === requestId && it.status === "pending"
-          ? { ...it, status: allow ? "allowed" : "denied", ...(answer ? { answerText: answer } : {}) }
-          : it,
-      ),
-    );
+    // Карточка может лежать в любой ленте — обновляем во всех проектах.
+    setItemsByProject((prev) => {
+      const next: typeof prev = {};
+      for (const [path, list] of Object.entries(prev)) {
+        next[path] = list.map((it) =>
+          it.role === "permission" && it.requestId === requestId && it.status === "pending"
+            ? { ...it, status: allow ? "allowed" : "denied", ...(answer ? { answerText: answer } : {}) }
+            : it,
+        );
+      }
+      return next;
+    });
     vscode.postMessage({ type: "permission", requestId, allow, answer });
   };
 
@@ -389,21 +451,25 @@ export function App() {
     if (!text && pending.length === 0) return;
     const finalText = text || "Посмотри приложенные файлы.";
     const attachments = pending;
+    const path = activePath;
     setDraft("");
     setPending([]);
-    if (busy) {
-      // Агент занят — в очередь; уйдёт автоматически после ответа.
-      setQueue((q) => [...q, { text: finalText, attachments }]);
+    if (busyBy[path]) {
+      // Этот проект занят — в его очередь; уйдёт сам после ответа.
+      setQueueBy((prev) => ({
+        ...prev,
+        [path]: [...(prev[path] ?? []), { text: finalText, attachments, agent }],
+      }));
       return;
     }
-    dispatchSend(finalText, attachments);
+    dispatchSend(path, finalText, attachments, agent);
   };
 
   /** Вставка/перетаскивание файлов: байты уходят хосту, он сохраняет в проект. */
   const ingestFiles = (files: FileList | File[]) => {
     for (const file of Array.from(files)) {
       if (file.size > 20 * 1024 * 1024) {
-        mutateItems((p) => [
+        mutateItems(activePath, (p) => [
           ...p,
           { id: nextId++, role: "error", text: `«${file.name}» больше 20 МБ — прикрепите через 📎.` },
         ]);
@@ -568,7 +634,7 @@ export function App() {
                     <button
                       className="finish-btn"
                       disabled={!form.project.serverHost || serverTest.status === "pending"}
-                      title="Пробуем ssh по ключам, затем по сохранённому паролю (через sshpass)"
+                      title="Пробуем подключение по выбранному протоколу"
                       onClick={() => {
                         setServerTest({ status: "pending", message: "" });
                         vscode.postMessage({
@@ -584,9 +650,7 @@ export function App() {
                       {serverTest.status === "pending" ? "⏳ Проверяю…" : "🔌 Проверить соединение"}
                     </button>
                   </div>
-                  {serverTest.status === "ok" && (
-                    <div className="test-ok">✓ {serverTest.message}</div>
-                  )}
+                  {serverTest.status === "ok" && <div className="test-ok">✓ {serverTest.message}</div>}
                   {serverTest.status === "fail" && (
                     <div className="danger-hint" style={{ paddingLeft: 0 }}>
                       ✗ {serverTest.message}
@@ -648,8 +712,9 @@ export function App() {
                   <input
                     type="number"
                     value={form.claude.contextWindow}
+                    title="0 — автоматически по модели"
                     onChange={(e) =>
-                      up((f) => (f.claude.contextWindow = num(e.target.value, 200000)))
+                      up((f) => (f.claude.contextWindow = num(e.target.value, 0)))
                     }
                   />
                 </label>
@@ -708,8 +773,9 @@ export function App() {
                   <input
                     type="number"
                     value={form.codex.contextWindow}
+                    title="0 — автоматически"
                     onChange={(e) =>
-                      up((f) => (f.codex.contextWindow = num(e.target.value, 400000)))
+                      up((f) => (f.codex.contextWindow = num(e.target.value, 0)))
                     }
                   />
                 </label>
@@ -809,7 +875,10 @@ export function App() {
                   </button>
                 </div>
                 {configResult && (
-                  <div className={configResult.ok ? "test-ok" : "danger-hint"} style={{ paddingLeft: 0 }}>
+                  <div
+                    className={configResult.ok ? "test-ok" : "danger-hint"}
+                    style={{ paddingLeft: 0 }}
+                  >
                     {configResult.ok ? "✓ " : "✗ "}
                     {configResult.message}
                   </div>
@@ -864,7 +933,6 @@ export function App() {
           className="project-select"
           value={activePath}
           onChange={(e) => onProjectChange(e.target.value)}
-          disabled={busy}
           title={
             activeProject
               ? [
@@ -882,7 +950,8 @@ export function App() {
           {projects.length === 0 && <option value="">нет проектов</option>}
           {projects.map((p) => (
             <option key={p.path} value={p.path}>
-              📁 {p.name}
+              {attentionBy[p.path] ? "⚠️ " : busyBy[p.path] ? "⏳ " : "📁 "}
+              {p.name}
             </option>
           ))}
           <option value="__add__">＋ Добавить проект…</option>
@@ -975,7 +1044,8 @@ export function App() {
           <div className="empty">
             Спросите что-нибудь — агент работает в папке выбранного проекта: читает
             файлы, выполняет команды, коммитит. Проекты добавляются через «＋ Добавить
-            проект…» (папка, GitHub-репозиторий, сервер).
+            проект…». Пока агент работает, можно переключиться на другой проект и
+            продолжить там — ход не прервётся.
           </div>
         )}
         {rendered.map((it) => {
@@ -1155,7 +1225,12 @@ export function App() {
                 <button
                   className="attach-remove"
                   title="Убрать из очереди"
-                  onClick={() => setQueue((prev) => prev.filter((_, j) => j !== i))}
+                  onClick={() =>
+                    setQueueBy((prev) => ({
+                      ...prev,
+                      [activePath]: (prev[activePath] ?? []).filter((_, j) => j !== i),
+                    }))
+                  }
                 >
                   ✕
                 </button>
@@ -1216,7 +1291,13 @@ export function App() {
               >
                 ⏳ В очередь
               </button>
-              <button className="stop" onClick={() => vscode.postMessage({ type: "stop" })}>
+              <button
+                className="stop"
+                onClick={() => {
+                  setQueueBy((prev) => ({ ...prev, [activePath]: [] }));
+                  vscode.postMessage({ type: "stop" });
+                }}
+              >
                 ⏹ Стоп
               </button>
             </>

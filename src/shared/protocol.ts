@@ -34,7 +34,15 @@ export interface Attachment {
 /** webview → extension */
 export type WebviewToHost =
   | { type: "ready" }
-  | { type: "send"; text: string; agent: AgentId; attachments?: Attachment[] }
+  | {
+      type: "send";
+      text: string;
+      agent: AgentId;
+      attachments?: Attachment[];
+      /** Проект, в котором выполнять ход (пусто — активный). Нужен очереди
+       *  фонового проекта, чтобы не стрелять в активный. */
+      path?: string;
+    }
   | { type: "pickAttachment" }
   | { type: "saveAttachment"; name: string; dataBase64: string }
   | { type: "stop" }
@@ -60,24 +68,30 @@ export type WebviewToHost =
   | { type: "cycleSafety"; agent: AgentId }
   | { type: "saveTranscript"; path: string; items: unknown[] };
 
-/** extension → webview */
+/**
+ * extension → webview.
+ * `path` — проект-адресат события: ходы разных проектов идут параллельно,
+ * и webview маршрутизирует события в ленту/статусы своего проекта.
+ * Пустой path трактуется как «активный проект».
+ */
 export type HostToWebview =
-  | { type: "busy"; value: boolean }
-  | { type: "activity"; label: string }
-  | { type: "sessionInfo"; sessionId: string | null; agent: AgentId }
-  | { type: "textDelta"; text: string }
-  | { type: "assistantText"; text: string }
-  | { type: "toolUse"; toolName: string; summary: string }
+  | { type: "busy"; value: boolean; path?: string }
+  | { type: "activity"; label: string; path?: string }
+  | { type: "sessionInfo"; sessionId: string | null; agent: AgentId; path?: string }
+  | { type: "textDelta"; text: string; path?: string }
+  | { type: "assistantText"; text: string; path?: string }
+  | { type: "toolUse"; toolName: string; summary: string; path?: string }
   | {
       type: "turnResult";
       ok: boolean;
       costUsd?: number;
       durationMs?: number;
       numTurns?: number;
+      path?: string;
     }
-  | { type: "info"; text: string }
-  | { type: "error"; message: string }
-  | { type: "reset" }
+  | { type: "info"; text: string; path?: string }
+  | { type: "error"; message: string; path?: string }
+  | { type: "reset"; path?: string }
   | {
       type: "permissionRequest";
       requestId: string;
@@ -87,12 +101,13 @@ export type HostToWebview =
       kind: "tool" | "question";
       question?: string;
       options?: { label: string; description?: string }[];
+      path?: string;
     }
-  | { type: "permissionResolved"; requestId: string; allow: boolean }
+  | { type: "permissionResolved"; requestId: string; allow: boolean; path?: string }
   | { type: "projects"; projects: ProjectInfo[]; activePath: string }
   | { type: "transcript"; path: string; items: unknown[] }
-  | { type: "contextUsage"; agent: AgentId; used: number; max: number }
-  | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string }
+  | { type: "contextUsage"; agent: AgentId; used: number; max: number; path?: string }
+  | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string; path?: string }
   | { type: "settings"; settings: SettingsSnapshot }
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }
   | { type: "attachmentAdded"; files: Attachment[] }

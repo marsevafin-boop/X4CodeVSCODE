@@ -125,12 +125,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     claude: new ClaudeBackend(),
     codex: new CodexBackend(),
   };
-  private abort: AbortController | null = null;
-  /** Ожидающие решения пользователя запросы canUseTool: requestId → resolve. */
+  /** Запущенные ходы по проектам: путь → контроллер. Разные проекты — параллельно. */
+  private runs = new Map<string, AbortController>();
+  /** Ожидающие решения запросы canUseTool: requestId → {проект, resolve}. */
   private pendingPermissions = new Map<
     string,
-    (result: { allow: boolean; answer?: string }) => void
+    { path: string; resolve: (result: { allow: boolean; answer?: string }) => void }
   >();
+
+  /** Сообщение с меткой проекта — webview маршрутизирует в свою ленту. */
+  private postScoped(path: string, msg: HostToWebview) {
+    this.post({ ...msg, path } as HostToWebview);
+  }
+
+  /** После изменения реестра: остановить ходы проектов, которых больше нет. */
+  private abortOrphanRuns() {
+    const known = new Set(this.getProjects().map((p) => p.path));
+    for (const [path, controller] of [...this.runs]) {
+      if (!known.has(path)) {
+        controller.abort();
+        this.denyAllPending(path);
+      }
+    }
+  }
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -310,6 +327,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       await this.context.secrets.delete(this.passwordKey(active.path));
       await this.context.globalState.update(ACTIVE_PROJECT_KEY, undefined);
+      this.abortOrphanRuns();
       this.postFullState();
       return;
     }
@@ -603,6 +621,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .getConfiguration("agentHub")
         .update("projects", list, vscode.ConfigurationTarget.Global);
       projectsNote = ` Проектов в реестре: ${list.length}.`;
+      this.abortOrphanRuns();
     }
 
     this.postFullState();
@@ -882,12 +901,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (active) {
       const rec = this.getActiveRecord(active.path);
       this.post({ type: "transcript", path: active.path, items: rec?.items ?? [] });
-      this.post({ type: "sessionInfo", sessionId: rec?.agentIds.claude ?? null, agent: "claude" });
-      this.post({ type: "sessionInfo", sessionId: rec?.agentIds.codex ?? null, agent: "codex" });
+      // Скоуп обязателен: burst идёт до ре-рендера webview, и фолбэк на
+      // activeRef разложил бы состояние под старым проектом (баг из ревью).
+      this.postScoped(active.path, {
+        type: "sessionInfo",
+        sessionId: rec?.agentIds.claude ?? null,
+        agent: "claude",
+      });
+      this.postScoped(active.path, {
+        type: "sessionInfo",
+        sessionId: rec?.agentIds.codex ?? null,
+        agent: "codex",
+      });
       for (const a of ["claude", "codex"] as const) {
         const ctx = rec?.context?.[a];
-        this.post({ type: "contextUsage", agent: a, used: ctx?.used ?? 0, max: ctx?.max ?? 0 });
-        this.post({
+        this.postScoped(active.path, {
+          type: "contextUsage",
+          agent: a,
+          used: ctx?.used ?? 0,
+          max: ctx?.max ?? 0,
+        });
+        this.postScoped(active.path, {
           type: "modelInfo",
           agent: a,
           model: rec?.models?.[a] ?? "",
@@ -1064,12 +1098,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Список сессий проекта: переключение по клику, удаление корзинкой. */
   async showSessions() {
-    if (this.abort) {
-      this.post({ type: "error", message: "Дождитесь завершения текущего хода." });
-      return;
-    }
     const project = this.getActiveProject();
     if (!project) return;
+    if (this.runs.has(project.path)) {
+      this.post({ type: "error", message: "В этом проекте идёт ход — дождитесь завершения." });
+      return;
+    }
     const store = this.getProjectStore(project.path);
     this.pruneEmptySessions(store);
     await this.saveProjectStore(project.path, store);
@@ -1148,9 +1182,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // ---------- Управление сессиями ----------
 
   newSession() {
-    this.abort?.abort();
-    this.denyAllPending();
     const active = this.getActiveProject();
+    if (active) {
+      this.runs.get(active.path)?.abort();
+      this.denyAllPending(active.path);
+    }
     let keptPrevious = false;
     if (active) {
       const store = this.getProjectStore(active.path);
@@ -1178,12 +1214,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       void this.saveProjectStore(active.path, store);
     }
     this.postFullState();
-    this.post({
-      type: "info",
-      text: keptPrevious
-        ? "Новая сессия. Прошлая сохранена в истории (🕘)."
-        : "Новая сессия.",
-    });
+    if (active) {
+      this.postScoped(active.path, {
+        type: "info",
+        text: keptPrevious
+          ? "Новая сессия. Прошлая сохранена в истории (🕘)."
+          : "Новая сессия.",
+      });
+    }
   }
 
   private post(msg: HostToWebview) {
@@ -1195,15 +1233,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "ready":
         this.postFullState();
         break;
-      case "stop":
-        this.abort?.abort();
-        this.denyAllPending();
+      case "stop": {
+        const active = this.getActiveProject();
+        if (active) {
+          this.runs.get(active.path)?.abort();
+          this.denyAllPending(active.path);
+        }
         break;
+      }
       case "newSession":
         this.newSession();
         break;
       case "send":
-        await this.runTurn(msg.text, msg.agent, msg.attachments ?? []);
+        await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], msg.path);
         break;
       case "pickAttachment": {
         const picked = await vscode.window.showOpenDialog({
@@ -1271,10 +1313,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.cycleSafety(msg.agent);
         break;
       case "permission": {
-        const resolve = this.pendingPermissions.get(msg.requestId);
-        if (resolve) {
+        const pending = this.pendingPermissions.get(msg.requestId);
+        if (pending) {
           this.pendingPermissions.delete(msg.requestId);
-          resolve({ allow: msg.allow, answer: msg.answer });
+          pending.resolve({ allow: msg.allow, answer: msg.answer });
         }
         break;
       }
@@ -1312,38 +1354,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Отклонить все зависшие запросы подтверждения (стоп, новая сессия). */
-  private denyAllPending() {
-    for (const [requestId, resolve] of this.pendingPermissions) {
-      resolve({ allow: false });
-      this.post({ type: "permissionResolved", requestId, allow: false });
+  /** Отклонить зависшие подтверждения: по проекту или все (path не задан). */
+  private denyAllPending(path?: string) {
+    for (const [requestId, pending] of [...this.pendingPermissions]) {
+      if (path && pending.path !== path) continue;
+      pending.resolve({ allow: false });
+      this.pendingPermissions.delete(requestId);
+      this.postScoped(pending.path, { type: "permissionResolved", requestId, allow: false });
     }
-    this.pendingPermissions.clear();
   }
 
-  private async runTurn(prompt: string, agent: AgentId, attachments: Attachment[] = []) {
-    if (this.abort) {
-      this.post({ type: "error", message: "Агент ещё работает. Дождитесь ответа или нажмите «Стоп»." });
-      return;
-    }
-
-    const project = this.getActiveProject();
+  private async runTurn(
+    prompt: string,
+    agent: AgentId,
+    attachments: Attachment[] = [],
+    targetPath?: string,
+  ) {
+    const project = targetPath
+      ? (this.getProjects().find((p) => p.path === targetPath) ?? null)
+      : this.getActiveProject();
     if (!project) {
       this.post({
         type: "error",
-        message: "Нет проектов. Добавьте проект через «＋ Добавить проект…» или откройте папку.",
+        message: targetPath
+          ? "Проект отложенного сообщения удалён из списка — сообщение не отправлено."
+          : "Нет проектов. Добавьте проект через «＋ Добавить проект…» или откройте папку.",
       });
       return;
     }
-    if (!fs.existsSync(project.path)) {
-      this.post({ type: "error", message: `Папка проекта не найдена: ${project.path}` });
+    const cwd = project.path;
+    if (this.runs.has(cwd)) {
+      this.postScoped(cwd, {
+        type: "error",
+        message: `В проекте «${project.name}» агент ещё работает. Дождитесь ответа или нажмите «Стоп».`,
+      });
       return;
     }
-    const cwd = project.path;
+    if (!fs.existsSync(cwd)) {
+      this.postScoped(cwd, { type: "error", message: `Папка проекта не найдена: ${cwd}` });
+      return;
+    }
 
-    this.abort = new AbortController();
-    this.post({ type: "busy", value: true });
-    this.post({ type: "activity", label: "Запускается…" });
+    const controller = new AbortController();
+    this.runs.set(cwd, controller);
+    this.postScoped(cwd, { type: "busy", value: true });
+    this.postScoped(cwd, { type: "activity", label: "Запускается…" });
 
     // Вложения идут вместе с текстом сообщения — блок путей перед задачей.
     const promptWithAttachments =
@@ -1363,7 +1418,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       );
       if (journalContext) {
         parts.push(journalContext);
-        this.post({ type: "info", text: "В контекст добавлены записи журнала сессий." });
+        this.postScoped(cwd, { type: "info", text: "В контекст добавлены записи журнала сессий." });
       }
       parts.push(`Задача пользователя:\n${promptWithAttachments}`);
       fullPrompt = parts.join("\n\n");
@@ -1376,13 +1431,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const events = this.backends[agent].start(fullPrompt, {
         cwd,
         resumeSessionId: sessions[agent] ?? undefined,
-        signal: this.abort.signal,
+        signal: controller.signal,
         extraEnv: serverPassword
           ? { AGENT_HUB_SERVER_PASSWORD: serverPassword, LFTP_PASSWORD: serverPassword }
           : undefined,
         config: this.buildAgentConfig(agent),
         attachments: attachments.map((a) => ({ path: a.path, isImage: isImagePath(a.path) })),
-        confirmTool: (toolName, input) => this.confirmTool(toolName, input),
+        confirmTool: (toolName, input) => this.confirmTool(toolName, input, cwd),
       });
 
       for await (const ev of events) {
@@ -1391,38 +1446,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             await this.mutateActiveRecord(cwd, (r) => {
               r.agentIds[agent] = ev.sessionId;
             });
-            this.post({ type: "sessionInfo", sessionId: ev.sessionId, agent });
+            this.postScoped(cwd, { type: "sessionInfo", sessionId: ev.sessionId, agent });
             break;
           case "activity":
-            this.post({ type: "activity", label: ev.label });
+            this.postScoped(cwd, { type: "activity", label: ev.label });
             break;
           case "notice":
-            this.post({ type: "info", text: ev.text });
+            this.postScoped(cwd, { type: "info", text: ev.text });
             break;
           case "contextUsage":
             await this.mutateActiveRecord(cwd, (r) => {
               r.context = { ...r.context, [agent]: { used: ev.usedTokens, max: ev.maxTokens } };
             });
-            this.post({ type: "contextUsage", agent, used: ev.usedTokens, max: ev.maxTokens });
+            this.postScoped(cwd, { type: "contextUsage", agent, used: ev.usedTokens, max: ev.maxTokens });
             break;
           case "model":
             await this.mutateActiveRecord(cwd, (r) => {
               r.models = { ...r.models, [agent]: ev.model };
               r.modelFallbacks = { ...r.modelFallbacks, [agent]: ev.fallbackFrom ?? undefined };
             });
-            this.post({ type: "modelInfo", agent, model: ev.model, fallbackFrom: ev.fallbackFrom });
+            this.postScoped(cwd, { type: "modelInfo", agent, model: ev.model, fallbackFrom: ev.fallbackFrom });
             break;
           case "textDelta":
-            this.post({ type: "textDelta", text: ev.text });
+            this.postScoped(cwd, { type: "textDelta", text: ev.text });
             break;
           case "assistantText":
-            this.post({ type: "assistantText", text: ev.text });
+            this.postScoped(cwd, { type: "assistantText", text: ev.text });
             break;
           case "toolUse":
-            this.post({ type: "toolUse", toolName: ev.toolName, summary: ev.summary });
+            this.postScoped(cwd, { type: "toolUse", toolName: ev.toolName, summary: ev.summary });
             break;
           case "result":
-            this.post({
+            this.postScoped(cwd, {
               type: "turnResult",
               ok: ev.ok,
               costUsd: ev.costUsd,
@@ -1431,20 +1486,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             });
             break;
           case "error":
-            this.post({ type: "error", message: ev.message });
+            this.postScoped(cwd, { type: "error", message: ev.message });
             break;
         }
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (!/abort/i.test(message)) {
-        this.post({ type: "error", message });
+        this.postScoped(cwd, { type: "error", message });
       } else {
-        this.post({ type: "info", text: "Остановлено." });
+        this.postScoped(cwd, { type: "info", text: "Остановлено." });
       }
     } finally {
-      this.abort = null;
-      this.post({ type: "busy", value: false });
+      this.runs.delete(cwd);
+      this.postScoped(cwd, { type: "busy", value: false });
     }
   }
 
@@ -1454,12 +1509,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * которая подхватит журнал. Лента чата при этом не очищается.
    */
   private async finishSession(agent: AgentId) {
-    if (this.abort) {
-      this.post({ type: "error", message: "Агент ещё работает. Дождитесь ответа или нажмите «Стоп»." });
-      return;
-    }
     const project = this.getActiveProject();
     if (!project) return;
+    if (this.runs.has(project.path)) {
+      this.post({ type: "error", message: "В этом проекте агент ещё работает. Дождитесь ответа или нажмите «Стоп»." });
+      return;
+    }
 
     const cfg = vscode.workspace.getConfiguration("agentHub");
     const dir = cfg.get<string>("journalDir", "docs/journal");
@@ -1470,9 +1525,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await this.mutateActiveRecord(project.path, (r) => {
       r.agentIds = { claude: null, codex: null };
     });
-    this.post({ type: "sessionInfo", sessionId: null, agent: "claude" });
-    this.post({ type: "sessionInfo", sessionId: null, agent: "codex" });
-    this.post({
+    // Пользователь мог переключиться на другой проект за время хода —
+    // адресуем завершение проекту, где писались итоги.
+    this.postScoped(project.path, { type: "sessionInfo", sessionId: null, agent: "claude" });
+    this.postScoped(project.path, { type: "sessionInfo", sessionId: null, agent: "codex" });
+    this.postScoped(project.path, {
       type: "info",
       text: "Итоги записаны. Следующее сообщение начнёт новую сессию с контекстом из журнала.",
     });
@@ -1486,6 +1543,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async confirmTool(
     toolName: string,
     input: unknown,
+    cwd: string,
   ): Promise<{ allow: boolean; answer?: string }> {
     const requestId = `perm-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
@@ -1493,7 +1551,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const q = (input as {
         questions?: { question?: string; options?: { label?: string; description?: string }[] }[];
       } | null)?.questions?.[0];
-      this.post({
+      this.postScoped(cwd, {
         type: "permissionRequest",
         requestId,
         toolName,
@@ -1504,27 +1562,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           .filter((o) => typeof o?.label === "string")
           .map((o) => ({ label: o.label as string, description: o.description })),
       });
-      this.post({ type: "activity", label: "Ждёт вашего ответа…" });
+      this.postScoped(cwd, { type: "activity", label: "Ждёт вашего ответа…" });
       this.view?.show?.(true);
-      return new Promise((resolve) => this.pendingPermissions.set(requestId, resolve));
+      this.notifyBackgroundPermission(cwd, "агент задаёт вопрос");
+      return new Promise((resolve) =>
+        this.pendingPermissions.set(requestId, { path: cwd, resolve }),
+      );
     }
 
     if (this.isAutoAllowed(toolName, input)) {
       return { allow: true };
     }
 
-    this.post({
+    this.postScoped(cwd, {
       type: "permissionRequest",
       requestId,
       toolName,
       inputPreview: formatInputPreview(input),
       kind: "tool",
     });
-    this.post({ type: "activity", label: "Ждёт подтверждения…" });
+    this.postScoped(cwd, { type: "activity", label: "Ждёт подтверждения…" });
     // Панель может быть скрыта — покажем её, иначе агент будет ждать вечно.
     this.view?.show?.(true);
+    this.notifyBackgroundPermission(cwd, `нужно подтверждение: ${toolName}`);
 
-    return new Promise((resolve) => this.pendingPermissions.set(requestId, resolve));
+    return new Promise((resolve) =>
+      this.pendingPermissions.set(requestId, { path: cwd, resolve }),
+    );
+  }
+
+  /** Карточка ждёт в ФОНОВОМ проекте — иначе пользователь её не увидит. */
+  private notifyBackgroundPermission(cwd: string, what: string) {
+    if (this.getActiveProject()?.path === cwd) return;
+    const name = this.getProjects().find((p) => p.path === cwd)?.name ?? nodePath.basename(cwd);
+    void vscode.window
+      .showWarningMessage(`Agent Hub — проект «${name}»: ${what}`, "Открыть проект")
+      .then(async (choice) => {
+        if (choice === "Открыть проект") {
+          await this.context.globalState.update(ACTIVE_PROJECT_KEY, cwd);
+          this.postFullState();
+          this.view?.show?.(true);
+        }
+      });
   }
 
   /** Allowlist из настроек: имена инструментов и префиксы bash-команд (раздел 8.5). */
@@ -1547,7 +1626,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   dispose() {
     this.denyAllPending();
-    this.abort?.abort();
+    for (const controller of this.runs.values()) controller.abort();
+    this.runs.clear();
   }
 
   private renderHtml(webview: vscode.Webview): string {
