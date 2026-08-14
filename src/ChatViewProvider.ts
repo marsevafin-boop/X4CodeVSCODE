@@ -38,6 +38,8 @@ interface SessionRecord {
   context?: Partial<Record<AgentId, { used: number; max: number }>>;
   /** Последняя известная модель по агентам. */
   models?: Partial<Record<AgentId, string>>;
+  /** Если модель понижена фоллбэком — с какой (по агентам). */
+  modelFallbacks?: Partial<Record<AgentId, string>>;
 }
 
 interface ProjectStore {
@@ -885,7 +887,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       for (const a of ["claude", "codex"] as const) {
         const ctx = rec?.context?.[a];
         this.post({ type: "contextUsage", agent: a, used: ctx?.used ?? 0, max: ctx?.max ?? 0 });
-        this.post({ type: "modelInfo", agent: a, model: rec?.models?.[a] ?? "" });
+        this.post({
+          type: "modelInfo",
+          agent: a,
+          model: rec?.models?.[a] ?? "",
+          fallbackFrom: rec?.modelFallbacks?.[a],
+        });
       }
     }
     this.postSafety();
@@ -1401,8 +1408,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           case "model":
             await this.mutateActiveRecord(cwd, (r) => {
               r.models = { ...r.models, [agent]: ev.model };
+              r.modelFallbacks = { ...r.modelFallbacks, [agent]: ev.fallbackFrom ?? undefined };
             });
-            this.post({ type: "modelInfo", agent, model: ev.model });
+            this.post({ type: "modelInfo", agent, model: ev.model, fallbackFrom: ev.fallbackFrom });
             break;
           case "textDelta":
             this.post({ type: "textDelta", text: ev.text });

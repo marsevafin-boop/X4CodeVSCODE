@@ -92,7 +92,7 @@ export type HostToWebview =
   | { type: "projects"; projects: ProjectInfo[]; activePath: string }
   | { type: "transcript"; path: string; items: unknown[] }
   | { type: "contextUsage"; agent: AgentId; used: number; max: number }
-  | { type: "modelInfo"; agent: AgentId; model: string }
+  | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string }
   | { type: "settings"; settings: SettingsSnapshot }
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }
   | { type: "attachmentAdded"; files: Attachment[] }

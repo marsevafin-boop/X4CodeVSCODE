@@ -98,6 +98,11 @@ body {
   font-family: var(--vscode-editor-font-family);
 }
 
+.model-badge.model-fallback {
+  color: var(--vscode-charts-yellow, #d29922);
+  font-weight: 600;
+}
+
 .ctx {
   display: flex;
   align-items: center;

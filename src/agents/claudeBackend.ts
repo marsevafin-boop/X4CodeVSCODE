@@ -6,6 +6,11 @@ function inferClaudeWindow(model: string): number {
   return /haiku|claude-3/i.test(model) ? 200_000 : 1_000_000;
 }
 
+/** Канонизация id модели для сравнения (без датированного суффикса). */
+function canonicalModel(m: string): string {
+  return m.replace(/-\d{8}$/, "");
+}
+
 /**
  * Бэкенд Claude через @anthropic-ai/claude-agent-sdk.
  * SDK оборачивает CLI Claude Code и использует его авторизацию (подписка Max).
@@ -63,6 +68,10 @@ export class ClaudeBackend implements AgentBackend {
     });
 
     let currentModel = cfg.model ?? "";
+    /** Модель сессии из init — то, что «должно» работать. */
+    let sessionModel = "";
+    /** Фактически обслуживающая модель (меняется при серверном фоллбэке). */
+    let servingModel = "";
     /**
      * Занятость контекста = размер промпта ПОСЛЕДНЕГО запроса + его выход
      * (in + cache_read + cache_write + out одного API-вызова). Суммировать
@@ -86,6 +95,8 @@ export class ClaudeBackend implements AgentBackend {
             const model = (msg as unknown as { model?: string }).model;
             if (model) {
               currentModel = model;
+              sessionModel = model;
+              servingModel = model;
               yield { kind: "model", model };
             }
             // Пока CLI жив — точный замер: окно модели + базовая занятость
@@ -157,6 +168,24 @@ export class ClaudeBackend implements AgentBackend {
           const parentId = (msg as unknown as { parent_tool_use_id?: string | null })
             .parent_tool_use_id;
           if (!parentId) {
+            // Автодетект фоллбэка: message.model — модель, реально обслужившая
+            // ЭТОТ ответ. При серверном фоллбэке (opus5/fable5 → запасная) она
+            // отличается от модели сессии из init.
+            const actual = (msg.message as unknown as { model?: string }).model;
+            if (actual && sessionModel && canonicalModel(actual) !== canonicalModel(servingModel)) {
+              const downgraded = canonicalModel(actual) !== canonicalModel(sessionModel);
+              servingModel = actual;
+              if (downgraded) {
+                yield { kind: "model", model: actual, fallbackFrom: sessionModel };
+                yield {
+                  kind: "notice",
+                  text: `⚠️ Сработал фоллбэк: ответ обслуживает ${actual} вместо ${sessionModel}.`,
+                };
+              } else {
+                yield { kind: "model", model: actual };
+                yield { kind: "notice", text: `Модель восстановлена: ${actual}.` };
+              }
+            }
             const u = (msg.message as unknown as { usage?: Record<string, number> }).usage;
             if (u) {
               const used =

@@ -19,7 +19,12 @@ export type AgentEvent =
       numTurns?: number;
     }
   | { kind: "contextUsage"; usedTokens: number; maxTokens: number }
-  | { kind: "model"; model: string }
+  | {
+      kind: "model";
+      model: string;
+      /** Заполнено, если модель фактически понижена фоллбэком с указанной. */
+      fallbackFrom?: string;
+    }
   | { kind: "notice"; text: string }
   | { kind: "error"; message: string };
 

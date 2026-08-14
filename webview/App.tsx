@@ -98,7 +98,9 @@ export function App() {
   const [contextUsage, setContextUsage] = useState<
     Record<AgentId, { used: number; max: number } | null>
   >({ claude: null, codex: null });
-  const [models, setModels] = useState<Record<AgentId, string>>({ claude: "", codex: "" });
+  const [models, setModels] = useState<
+    Record<AgentId, { model: string; fallbackFrom?: string }>
+  >({ claude: { model: "" }, codex: { model: "" } });
   const [safety, setSafety] = useState<
     Record<AgentId, { label: string; dangerous: boolean } | null>
   >({ claude: null, codex: null });
@@ -241,7 +243,10 @@ export function App() {
           }));
           break;
         case "modelInfo":
-          setModels((prev) => ({ ...prev, [msg.agent]: msg.model }));
+          setModels((prev) => ({
+            ...prev,
+            [msg.agent]: { model: msg.model, fallbackFrom: msg.fallbackFrom },
+          }));
           break;
         case "safetyInfo":
           setSafety((prev) => ({
@@ -922,8 +927,17 @@ export function App() {
         </span>
       </header>
       <div className="statusbar">
-        <span className="model-badge" title="Модель текущей сессии для выбранного агента">
-          {models[agent] || "модель: по умолчанию CLI"}
+        <span
+          className={`model-badge ${models[agent].fallbackFrom ? "model-fallback" : ""}`}
+          title={
+            models[agent].fallbackFrom
+              ? `Сработал фоллбэк: фактически отвечает ${models[agent].model}, хотя сессия начиналась на ${models[agent].fallbackFrom}`
+              : "Модель текущей сессии для выбранного агента"
+          }
+        >
+          {models[agent].fallbackFrom
+            ? `⚠️ ${models[agent].model} (фоллбэк с ${models[agent].fallbackFrom})`
+            : models[agent].model || "модель: по умолчанию CLI"}
         </span>
         <button
           className={`safety-btn ${safety[agent]?.dangerous ? "safety-danger" : ""}`}
