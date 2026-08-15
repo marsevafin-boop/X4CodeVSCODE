@@ -1146,6 +1146,66 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /**
+   * Быстрый выбор модели по клику на бейдж. Применяется со следующего хода —
+   * в т.ч. чтобы вернуться на основную модель после «липкого» фоллбэка.
+   */
+  async pickModel(agent: AgentId) {
+    const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
+    const current = section.get<string>("model", "");
+    const CUSTOM = "__custom__";
+
+    type Item = vscode.QuickPickItem & { value: string };
+    const base: Item[] =
+      agent === "claude"
+        ? [
+            { label: "По умолчанию CLI", detail: "модель из настроек claude", value: "" },
+            { label: "claude-fable-5", detail: "максимальные способности", value: "claude-fable-5" },
+            { label: "claude-opus-5", detail: "топ для агентной работы", value: "claude-opus-5" },
+            { label: "claude-opus-4-8", value: "claude-opus-4-8" },
+            { label: "claude-sonnet-5", detail: "быстрее и дешевле", value: "claude-sonnet-5" },
+            { label: "claude-haiku-4-5", detail: "самый быстрый", value: "claude-haiku-4-5" },
+            { label: "$(edit) Ввести вручную…", value: CUSTOM },
+          ]
+        : [
+            { label: "По умолчанию", detail: "модель из ~/.codex/config.toml", value: "" },
+            { label: "$(edit) Ввести вручную…", value: CUSTOM },
+          ];
+
+    const pick = await vscode.window.showQuickPick(
+      base.map((i) => ({
+        ...i,
+        description: i.value === current ? "✓ текущая настройка" : undefined,
+      })),
+      {
+        placeHolder: `Модель для ${agent === "claude" ? "Claude" : "Codex"} — применится со следующего хода`,
+        ignoreFocusOut: true,
+      },
+    );
+    if (!pick) return;
+
+    let value = pick.value;
+    if (value === CUSTOM) {
+      const input = await vscode.window.showInputBox({
+        prompt: "Идентификатор модели",
+        value: current,
+        placeHolder: agent === "claude" ? "например: claude-fable-5" : "например: gpt-5-codex",
+        ignoreFocusOut: true,
+      });
+      if (input === undefined) return;
+      value = input.trim();
+    }
+
+    await section.update("model", value, vscode.ConfigurationTarget.Global);
+    await this.postSettings();
+    this.post({
+      type: "info",
+      text: value
+        ? `Модель ${agent === "claude" ? "Claude" : "Codex"} со следующего хода: ${value}.`
+        : `Модель ${agent === "claude" ? "Claude" : "Codex"}: по умолчанию CLI.`,
+    });
+  }
+
   /** Клик по индикатору режима: default → acceptEdits → YOLO → default (Claude); вкл/выкл YOLO (Codex). */
   private async cycleSafety(agent: AgentId) {
     if (agent === "claude") {
@@ -1459,6 +1519,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case "cycleSafety":
         await this.cycleSafety(msg.agent);
+        break;
+      case "pickModel":
+        await this.pickModel(msg.agent);
         break;
       case "permission": {
         const pending = this.pendingPermissions.get(msg.requestId);

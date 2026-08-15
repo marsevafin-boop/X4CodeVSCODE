@@ -68,6 +68,7 @@ export type WebviewToHost =
     }
   | { type: "saveSettings"; settings: SettingsSave }
   | { type: "cycleSafety"; agent: AgentId }
+  | { type: "pickModel"; agent: AgentId }
   | { type: "saveTranscript"; path: string; items: unknown[] };
 
 /**

@@ -1038,18 +1038,19 @@ export function App() {
         </span>
       </header>
       <div className="statusbar">
-        <span
+        <button
           className={`model-badge ${models[agent].fallbackFrom ? "model-fallback" : ""}`}
           title={
-            models[agent].fallbackFrom
-              ? `Сработал фоллбэк: фактически отвечает ${models[agent].model}, хотя сессия начиналась на ${models[agent].fallbackFrom}`
-              : "Модель текущей сессии для выбранного агента"
+            (models[agent].fallbackFrom
+              ? `Сработал фоллбэк: фактически отвечает ${models[agent].model}, хотя сессия начиналась на ${models[agent].fallbackFrom}. `
+              : "") + "Клик — выбрать модель (применится со следующего хода)"
           }
+          onClick={() => vscode.postMessage({ type: "pickModel", agent })}
         >
           {models[agent].fallbackFrom
             ? `⚠️ ${models[agent].model} (фоллбэк с ${models[agent].fallbackFrom})`
             : models[agent].model || "модель: по умолчанию CLI"}
-        </span>
+        </button>
         <button
           className={`safety-btn ${safety[agent]?.dangerous ? "safety-danger" : ""}`}
           title="Режим разрешений выбранного агента — клик переключает (Claude: подтверждения → правки без спроса → YOLO; Codex: песочница ↔ YOLO)"
