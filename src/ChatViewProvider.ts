@@ -1387,7 +1387,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.newSession();
         break;
       case "send":
-        await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], msg.path);
+        await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], msg.path, true);
         break;
       case "pickAttachment": {
         const picked = await vscode.window.showOpenDialog({
@@ -1517,6 +1517,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     agent: AgentId,
     attachments: Attachment[] = [],
     targetPath?: string,
+    echoUser = false,
   ) {
     const project = targetPath
       ? (this.getProjects().find((p) => p.path === targetPath) ?? null)
@@ -1545,6 +1546,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const controller = new AbortController();
     this.runs.set(cwd, controller);
+    if (echoUser) {
+      // Пузырь пользователя рассылает хост — обе поверхности видят одно и то же.
+      this.postScoped(cwd, {
+        type: "userMessage",
+        text: prompt,
+        attachments: attachments.length ? attachments.map((a) => a.name) : undefined,
+      });
+    }
     this.postScoped(cwd, { type: "busy", value: true });
     this.postScoped(cwd, { type: "activity", label: "Запускается…" });
 

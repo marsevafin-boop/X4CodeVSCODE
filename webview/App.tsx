@@ -222,21 +222,16 @@ export function App() {
     [mutateItems],
   );
 
-  /** Фактическая отправка: пузырь в ленту проекта + сообщение хосту с меткой проекта. */
+  /**
+   * Отправка хосту. Пузырь пользователя НЕ добавляем локально — его эхом
+   * рассылает хост (userMessage) обеим поверхностям, иначе ленты сайдбара и
+   * вкладки расходятся и автосохранение теряет промпты.
+   */
   const dispatchSend = useCallback(
     (path: string, text: string, attachments: Attachment[], agentId: AgentId) => {
-      mutateItems(path, (p) => [
-        ...p,
-        {
-          id: nextId++,
-          role: "user",
-          text,
-          ...(attachments.length ? { attachments: attachments.map((a) => a.name) } : {}),
-        },
-      ]);
       vscode.postMessage({ type: "send", text, agent: agentId, attachments, path });
     },
-    [mutateItems],
+    [],
   );
 
   useEffect(() => {
@@ -349,6 +344,18 @@ export function App() {
           setPending((prev) => [
             ...prev,
             ...msg.files.filter((f) => !prev.some((x) => x.path === f.path)),
+          ]);
+          break;
+        case "userMessage":
+          finalizeStreaming(p);
+          mutateItems(p, (x) => [
+            ...x,
+            {
+              id: nextId++,
+              role: "user",
+              text: msg.text,
+              ...(msg.attachments?.length ? { attachments: msg.attachments } : {}),
+            },
           ]);
           break;
         case "textDelta":

@@ -80,6 +80,14 @@ export type HostToWebview =
   | { type: "busy"; value: boolean; path?: string }
   | { type: "activity"; label: string; path?: string }
   | { type: "sessionInfo"; sessionId: string | null; agent: AgentId; path?: string }
+  | {
+      /** Эхо сообщения пользователя: пузырь создаёт хост, чтобы обе
+       *  поверхности (сайдбар и вкладка) имели одинаковую ленту. */
+      type: "userMessage";
+      text: string;
+      attachments?: string[];
+      path?: string;
+    }
   | { type: "textDelta"; text: string; path?: string }
   | { type: "assistantText"; text: string; path?: string }
   | { type: "toolUse"; toolName: string; summary: string; path?: string }
