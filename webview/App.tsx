@@ -1019,6 +1019,13 @@ export function App() {
         >
           ⚙
         </button>
+        <button
+          className="finish-btn"
+          title="Во всю ширину: открыть чат вкладкой редактора (сайдбар спрячется)"
+          onClick={() => vscode.postMessage({ type: "openFullView" })}
+        >
+          ⛶
+        </button>
         <span className="session" title={sessionId ?? ""}>
           {sessionId ? `сессия ${sessionId.slice(0, 8)}…` : "новая сессия"}
         </span>

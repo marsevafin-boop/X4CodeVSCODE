@@ -121,6 +121,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewId = "agentHub.chat";
 
   private view?: vscode.WebviewView;
+  /** Полноэкранный режим: тот же чат вкладкой редактора; работает синхронно с сайдбаром. */
+  private panel: vscode.WebviewPanel | null = null;
   private readonly backends: Record<AgentId, AgentBackend> = {
     claude: new ClaudeBackend(),
     codex: new CodexBackend(),
@@ -1306,6 +1308,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private post(msg: HostToWebview) {
     this.view?.webview.postMessage(msg);
+    this.panel?.webview.postMessage(msg);
+  }
+
+  /** Показать чат пользователю: вкладка приоритетнее сайдбара. */
+  private revealUi() {
+    if (this.panel) this.panel.reveal(undefined, true);
+    else this.view?.show?.(true);
+  }
+
+  /** «Во всю ширину»: чат вкладкой редактора + прячем сайдбар. */
+  async openFullView() {
+    if (this.panel) {
+      this.panel.reveal();
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      "agentHub.chatPanel",
+      "Agent Hub",
+      vscode.ViewColumn.One,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "dist")],
+      },
+    );
+    panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, "media", "icon.svg");
+    panel.webview.html = this.renderHtml(panel.webview);
+    panel.webview.onDidReceiveMessage((msg: WebviewToHost) => this.onMessage(msg));
+    panel.onDidDispose(() => {
+      this.panel = null;
+    });
+    this.panel = panel;
+    // Сайдбар прячем — чат занимает всю ширину окна.
+    await vscode.commands.executeCommand("workbench.action.closeSidebar");
+    this.postFullState();
+    await this.postSettings();
   }
 
   private async onMessage(msg: WebviewToHost) {
@@ -1373,6 +1411,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       case "showSessions":
         await this.showSessions();
+        break;
+      case "openFullView":
+        await this.openFullView();
         break;
       case "getSettings":
         await this.postSettings();
@@ -1646,7 +1687,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           .map((o) => ({ label: o.label as string, description: o.description })),
       });
       this.postScoped(cwd, { type: "activity", label: "Ждёт вашего ответа…" });
-      this.view?.show?.(true);
+      this.revealUi();
       this.notifyBackgroundPermission(cwd, "агент задаёт вопрос");
       return new Promise((resolve) =>
         this.pendingPermissions.set(requestId, { path: cwd, resolve }),
@@ -1666,7 +1707,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
     this.postScoped(cwd, { type: "activity", label: "Ждёт подтверждения…" });
     // Панель может быть скрыта — покажем её, иначе агент будет ждать вечно.
-    this.view?.show?.(true);
+    this.revealUi();
     this.notifyBackgroundPermission(cwd, `нужно подтверждение: ${toolName}`);
 
     return new Promise((resolve) =>
@@ -1684,7 +1725,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (choice === "Открыть проект") {
           await this.context.globalState.update(ACTIVE_PROJECT_KEY, cwd);
           this.postFullState();
-          this.view?.show?.(true);
+          this.revealUi();
         }
       });
   }

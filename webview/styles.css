@@ -621,6 +621,21 @@ body {
   opacity: 0.7;
 }
 
+/* Широкая вкладка (режим «во всю ширину»): контент центрируем, строки читаемы. */
+@media (min-width: 1000px) {
+  .feed,
+  .composer {
+    padding-left: calc((100% - 940px) / 2);
+    padding-right: calc((100% - 940px) / 2);
+  }
+
+  .topbar,
+  .statusbar {
+    padding-left: calc((100% - 1100px) / 2);
+    padding-right: calc((100% - 1100px) / 2);
+  }
+}
+
 .spinner {
   width: 12px;
   height: 12px;
