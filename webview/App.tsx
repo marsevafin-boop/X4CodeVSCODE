@@ -264,10 +264,27 @@ export function App() {
         case "activity":
           setActivityBy((prev) => ({ ...prev, [p]: msg.label }));
           break;
-        case "projects":
+        case "projects": {
           setProjects(msg.projects);
           setActivePath(msg.activePath);
+          // Чистим состояние удалённых проектов, чтобы их ленты/очереди
+          // не жили вечно и не пересоздавали записи на хосте.
+          const known = new Set(msg.projects.map((x) => x.path));
+          const prune = <T,>(rec: Record<string, T>): Record<string, T> => {
+            const out: Record<string, T> = {};
+            for (const [k, v] of Object.entries(rec)) if (known.has(k)) out[k] = v;
+            return out;
+          };
+          setItemsByProject(prune);
+          setQueueBy(prune);
+          setBusyBy(prune);
+          setActivityBy(prune);
+          setBusyStartBy(prune);
+          setSessionsBy(prune);
+          setCtxBy(prune);
+          setModelsBy(prune);
           break;
+        }
         case "transcript": {
           const restored = msg.items as ChatItem[];
           const maxId = restored.reduce((m, it) => Math.max(m, it?.id ?? 0), 0);
@@ -656,6 +673,17 @@ export function App() {
                       ✗ {serverTest.message}
                     </div>
                   )}
+                  <div className="set-actions" style={{ paddingBottom: 0 }}>
+                    <button
+                      className="finish-btn delete-btn"
+                      title="Убрать проект из списка или удалить вместе с папкой (папка уедет в Корзину)"
+                      onClick={() =>
+                        vscode.postMessage({ type: "deleteProject", path: form.project!.path })
+                      }
+                    >
+                      🗑 Удалить проект…
+                    </button>
+                  </div>
                 </section>
               )}
 

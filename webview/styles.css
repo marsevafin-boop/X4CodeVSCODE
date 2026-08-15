@@ -223,6 +223,11 @@ body {
   align-self: flex-start;
 }
 
+.delete-btn {
+  color: var(--vscode-errorForeground);
+  border-color: var(--vscode-errorForeground);
+}
+
 .set-hint {
   font-size: 0.85em;
   opacity: 0.7;

@@ -243,6 +243,99 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /**
+   * Удаление проекта: «убрать из списка» (файлы не трогаем, история сессий
+   * сохраняется на случай возврата) или «удалить с диска» (папка — в Корзину,
+   * пароль и история сессий вычищаются).
+   */
+  async deleteProject(path: string) {
+    const project = this.getProjects().find((p) => p.path === path);
+    if (!project) return;
+    const isWorkspaceFolder = (vscode.workspace.workspaceFolders ?? []).some(
+      (f) => f.uri.fsPath === path,
+    );
+
+    const LIST_ONLY = "Убрать из списка";
+    const WITH_FOLDER = "Удалить вместе с папкой";
+    const choice = await vscode.window.showWarningMessage(
+      `Удалить проект «${project.name}»?`,
+      {
+        modal: true,
+        detail:
+          `${path}\n\n«${LIST_ONLY}» — файлы не трогаем, историю сессий сохраняем.\n` +
+          `«${WITH_FOLDER}» — папка отправится в Корзину, история и пароль будут удалены.`,
+      },
+      LIST_ONLY,
+      WITH_FOLDER,
+    );
+    if (!choice) return;
+
+    if (choice === WITH_FOLDER && isWorkspaceFolder) {
+      void vscode.window.showErrorMessage(
+        `Папка «${project.name}» открыта в текущем workspace — сначала закройте её (File → Remove Folder from Workspace), потом удаляйте с диска.`,
+      );
+      return;
+    }
+
+    if (choice === WITH_FOLDER) {
+      const confirm = await vscode.window.showWarningMessage(
+        `Точно удалить папку с диска?`,
+        { modal: true, detail: `${path}\n\nПапка будет отправлена в Корзину (восстановимо).` },
+        "Да, удалить папку",
+      );
+      if (confirm !== "Да, удалить папку") return;
+    }
+
+    // Останавливаем ход проекта и снимаем зависшие подтверждения.
+    this.runs.get(path)?.abort();
+    this.denyAllPending(path);
+
+    // Из реестра — в любом случае.
+    const cfg = vscode.workspace.getConfiguration("agentHub");
+    const list = (cfg.get<ProjectInfo[]>("projects", []) ?? []).filter(
+      (p) => p.path?.replace(/^~(?=\/|$)/, os.homedir()) !== path,
+    );
+    await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
+    if (this.context.globalState.get<string>(ACTIVE_PROJECT_KEY) === path) {
+      await this.context.globalState.update(ACTIVE_PROJECT_KEY, undefined);
+    }
+
+    if (choice === WITH_FOLDER) {
+      // Пароль и историю сессий вычищаем вместе с папкой.
+      await this.context.secrets.delete(this.passwordKey(path));
+      const all = { ...this.getStoreAll() };
+      delete all[path];
+      await this.context.globalState.update(STORE_KEY, all);
+      try {
+        await vscode.workspace.fs.delete(vscode.Uri.file(path), {
+          recursive: true,
+          useTrash: true,
+        });
+      } catch (err) {
+        void vscode.window.showErrorMessage(
+          `Проект убран из списка, но папку удалить не удалось: ${err instanceof Error ? err.message : err}`,
+        );
+        this.abortOrphanRuns();
+        this.postFullState();
+        await this.postSettings();
+        return;
+      }
+    }
+
+    this.abortOrphanRuns();
+    this.postFullState();
+    await this.postSettings();
+    this.post({
+      type: "info",
+      text:
+        choice === WITH_FOLDER
+          ? `Проект «${project.name}» удалён, папка отправлена в Корзину.`
+          : isWorkspaceFolder
+            ? `Проект «${project.name}» убран из реестра, но папка открыта в workspace — она останется в списке, пока открыта.`
+            : `Проект «${project.name}» убран из списка. Файлы и история сессий не тронуты.`,
+    });
+  }
+
   /** Ручное редактирование полей активного проекта. */
   async editProject() {
     const active = this.getActiveProject();
@@ -315,20 +408,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (pick.action === "delete") {
-      const ok = await vscode.window.showWarningMessage(
-        `Удалить проект «${active.name}» из списка?`,
-        { modal: true },
-        "Удалить",
-      );
-      if (ok !== "Удалить") return;
-      if (idx >= 0) {
-        list.splice(idx, 1);
-        await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
-      }
-      await this.context.secrets.delete(this.passwordKey(active.path));
-      await this.context.globalState.update(ACTIVE_PROJECT_KEY, undefined);
-      this.abortOrphanRuns();
-      this.postFullState();
+      await this.deleteProject(active.path);
       return;
     }
 
@@ -1274,6 +1354,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case "addProject":
         await this.addProject();
+        break;
+      case "deleteProject":
+        await this.deleteProject(msg.path);
         break;
       case "saveTranscript": {
         const store = this.getProjectStore(msg.path);

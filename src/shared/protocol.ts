@@ -51,6 +51,7 @@ export type WebviewToHost =
   | { type: "permission"; requestId: string; allow: boolean; answer?: string }
   | { type: "selectProject"; path: string }
   | { type: "addProject" }
+  | { type: "deleteProject"; path: string }
   | { type: "showSessions" }
   | { type: "getSettings" }
   | { type: "exportSettings" }
