@@ -45,7 +45,7 @@ export type WebviewToHost =
     }
   | { type: "pickAttachment" }
   | { type: "saveAttachment"; name: string; dataBase64: string }
-  | { type: "stop" }
+  | { type: "stop"; path?: string }
   | { type: "newSession" }
   | { type: "finishSession"; agent: AgentId }
   | { type: "permission"; requestId: string; allow: boolean; answer?: string }

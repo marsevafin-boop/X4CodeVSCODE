@@ -135,7 +135,13 @@ export class CodexBackend implements AgentBackend {
     child.stdin.write(prompt);
     child.stdin.end();
 
-    const kill = () => child.kill("SIGTERM");
+    const kill = () => {
+      child.kill("SIGTERM");
+      // Codex может игнорировать SIGTERM посреди запроса — добиваем.
+      setTimeout(() => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+      }, 3000);
+    };
     opts.signal.addEventListener("abort", kill, { once: true });
 
     const stderrChunks: string[] = [];

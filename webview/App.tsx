@@ -1330,7 +1330,8 @@ export function App() {
                 className="stop"
                 onClick={() => {
                   setQueueBy((prev) => ({ ...prev, [activePath]: [] }));
-                  vscode.postMessage({ type: "stop" });
+                  setActivityBy((prev) => ({ ...prev, [activePath]: "Останавливаю…" }));
+                  vscode.postMessage({ type: "stop", path: activePath });
                 }}
               >
                 ⏹ Стоп

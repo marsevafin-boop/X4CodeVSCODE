@@ -1352,10 +1352,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.postFullState();
         break;
       case "stop": {
-        const active = this.getActiveProject();
-        if (active) {
-          this.runs.get(active.path)?.abort();
-          this.denyAllPending(active.path);
+        const requested = msg.path ?? this.getActiveProject()?.path;
+        // Ищем, что останавливать: запрошенный проект → единственный запуск.
+        const target =
+          requested && this.runs.has(requested)
+            ? requested
+            : this.runs.size === 1
+              ? [...this.runs.keys()][0]
+              : undefined;
+        if (target) {
+          this.postScoped(target, { type: "activity", label: "Останавливаю…" });
+          this.runs.get(target)?.abort();
+          this.denyAllPending(target);
+          // Страховка: бэкенд не завершился за 6 с — принудительно чистим UI.
+          setTimeout(() => {
+            if (this.runs.has(target)) {
+              this.runs.delete(target);
+              this.postScoped(target, { type: "busy", value: false });
+              this.postScoped(target, {
+                type: "error",
+                message: "Ход остановлен принудительно: бэкенд не ответил на прерывание.",
+              });
+            }
+          }, 6000);
+        } else if (requested) {
+          // Запусков нет, а UI считает проект занятым (рассинхрон после
+          // перезагрузки) — «Стоп» приводит панель в порядок.
+          this.denyAllPending(requested);
+          this.postScoped(requested, { type: "busy", value: false });
         }
         break;
       }
