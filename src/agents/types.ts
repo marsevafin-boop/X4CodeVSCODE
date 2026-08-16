@@ -26,6 +26,11 @@ export type AgentEvent =
       fallbackFrom?: string;
     }
   | { kind: "notice"; text: string }
+  | {
+      /** Доступные slash-команды CLI (Claude отдаёт их после init). */
+      kind: "commands";
+      commands: { name: string; description?: string; argumentHint?: string }[];
+    }
   | { kind: "error"; message: string };
 
 /** Настройки агента из VS Code settings (модель, effort и т.п.). */

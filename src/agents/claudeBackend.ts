@@ -122,6 +122,38 @@ export class ClaudeBackend implements AgentBackend {
             } catch {
               // не критично — далее считаем по шагам
             }
+            // Список slash-команд CLI (встроенные + .claude/commands) — для
+            // меню автодополнения. Только на первом ходе, кэшируется хостом.
+            try {
+              const commands = (await Promise.race([
+                stream.supportedCommands(),
+                new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error("timeout")), 2500),
+                ),
+              ])) as { name: string; description?: string; argumentHint?: string }[];
+              if (Array.isArray(commands) && commands.length > 0) {
+                yield {
+                  kind: "commands",
+                  commands: commands.map((c) => ({
+                    name: c.name,
+                    description: c.description,
+                    argumentHint: c.argumentHint,
+                  })),
+                };
+              }
+            } catch {
+              // список команд не критичен
+            }
+          } else if ((msg as { subtype?: string }).subtype === "local_command_output") {
+            // Вывод локальной slash-команды (/usage, /model и т.п.) — в ленту.
+            const content = (msg as unknown as { content?: string }).content;
+            if (content) yield { kind: "assistantText", text: content };
+          } else if ((msg as { subtype?: string }).subtype === "informational") {
+            // Баннеры цикла (в т.ч. вывод части slash-команд); info-уровень — шум.
+            const info = msg as unknown as { content?: string; level?: string };
+            if (info.content && info.level && info.level !== "info") {
+              yield { kind: "notice", text: info.content };
+            }
           } else if ((msg as { subtype?: string }).subtype === "compact_boundary") {
             const meta = (msg as unknown as { compact_metadata?: { pre_tokens?: number } })
               .compact_metadata;

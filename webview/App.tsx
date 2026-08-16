@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
   AgentId,
@@ -7,6 +7,7 @@ import type {
   HostToWebview,
   ProjectInfo,
   SettingsSnapshot,
+  SlashCommandInfo,
   WebviewToHost,
 } from "../src/shared/protocol";
 
@@ -75,6 +76,35 @@ function QuestionCustomAnswer({ onSubmit }: { onSubmit: (text: string) => void }
   );
 }
 
+/**
+ * Похоже ли содержимое инлайн-кода на путь к файлу? Такие фрагменты
+ * рендерятся кликабельной плашкой (открытие в редакторе). Осторожная
+ * эвристика: не путать с URL-роутами (/api/…), флагами и доменами.
+ */
+function detectFilePath(raw: string): string | null {
+  const t = raw.trim();
+  if (t.length < 3 || t.length > 260) return null;
+  if (/[\n`]/.test(t)) return null;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) return null; // URL
+  if (/^[A-Za-z]:[\\/]/.test(t)) return t; // Windows-путь
+  if (t.startsWith("~/")) return t;
+  if (t.startsWith("/")) {
+    // Абсолютный путь: типичный корень ФС или расширение файла в конце.
+    if (/^\/(Users|home|var|etc|tmp|opt|srv|private|Applications|Library)\//.test(t)) return t;
+    const hasExt = /\.[A-Za-z][A-Za-z0-9]{0,5}$/.test(t);
+    return hasExt && t.split("/").length >= 3 ? t : null;
+  }
+  // Относительный путь или голое имя файла: без пробелов, с расширением.
+  if (/\s/.test(t)) return null;
+  if (!/^[\w.@-][\w.@/-]*$/.test(t)) return null;
+  const base = t.split("/").pop()!;
+  const ext = /\.([A-Za-z][A-Za-z0-9]{0,5})$/.exec(base)?.[1];
+  if (!ext || /^\d+$/.test(ext)) return null;
+  // Голые домены (example.com) — не файлы.
+  if (!t.includes("/") && /^(com|org|net|io|ru|dev|app|ai)$/i.test(ext)) return null;
+  return t;
+}
+
 /** 2 действия / 5 действий / 21 действие … */
 function pluralActions(n: number): string {
   const d10 = n % 10;
@@ -120,6 +150,12 @@ export function App() {
   const [safety, setSafety] = useState<
     Record<AgentId, { label: string; dangerous: boolean } | null>
   >({ claude: null, codex: null });
+  const [slashCmds, setSlashCmds] = useState<Record<AgentId, SlashCommandInfo[]>>({
+    claude: [],
+    codex: [],
+  });
+  const [slashIdx, setSlashIdx] = useState(0);
+  const [slashDismissed, setSlashDismissed] = useState(false);
   const [agent, setAgent] = useState<AgentId>("claude");
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState<Attachment[]>([]);
@@ -187,6 +223,67 @@ export function App() {
     }
     return m;
   }, [itemsByProject]);
+
+  // ---------- Slash-команды в композере ----------
+  const slashMatch = /^\/(\S*)$/.exec(draft);
+  const slashList = useMemo(() => {
+    if (!slashMatch || slashDismissed) return [];
+    const prefix = slashMatch[1].toLowerCase();
+    return (slashCmds[agent] ?? [])
+      .filter((c) => c.name.toLowerCase().startsWith(prefix))
+      .slice(0, 12);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft, slashCmds, agent, slashDismissed]);
+
+  const pickSlash = (c: SlashCommandInfo) => {
+    setDraft(`/${c.name} `);
+    setSlashIdx(0);
+  };
+
+  /** Инлайн-код с путями и не-http ссылки → кликабельные плашки файлов. */
+  const mdComponents = useMemo<Components>(() => {
+    const open = (p: string) =>
+      vscode.postMessage({ type: "openFile", path: p, project: activeRef.current });
+    return {
+      code({ className, children, ...props }) {
+        const text =
+          typeof children === "string"
+            ? children
+            : Array.isArray(children) && children.length === 1 && typeof children[0] === "string"
+              ? children[0]
+              : null;
+        if (text && !className && !text.includes("\n")) {
+          const p = detectFilePath(text);
+          if (p) {
+            return (
+              <button className="file-chip" title={`Открыть: ${p}`} onClick={() => open(p)}>
+                📄 <span className="file-chip-name">{p.split("/").pop() || p}</span>
+              </button>
+            );
+          }
+        }
+        return (
+          <code className={className} {...props}>
+            {children}
+          </code>
+        );
+      },
+      a({ href, children, ...props }) {
+        if (href && !/^[a-z][a-z0-9+.-]*:/i.test(href) && !href.startsWith("#")) {
+          return (
+            <button className="file-chip" title={`Открыть: ${href}`} onClick={() => open(href)}>
+              📄 <span className="file-chip-name">{children}</span>
+            </button>
+          );
+        }
+        return (
+          <a href={href} {...props}>
+            {children}
+          </a>
+        );
+      },
+    };
+  }, []);
 
   /** Мутация ленты УКАЗАННОГО проекта (события фоновых ходов идут в свои ленты). */
   const mutateItems = useCallback(
@@ -322,6 +419,9 @@ export function App() {
             ...prev,
             [msg.agent]: { label: msg.label, dangerous: msg.dangerous },
           }));
+          break;
+        case "slashCommands":
+          setSlashCmds((prev) => ({ ...prev, [msg.agent]: msg.commands }));
           break;
         case "settings":
           setForm(msg.settings);
@@ -1002,6 +1102,14 @@ export function App() {
         </select>
         <button
           className="finish-btn"
+          title="Новая сессия (текущая непустая сохранится в истории 🕘)"
+          disabled={busy}
+          onClick={() => vscode.postMessage({ type: "newSession" })}
+        >
+          ＋ Новая
+        </button>
+        <button
+          className="finish-btn"
           title="История сессий проекта: вернуться к старой или удалить"
           disabled={busy}
           onClick={() => vscode.postMessage({ type: "showSessions" })}
@@ -1156,7 +1264,9 @@ export function App() {
             case "assistant":
               return (
                 <div key={it.id} className="msg assistant md">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{it.text}</ReactMarkdown>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                    {it.text}
+                  </ReactMarkdown>
                   {it.streaming && <span className="cursor">▌</span>}
                 </div>
               );
@@ -1297,10 +1407,35 @@ export function App() {
             ))}
           </div>
         )}
+        {slashList.length > 0 && (
+          <div className="slash-menu">
+            {slashList.map((c, i) => (
+              <button
+                key={c.name}
+                className={`slash-item ${i === slashIdx ? "slash-active" : ""}`}
+                onMouseEnter={() => setSlashIdx(i)}
+                onClick={() => pickSlash(c)}
+              >
+                <span className="slash-name">/{c.name}</span>
+                {c.argumentHint && <span className="slash-hint">{c.argumentHint}</span>}
+                {c.description && <span className="slash-desc">{c.description}</span>}
+              </button>
+            ))}
+          </div>
+        )}
+        {slashMatch && !slashDismissed && slashList.length === 0 && agent === "codex" && (
+          <div className="slash-menu slash-empty">
+            У Codex команды — это файлы *.md в ~/.codex/prompts: имя файла станет командой.
+          </div>
+        )}
         <textarea
           value={draft}
-          placeholder="Сообщение агенту… (Enter — отправить, Cmd+V — вставить скриншот, файлы можно перетащить)"
-          onChange={(e) => setDraft(e.target.value)}
+          placeholder="Сообщение агенту… (Enter — отправить, «/» — команды CLI, Cmd+V — вставить скриншот, файлы можно перетащить)"
+          onChange={(e) => {
+            setDraft(e.target.value);
+            setSlashDismissed(false);
+            setSlashIdx(0);
+          }}
           onPaste={(e) => {
             if (e.clipboardData.files.length) {
               e.preventDefault();
@@ -1308,6 +1443,27 @@ export function App() {
             }
           }}
           onKeyDown={(e) => {
+            if (slashList.length > 0) {
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setSlashIdx((i) => (i + 1) % slashList.length);
+                return;
+              }
+              if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setSlashIdx((i) => (i - 1 + slashList.length) % slashList.length);
+                return;
+              }
+              if (e.key === "Tab" || e.key === "Enter") {
+                e.preventDefault();
+                pickSlash(slashList[Math.min(slashIdx, slashList.length - 1)]);
+                return;
+              }
+              if (e.key === "Escape") {
+                setSlashDismissed(true);
+                return;
+              }
+            }
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               send();

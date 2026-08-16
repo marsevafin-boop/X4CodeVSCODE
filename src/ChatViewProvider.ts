@@ -8,6 +8,7 @@ import type {
   Attachment,
   HostToWebview,
   ProjectInfo,
+  SlashCommandInfo,
   WebviewToHost,
 } from "./shared/protocol";
 import type { AgentBackend } from "./agents/types";
@@ -19,6 +20,7 @@ const LEGACY_SESSIONS_KEY = "agentHub.sessions";
 const LEGACY_TRANSCRIPTS_KEY = "agentHub.transcripts";
 const STORE_KEY = "agentHub.sessionStore";
 const ACTIVE_PROJECT_KEY = "agentHub.activeProject";
+const CLAUDE_COMMANDS_KEY = "agentHub.claudeCommands";
 const TRANSCRIPT_MAX_ITEMS = 300;
 const MAX_SESSIONS_PER_PROJECT = 30;
 
@@ -46,6 +48,14 @@ interface ProjectStore {
   activeId: string | null;
   sessions: SessionRecord[];
 }
+
+/** Стартовый список команд Claude до первого хода — реальный приходит из CLI. */
+const DEFAULT_CLAUDE_COMMANDS: SlashCommandInfo[] = [
+  { name: "compact", description: "Сжать контекст сессии (compaction)" },
+  { name: "review", description: "Код-ревью текущих изменений" },
+  { name: "init", description: "Создать/обновить CLAUDE.md проекта" },
+  { name: "usage", description: "Использование лимитов подписки" },
+];
 
 const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
 
@@ -1012,6 +1022,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     this.postSafety();
+    this.postSlashCommands();
   }
 
   /** Настройки агента (модель, effort и т.п.) из VS Code settings. */
@@ -1169,6 +1180,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           ]
         : [
             { label: "По умолчанию", detail: "модель из ~/.codex/config.toml", value: "" },
+            // Список из кэша самого CLI — актуальные модели аккаунта.
+            ...this.listCodexModels().map((m) => ({
+              label: m.slug,
+              detail: m.description,
+              value: m.slug,
+            })),
             { label: "$(edit) Ввести вручную…", value: CUSTOM },
           ];
 
@@ -1204,6 +1221,113 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         ? `Модель ${agent === "claude" ? "Claude" : "Codex"} со следующего хода: ${value}.`
         : `Модель ${agent === "claude" ? "Claude" : "Codex"}: по умолчанию CLI.`,
     });
+  }
+
+  /** Модели Codex из кэша CLI (~/.codex/models_cache.json). */
+  private listCodexModels(): { slug: string; description?: string }[] {
+    try {
+      const raw = fs.readFileSync(
+        nodePath.join(os.homedir(), ".codex", "models_cache.json"),
+        "utf8",
+      );
+      const parsed = JSON.parse(raw) as {
+        models?: { slug?: string; description?: string; visibility?: string }[];
+      };
+      const out: { slug: string; description?: string }[] = [];
+      for (const m of parsed.models ?? []) {
+        if (typeof m.slug === "string" && m.visibility !== "hide") {
+          out.push({ slug: m.slug, description: m.description });
+        }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  // ---------- Slash-команды CLI ----------
+
+  /** Списки slash-команд для меню композера: Claude из кэша CLI, Codex из ~/.codex/prompts. */
+  private postSlashCommands() {
+    const cached = this.context.globalState.get<SlashCommandInfo[]>(CLAUDE_COMMANDS_KEY);
+    this.post({
+      type: "slashCommands",
+      agent: "claude",
+      commands: cached?.length ? cached : DEFAULT_CLAUDE_COMMANDS,
+    });
+    this.post({ type: "slashCommands", agent: "codex", commands: this.listCodexPrompts() });
+  }
+
+  /** Кастомные промпты Codex: файлы *.md в ~/.codex/prompts, имя файла = команда. */
+  private listCodexPrompts(): SlashCommandInfo[] {
+    const dir = nodePath.join(os.homedir(), ".codex", "prompts");
+    let files: string[] = [];
+    try {
+      files = fs.readdirSync(dir);
+    } catch {
+      return [];
+    }
+    const out: SlashCommandInfo[] = [];
+    for (const f of files) {
+      if (!f.endsWith(".md")) continue;
+      let description: string | undefined;
+      try {
+        const first = fs
+          .readFileSync(nodePath.join(dir, f), "utf8")
+          .split("\n")
+          .find((l) => l.trim());
+        if (first) description = first.replace(/^#+\s*/, "").trim().slice(0, 80);
+      } catch {
+        // без описания
+      }
+      out.push({ name: f.slice(0, -3), description });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
+   * «/имя аргументы» → содержимое ~/.codex/prompts/имя.md: codex exec сам
+   * slash-команды не разворачивает, поэтому подставляем текст промпта здесь.
+   */
+  private expandCodexPrompt(prompt: string): string | null {
+    const m = /^\/([\w:.-]+)(?:\s+([\s\S]*))?$/.exec(prompt.trim());
+    if (!m) return null;
+    let content: string;
+    try {
+      content = fs.readFileSync(
+        nodePath.join(os.homedir(), ".codex", "prompts", `${m[1]}.md`),
+        "utf8",
+      );
+    } catch {
+      return null;
+    }
+    const args = (m[2] ?? "").trim();
+    if (content.includes("$ARGUMENTS")) return content.split("$ARGUMENTS").join(args);
+    return args ? `${content.trim()}\n\n${args}` : content;
+  }
+
+  /** Клик по плашке файла в ленте: открыть в редакторе этого же окна. */
+  private async openFileFromChat(raw: string, projectPath?: string) {
+    let p = raw.trim().replace(/^~(?=\/|$)/, os.homedir());
+    if (/^[A-Za-z]:[\\/]/.test(p)) {
+      void vscode.window.showWarningMessage(`Это путь с другой машины (Windows): ${raw}`);
+      return;
+    }
+    if (!nodePath.isAbsolute(p)) {
+      const base = projectPath || this.getActiveProject()?.path;
+      if (!base) return;
+      p = nodePath.join(base, p);
+    }
+    if (!fs.existsSync(p)) {
+      void vscode.window.showWarningMessage(`Файл не найден: ${p}`);
+      return;
+    }
+    const uri = vscode.Uri.file(p);
+    if (fs.statSync(p).isDirectory()) {
+      await vscode.commands.executeCommand("revealFileInOS", uri);
+      return;
+    }
+    await vscode.commands.executeCommand("vscode.open", uri, { preview: false });
   }
 
   /** Клик по индикатору режима: default → acceptEdits → YOLO → default (Claude); вкл/выкл YOLO (Codex). */
@@ -1523,6 +1647,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "pickModel":
         await this.pickModel(msg.agent);
         break;
+      case "openFile":
+        await this.openFileFromChat(msg.path, msg.project);
+        break;
       case "permission": {
         const pending = this.pendingPermissions.get(msg.requestId);
         if (pending) {
@@ -1620,15 +1747,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postScoped(cwd, { type: "busy", value: true });
     this.postScoped(cwd, { type: "activity", label: "Запускается…" });
 
-    // Вложения идут вместе с текстом сообщения — блок путей перед задачей.
-    const promptWithAttachments =
-      attachments.length > 0 ? `${buildAttachmentsBlock(attachments)}\n\n${prompt}` : prompt;
+    // Slash-команды: Claude Code исполняет их сам, но промпт обязан НАЧИНАТЬСЯ
+    // с «/» — никаких префиксов. Codex exec команды не понимает — кастомный
+    // промпт из ~/.codex/prompts разворачиваем в текст здесь.
+    let userText = prompt;
+    if (agent === "codex" && prompt.trimStart().startsWith("/")) {
+      const expanded = this.expandCodexPrompt(prompt);
+      if (expanded !== null) {
+        userText = expanded;
+        this.postScoped(cwd, {
+          type: "info",
+          text: `Команда развёрнута из ~/.codex/prompts.`,
+        });
+      }
+    }
+    const isSlashCommand = agent === "claude" && userText.trimStart().startsWith("/");
+
+    // Вложения идут вместе с текстом сообщения — блок путей перед задачей
+    // (после команды, если это slash-команда).
+    const attachBlock = attachments.length > 0 ? buildAttachmentsBlock(attachments) : "";
+    const promptWithAttachments = attachBlock
+      ? isSlashCommand
+        ? `${userText}\n\n${attachBlock}`
+        : `${attachBlock}\n\n${userText}`
+      : userText;
 
     // Новая сессия — карточка проекта + контекст из журнала (общая память).
     const record = await this.ensureActiveRecord(cwd);
     const sessions = record.agentIds;
     let fullPrompt = promptWithAttachments;
-    if (!sessions[agent]) {
+    if (!sessions[agent] && !isSlashCommand) {
       const cfg = vscode.workspace.getConfiguration("agentHub");
       const parts: string[] = [await this.buildProjectCard(project)];
       const journalContext = await readJournalContext(
@@ -1673,6 +1821,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             break;
           case "notice":
             this.postScoped(cwd, { type: "info", text: ev.text });
+            break;
+          case "commands":
+            // Реальный список команд CLI — кэшируем и обновляем меню.
+            await this.context.globalState.update(CLAUDE_COMMANDS_KEY, ev.commands);
+            this.post({ type: "slashCommands", agent, commands: ev.commands });
             break;
           case "contextUsage":
             await this.mutateActiveRecord(cwd, (r) => {

@@ -846,3 +846,94 @@ body {
   background: var(--vscode-button-secondaryBackground);
   color: var(--vscode-button-secondaryForeground);
 }
+
+/* ---------- Меню slash-команд над полем ввода ---------- */
+
+.slash-menu {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border));
+  border-radius: 5px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  max-height: 230px;
+  overflow-y: auto;
+}
+
+.slash-item {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 4px 9px;
+  cursor: pointer;
+  color: var(--vscode-foreground);
+  font-size: 0.9em;
+}
+
+.slash-item.slash-active {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground);
+}
+
+.slash-name {
+  font-family: var(--vscode-editor-font-family);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.slash-hint {
+  opacity: 0.6;
+  font-family: var(--vscode-editor-font-family);
+  white-space: nowrap;
+}
+
+.slash-desc {
+  opacity: 0.75;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60%;
+}
+
+.slash-empty {
+  padding: 6px 9px;
+  opacity: 0.7;
+  font-size: 0.88em;
+}
+
+/* ---------- Плашка файла в ответе: клик открывает файл в редакторе ---------- */
+
+.file-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 0 7px;
+  border-radius: 5px;
+  border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15));
+  color: var(--vscode-textLink-foreground);
+  cursor: pointer;
+  font-size: 0.92em;
+  font-family: inherit;
+  vertical-align: baseline;
+  max-width: 100%;
+}
+
+.file-chip:hover {
+  border-color: var(--vscode-textLink-foreground);
+}
+
+.file-chip:hover .file-chip-name {
+  text-decoration: underline;
+}
+
+.file-chip-name {
+  font-family: var(--vscode-editor-font-family);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

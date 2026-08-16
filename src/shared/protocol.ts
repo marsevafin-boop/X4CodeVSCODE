@@ -31,6 +31,13 @@ export interface Attachment {
   path: string;
 }
 
+/** Slash-команда CLI для меню автодополнения в композере. */
+export interface SlashCommandInfo {
+  name: string;
+  description?: string;
+  argumentHint?: string;
+}
+
 /** webview → extension */
 export type WebviewToHost =
   | { type: "ready" }
@@ -69,6 +76,13 @@ export type WebviewToHost =
   | { type: "saveSettings"; settings: SettingsSave }
   | { type: "cycleSafety"; agent: AgentId }
   | { type: "pickModel"; agent: AgentId }
+  | {
+      /** Клик по плашке файла в ленте: открыть файл в редакторе.
+       *  project — путь проекта ленты для резолва относительных путей. */
+      type: "openFile";
+      path: string;
+      project?: string;
+    }
   | { type: "saveTranscript"; path: string; items: unknown[] };
 
 /**
@@ -119,6 +133,7 @@ export type HostToWebview =
   | { type: "transcript"; path: string; items: unknown[] }
   | { type: "contextUsage"; agent: AgentId; used: number; max: number; path?: string }
   | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string; path?: string }
+  | { type: "slashCommands"; agent: AgentId; commands: SlashCommandInfo[] }
   | { type: "settings"; settings: SettingsSnapshot }
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }
   | { type: "attachmentAdded"; files: Attachment[] }
