@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.27",
+  "version": "0.0.28",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -230,6 +230,11 @@
           "type": "boolean",
           "default": false,
           "description": "После автокоммита сразу пушить текущую ветку в origin."
+        },
+        "agentHub.autoPull": {
+          "type": "boolean",
+          "default": true,
+          "description": "Перед каждым ходом агента проверять origin (git fetch) и подтягивать новые коммиты — агент работает с актуальной версией. При конфликте ход продолжается на текущей версии с предупреждением."
         },
         "agentHub.journalDir": {
           "type": "string",

@@ -962,6 +962,19 @@ export function App() {
                 <label className="set-row set-check">
                   <input
                     type="checkbox"
+                    checked={form.autoPull}
+                    onChange={(e) => up((f) => (f.autoPull = e.target.checked))}
+                  />
+                  <span>Перед каждым ходом подтягивать новые коммиты из origin</span>
+                </label>
+                <div className="set-hint">
+                  git fetch + fast-forward (при расхождении — rebase с автостэшем):
+                  агент всегда работает с актуальной версией. Конфликты не решаются
+                  автоматически — будет предупреждение.
+                </div>
+                <label className="set-row set-check">
+                  <input
+                    type="checkbox"
                     checked={form.autoCommit}
                     onChange={(e) => up((f) => (f.autoCommit = e.target.checked))}
                   />

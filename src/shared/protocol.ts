@@ -168,6 +168,8 @@ export interface SettingsSnapshot {
   autoCommit: boolean;
   /** После автокоммита сразу пушить в origin. */
   autoPush: boolean;
+  /** Перед каждым ходом подтягивать новые коммиты из origin. */
+  autoPull: boolean;
   /** Активный проект (null — проектов нет). */
   project: ProjectInfo | null;
   projectHasPassword: boolean;

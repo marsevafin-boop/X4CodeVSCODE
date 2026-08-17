@@ -637,6 +637,81 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Перед ходом: подтянуть новые коммиты из origin, чтобы агент работал с
+   * актуальной версией (парная половинка к автокоммиту/автопушу при работе
+   * с нескольких устройств). Fast-forward, при расхождении — rebase с
+   * автостэшем; конфликт не решаем — предупреждаем и работаем на текущей.
+   */
+  private async autoPull(cwd: string) {
+    const cfg = vscode.workspace.getConfiguration("agentHub");
+    if (!cfg.get<boolean>("autoPull", true)) return;
+
+    const inRepo = await this.execGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
+    if (inRepo.code !== 0 || !inRepo.out.trim().startsWith("true")) return;
+    const remotes = await this.execGit(cwd, ["remote"]);
+    if (remotes.code !== 0 || !remotes.out.trim()) return;
+
+    this.postScoped(cwd, { type: "activity", label: "Проверяю обновления в origin…" });
+    const fetched = await this.execGit(cwd, ["fetch", "--quiet"], 30000);
+    if (fetched.code !== 0) return; // офлайн/нет доступа — работаем с тем, что есть
+
+    const branchRes = await this.execGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    const branch = branchRes.out.trim();
+    if (branchRes.code !== 0 || !branch || branch === "HEAD") return;
+
+    // Upstream ветки; не настроен — пробуем одноимённую в origin.
+    let upstream = "";
+    const up = await this.execGit(cwd, [
+      "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}",
+    ]);
+    if (up.code === 0 && up.out.trim()) {
+      upstream = up.out.trim();
+    } else {
+      const cand = `origin/${branch}`;
+      const verify = await this.execGit(cwd, ["rev-parse", "--verify", "--quiet", cand]);
+      if (verify.code === 0) upstream = cand;
+    }
+    if (!upstream) return;
+
+    const behindRes = await this.execGit(cwd, ["rev-list", "--count", `HEAD..${upstream}`]);
+    const behind = behindRes.code === 0 ? parseInt(behindRes.out.trim(), 10) || 0 : 0;
+    if (behind === 0) return;
+
+    const aheadRes = await this.execGit(cwd, ["rev-list", "--count", `${upstream}..HEAD`]);
+    const ahead = aheadRes.code === 0 ? parseInt(aheadRes.out.trim(), 10) || 0 : 0;
+
+    this.postScoped(cwd, { type: "activity", label: `Подтягиваю новые коммиты (${behind})…` });
+    let ok: boolean;
+    if (ahead === 0) {
+      const merge = await this.execGit(
+        cwd,
+        ["merge", "--ff-only", "--autostash", upstream],
+        60000,
+      );
+      ok = merge.code === 0;
+    } else {
+      const rebase = await this.execGit(cwd, ["rebase", "--autostash", upstream], 60000);
+      ok = rebase.code === 0;
+      if (!ok) await this.execGit(cwd, ["rebase", "--abort"]);
+    }
+
+    if (ok) {
+      const sha = await this.execGit(cwd, ["rev-parse", "--short", "HEAD"]);
+      this.postScoped(cwd, {
+        type: "info",
+        text: `Подтянуты обновления из ${upstream}: коммитов — ${behind}. Теперь HEAD ${sha.out.trim()}.`,
+      });
+    } else {
+      this.postScoped(cwd, {
+        type: "info",
+        text:
+          `⚠️ В ${upstream} есть новые коммиты (${behind}), но обновиться автоматически не удалось ` +
+          `(конфликт или несовместимые локальные изменения). Ход продолжится на текущей версии.`,
+      });
+    }
+  }
+
+  /**
    * Автокоммит после хода: все изменения в папке проекта → git add -A +
    * commit с заголовком из промпта (+ опциональный push). Claude и Codex
    * проходят через одну точку — runTurn, поэтому покрыты оба.
@@ -744,6 +819,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       autoAllowBash: cfg.get<string[]>("autoAllowBash", []),
       autoCommit: cfg.get<boolean>("autoCommit", true),
       autoPush: cfg.get<boolean>("autoPush", false),
+      autoPull: cfg.get<boolean>("autoPull", true),
       // Реестр + папки workspace — на другой машине всё станет реестром.
       projects: this.getProjects(),
     };
@@ -776,6 +852,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await setIf("journalContextEntries", settings.journalContextEntries, "number");
     await setIf("autoCommit", settings.autoCommit, "boolean");
     await setIf("autoPush", settings.autoPush, "boolean");
+    await setIf("autoPull", settings.autoPull, "boolean");
     if (Array.isArray(settings.autoAllowTools)) {
       await cfg.update("autoAllowTools", settings.autoAllowTools, g);
     }
@@ -1191,6 +1268,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       autoAllowBash: cfg.get<string[]>("autoAllowBash", []),
       autoCommit: cfg.get<boolean>("autoCommit", true),
       autoPush: cfg.get<boolean>("autoPush", false),
+      autoPull: cfg.get<boolean>("autoPull", true),
       project,
       projectHasPassword: hasPassword,
     };
@@ -1223,6 +1301,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await cfg.update("autoAllowBash", s.autoAllowBash, g);
     await cfg.update("autoCommit", s.autoCommit, g);
     await cfg.update("autoPush", s.autoPush, g);
+    await cfg.update("autoPull", s.autoPull, g);
 
     if (s.project) {
       const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
@@ -1962,6 +2041,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this.postScoped(cwd, { type: "busy", value: true });
     this.postScoped(cwd, { type: "activity", label: "Запускается…" });
+
+    // Перед изменениями — актуальная версия: подтягиваем новые коммиты,
+    // чтобы агент (и журнал сессий) работали поверх свежего кода.
+    await this.autoPull(cwd);
 
     // Slash-команды: Claude Code исполняет их сам, но промпт обязан НАЧИНАТЬСЯ
     // с «/» — никаких префиксов. Codex exec команды не понимает — кастомный
