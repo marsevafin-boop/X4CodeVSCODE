@@ -610,6 +610,114 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  // ---------- Автокоммит изменений агента ----------
+
+  /** git в папке проекта; вывод собирается, таймаут страхует зависания. */
+  private execGit(
+    cwd: string,
+    args: string[],
+    timeoutMs = 30000,
+  ): Promise<{ code: number; out: string; err: string }> {
+    return new Promise((resolve) => {
+      const child = spawn("git", args, { cwd, env: process.env });
+      let out = "";
+      let err = "";
+      const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+      child.stdout.on("data", (d: Buffer) => (out += d.toString()));
+      child.stderr.on("data", (d: Buffer) => (err += d.toString()));
+      child.on("error", (e: Error) => {
+        clearTimeout(timer);
+        resolve({ code: 127, out, err: String(e) });
+      });
+      child.on("close", (code: number | null) => {
+        clearTimeout(timer);
+        resolve({ code: code ?? 1, out, err });
+      });
+    });
+  }
+
+  /**
+   * Автокоммит после хода: все изменения в папке проекта → git add -A +
+   * commit с заголовком из промпта (+ опциональный push). Claude и Codex
+   * проходят через одну точку — runTurn, поэтому покрыты оба.
+   */
+  private async autoCommit(cwd: string, agent: AgentId, prompt: string) {
+    const cfg = vscode.workspace.getConfiguration("agentHub");
+    if (!cfg.get<boolean>("autoCommit", true)) return;
+    const short = (s: string) => {
+      const line = s.trim().split("\n").filter(Boolean).pop() ?? "неизвестная ошибка";
+      return line.length > 180 ? line.slice(0, 180) + "…" : line;
+    };
+
+    const inRepo = await this.execGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
+    if (inRepo.code !== 0 || !inRepo.out.trim().startsWith("true")) return;
+
+    // Служебная папка панели (вложенные скриншоты) — не для репозитория;
+    // пишем в .git/info/exclude, чтобы не трогать пользовательский .gitignore.
+    const gitDir = await this.execGit(cwd, ["rev-parse", "--absolute-git-dir"]);
+    if (gitDir.code === 0 && gitDir.out.trim()) {
+      const exclude = nodePath.join(gitDir.out.trim(), "info", "exclude");
+      try {
+        const cur = await fs.promises.readFile(exclude, "utf8").catch(() => "");
+        if (!cur.includes(".agent-hub/")) {
+          await fs.promises.mkdir(nodePath.dirname(exclude), { recursive: true });
+          await fs.promises.writeFile(
+            exclude,
+            cur + (cur === "" || cur.endsWith("\n") ? "" : "\n") + ".agent-hub/\n",
+          );
+        }
+      } catch {
+        // не критично
+      }
+    }
+
+    const status = await this.execGit(cwd, ["status", "--porcelain"]);
+    if (status.code !== 0 || !status.out.trim()) return;
+    const changed = status.out.trim().split("\n").length;
+
+    this.postScoped(cwd, { type: "activity", label: "Коммичу изменения…" });
+    const add = await this.execGit(cwd, ["add", "-A"]);
+    if (add.code !== 0) {
+      this.postScoped(cwd, { type: "info", text: `Автокоммит: git add не удался — ${short(add.err)}` });
+      return;
+    }
+
+    const title = prompt.trim().split("\n")[0].replace(/\s+/g, " ").slice(0, 72);
+    const message = `авто (${agent}): ${title || "изменения после хода агента"}`;
+    let commit = await this.execGit(cwd, ["commit", "-m", message]);
+    if (commit.code !== 0 && /tell me who you are|user\.(name|email)/i.test(commit.err)) {
+      // В репозитории не настроена личность git — коммитим от имени панели.
+      commit = await this.execGit(cwd, [
+        "-c", "user.name=Agent Hub",
+        "-c", "user.email=agent-hub@local",
+        "commit", "-m", message,
+      ]);
+    }
+    if (commit.code !== 0) {
+      this.postScoped(cwd, {
+        type: "info",
+        text: `Автокоммит не удался: ${short(commit.err || commit.out)}`,
+      });
+      return;
+    }
+    const sha = await this.execGit(cwd, ["rev-parse", "--short", "HEAD"]);
+    this.postScoped(cwd, {
+      type: "info",
+      text: `Автокоммит ${sha.out.trim()}: файлов в изменениях — ${changed}.`,
+    });
+
+    if (!cfg.get<boolean>("autoPush", false)) return;
+    this.postScoped(cwd, { type: "activity", label: "Пушу в origin…" });
+    let push = await this.execGit(cwd, ["push"], 60000);
+    if (push.code !== 0 && /no upstream|set-upstream/i.test(push.err)) {
+      push = await this.execGit(cwd, ["push", "-u", "origin", "HEAD"], 60000);
+    }
+    this.postScoped(cwd, {
+      type: "info",
+      text: push.code === 0 ? "Изменения запушены в origin." : `Пуш не удался: ${short(push.err)}`,
+    });
+  }
+
   // ---------- Импорт/экспорт всех настроек ----------
 
   /** Все настройки Agent Hub одним объектом (пароли — нет, они в Keychain). */
@@ -634,6 +742,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       journalContextEntries: cfg.get<number>("journalContextEntries", 3),
       autoAllowTools: cfg.get<string[]>("autoAllowTools", []),
       autoAllowBash: cfg.get<string[]>("autoAllowBash", []),
+      autoCommit: cfg.get<boolean>("autoCommit", true),
+      autoPush: cfg.get<boolean>("autoPush", false),
       // Реестр + папки workspace — на другой машине всё станет реестром.
       projects: this.getProjects(),
     };
@@ -664,6 +774,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     await setIf("journalDir", settings.journalDir, "string");
     await setIf("journalContextEntries", settings.journalContextEntries, "number");
+    await setIf("autoCommit", settings.autoCommit, "boolean");
+    await setIf("autoPush", settings.autoPush, "boolean");
     if (Array.isArray(settings.autoAllowTools)) {
       await cfg.update("autoAllowTools", settings.autoAllowTools, g);
     }
@@ -1076,6 +1188,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       journalContextEntries: cfg.get<number>("journalContextEntries", 3),
       autoAllowTools: cfg.get<string[]>("autoAllowTools", []),
       autoAllowBash: cfg.get<string[]>("autoAllowBash", []),
+      autoCommit: cfg.get<boolean>("autoCommit", true),
+      autoPush: cfg.get<boolean>("autoPush", false),
       project,
       projectHasPassword: hasPassword,
     };
@@ -1106,6 +1220,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await cfg.update("journalContextEntries", s.journalContextEntries, g);
     await cfg.update("autoAllowTools", s.autoAllowTools, g);
     await cfg.update("autoAllowBash", s.autoAllowBash, g);
+    await cfg.update("autoCommit", s.autoCommit, g);
+    await cfg.update("autoPush", s.autoPush, g);
 
     if (s.project) {
       const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
@@ -1863,6 +1979,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             break;
         }
       }
+      // Ход завершился штатно — фиксируем изменения агента в git.
+      // При «Стоп»/ошибке коммита нет: остаток подберёт следующий ход.
+      await this.autoCommit(cwd, agent, prompt);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (!/abort/i.test(message)) {

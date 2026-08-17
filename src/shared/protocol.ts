@@ -162,6 +162,10 @@ export interface SettingsSnapshot {
   journalContextEntries: number;
   autoAllowTools: string[];
   autoAllowBash: string[];
+  /** Автокоммит всех изменений в папке проекта после каждого хода агента. */
+  autoCommit: boolean;
+  /** После автокоммита сразу пушить в origin. */
+  autoPush: boolean;
   /** Активный проект (null — проектов нет). */
   project: ProjectInfo | null;
   projectHasPassword: boolean;

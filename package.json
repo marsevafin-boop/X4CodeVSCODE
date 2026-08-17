@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.25",
+  "version": "0.0.26",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -219,6 +219,16 @@
           "type": "number",
           "default": 0,
           "description": "Окно контекста Codex в токенах для индикатора. 0 — автоматически (400k)."
+        },
+        "agentHub.autoCommit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Автокоммит: после каждого хода агента (Claude или Codex) все изменения в папке проекта коммитятся в git. Заголовок коммита — из промпта. Учтите: в коммит попадут и ваши несохранённые ручные правки."
+        },
+        "agentHub.autoPush": {
+          "type": "boolean",
+          "default": false,
+          "description": "После автокоммита сразу пушить текущую ветку в origin."
         },
         "agentHub.journalDir": {
           "type": "string",

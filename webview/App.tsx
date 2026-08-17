@@ -954,6 +954,31 @@ export function App() {
               </section>
 
               <section>
+                <h3>Git</h3>
+                <label className="set-row set-check">
+                  <input
+                    type="checkbox"
+                    checked={form.autoCommit}
+                    onChange={(e) => up((f) => (f.autoCommit = e.target.checked))}
+                  />
+                  <span>Автокоммит после каждого хода агента (Claude и Codex)</span>
+                </label>
+                <div className="set-hint">
+                  Все изменения в папке проекта коммитятся с заголовком из промпта.
+                  В коммит попадут и ваши ручные правки, сделанные во время хода.
+                </div>
+                <label className="set-row set-check">
+                  <input
+                    type="checkbox"
+                    checked={form.autoPush}
+                    disabled={!form.autoCommit}
+                    onChange={(e) => up((f) => (f.autoPush = e.target.checked))}
+                  />
+                  <span>…и сразу пушить текущую ветку в origin</span>
+                </label>
+              </section>
+
+              <section>
                 <h3>Журнал сессий</h3>
                 <label className="set-row">
                   <span>Папка</span>
