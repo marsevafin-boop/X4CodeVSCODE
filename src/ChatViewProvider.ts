@@ -13,7 +13,7 @@ import type {
 } from "./shared/protocol";
 import type { AgentBackend } from "./agents/types";
 import { ClaudeBackend } from "./agents/claudeBackend";
-import { CodexBackend } from "./agents/codexBackend";
+import { CodexBackend, codexDefaultModel } from "./agents/codexBackend";
 import { buildFinishPrompt, readJournalContext } from "./journal";
 
 const LEGACY_SESSIONS_KEY = "agentHub.sessions";
@@ -1134,6 +1134,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     this.postSafety();
+    this.postEfforts();
     this.postSlashCommands();
   }
 
@@ -1337,6 +1338,102 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         ? `Модель ${agent === "claude" ? "Claude" : "Codex"} со следующего хода: ${value}.`
         : `Модель ${agent === "claude" ? "Claude" : "Codex"}: по умолчанию CLI.`,
     });
+  }
+
+  /** Текущий effort обоих агентов — для кнопки в статус-баре чата. */
+  private postEfforts() {
+    for (const a of ["claude", "codex"] as const) {
+      this.post({
+        type: "effortInfo",
+        agent: a,
+        effort: vscode.workspace.getConfiguration(`agentHub.${a}`).get<string>("effort", ""),
+      });
+    }
+  }
+
+  /** Быстрый выбор effort (глубины размышлений) по клику в статус-баре. */
+  async pickEffort(agent: AgentId) {
+    const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
+    const current = section.get<string>("effort", "");
+    type Item = vscode.QuickPickItem & { value: string };
+    let base: Item[];
+    let subject = "Claude";
+    if (agent === "claude") {
+      base = [
+        { label: "По умолчанию", detail: "как настроено в CLI claude", value: "" },
+        { label: "low", detail: "быстрые ответы, лёгкие размышления", value: "low" },
+        { label: "medium", detail: "баланс скорости и глубины", value: "medium" },
+        { label: "high", detail: "глубже — для сложных задач", value: "high" },
+        { label: "xhigh", detail: "ещё глубже — для самых сложных задач", value: "xhigh" },
+        { label: "max", detail: "максимальная глубина размышлений", value: "max" },
+      ];
+    } else {
+      // Уровни берём из кэша CLI для выбранной модели (у разных моделей
+      // разный набор, у gpt-5.6-sol есть ultra); нет в кэше — типовой список.
+      const model = section.get<string>("model", "") || codexDefaultModel() || "";
+      const levels =
+        this.codexEffortLevels(model) ??
+        ["minimal", "low", "medium", "high", "xhigh"].map((e) => ({
+          effort: e,
+          description: undefined as string | undefined,
+        }));
+      base = [
+        { label: "По умолчанию", detail: "из ~/.codex/config.toml", value: "" },
+        ...levels.map((l) => ({ label: l.effort, detail: l.description, value: l.effort })),
+      ];
+      subject = `Codex (${model || "модель по умолчанию"})`;
+    }
+
+    const pick = await vscode.window.showQuickPick(
+      base.map((i) => ({
+        ...i,
+        description: i.value === current ? "✓ текущая настройка" : undefined,
+      })),
+      {
+        placeHolder: `Effort для ${subject} — применится со следующего хода`,
+        ignoreFocusOut: true,
+      },
+    );
+    if (!pick) return;
+
+    await section.update("effort", pick.value, vscode.ConfigurationTarget.Global);
+    await this.postSettings();
+    this.postEfforts();
+    this.post({
+      type: "info",
+      text: pick.value
+        ? `Effort ${agent === "claude" ? "Claude" : "Codex"} со следующего хода: ${pick.value}.`
+        : `Effort ${agent === "claude" ? "Claude" : "Codex"}: по умолчанию.`,
+    });
+  }
+
+  /** Поддерживаемые уровни размышлений модели Codex из кэша CLI. */
+  private codexEffortLevels(
+    model: string,
+  ): { effort: string; description?: string }[] | null {
+    if (!model) return null;
+    try {
+      const raw = fs.readFileSync(
+        nodePath.join(os.homedir(), ".codex", "models_cache.json"),
+        "utf8",
+      );
+      const parsed = JSON.parse(raw) as {
+        models?: {
+          slug?: string;
+          supported_reasoning_levels?: { effort?: string; description?: string }[];
+        }[];
+      };
+      const entry = (parsed.models ?? []).find((m) => m.slug === model);
+      const levels: { effort: string; description?: string }[] = [];
+      for (const l of entry?.supported_reasoning_levels ?? []) {
+        if (typeof l.effort === "string") {
+          levels.push({ effort: l.effort, description: l.description });
+        }
+      }
+      return levels.length > 0 ? levels : null;
+    } catch {
+      return null;
+    }
   }
 
   /** Модели Codex из кэша CLI (~/.codex/models_cache.json). */
@@ -1762,6 +1859,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case "pickModel":
         await this.pickModel(msg.agent);
+        break;
+      case "pickEffort":
+        await this.pickEffort(msg.agent);
         break;
       case "openFile":
         await this.openFileFromChat(msg.path, msg.project);

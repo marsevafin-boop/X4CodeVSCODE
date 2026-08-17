@@ -76,6 +76,7 @@ export type WebviewToHost =
   | { type: "saveSettings"; settings: SettingsSave }
   | { type: "cycleSafety"; agent: AgentId }
   | { type: "pickModel"; agent: AgentId }
+  | { type: "pickEffort"; agent: AgentId }
   | {
       /** Клик по плашке файла в ленте: открыть файл в редакторе.
        *  project — путь проекта ленты для резолва относительных путей. */
@@ -136,6 +137,7 @@ export type HostToWebview =
   | { type: "slashCommands"; agent: AgentId; commands: SlashCommandInfo[] }
   | { type: "settings"; settings: SettingsSnapshot }
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }
+  | { type: "effortInfo"; agent: AgentId; effort: string }
   | { type: "attachmentAdded"; files: Attachment[] }
   | { type: "serverTestResult"; ok: boolean; message: string }
   | { type: "configJson"; json: string }

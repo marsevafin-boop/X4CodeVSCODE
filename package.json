@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.26",
+  "version": "0.0.27",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -195,10 +195,11 @@
             "low",
             "medium",
             "high",
-            "xhigh"
+            "xhigh",
+            "ultra"
           ],
           "default": "",
-          "description": "model_reasoning_effort для Codex. Пусто — по умолчанию."
+          "description": "model_reasoning_effort для Codex. Пусто — по умолчанию. Набор уровней зависит от модели (ultra — только у топовых)."
         },
         "agentHub.codex.yolo": {
           "type": "boolean",

@@ -154,6 +154,7 @@ export function App() {
     claude: [],
     codex: [],
   });
+  const [efforts, setEfforts] = useState<Record<AgentId, string>>({ claude: "", codex: "" });
   const [slashIdx, setSlashIdx] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
   const [agent, setAgent] = useState<AgentId>("claude");
@@ -422,6 +423,9 @@ export function App() {
           break;
         case "slashCommands":
           setSlashCmds((prev) => ({ ...prev, [msg.agent]: msg.commands }));
+          break;
+        case "effortInfo":
+          setEfforts((prev) => ({ ...prev, [msg.agent]: msg.effort }));
           break;
         case "settings":
           setForm(msg.settings);
@@ -871,7 +875,7 @@ export function App() {
                     value={form.codex.effort}
                     onChange={(e) => up((f) => (f.codex.effort = e.target.value))}
                   >
-                    {["", "minimal", "low", "medium", "high", "xhigh"].map((v) => (
+                    {["", "minimal", "low", "medium", "high", "xhigh", "ultra"].map((v) => (
                       <option key={v} value={v}>
                         {v || "по умолчанию"}
                       </option>
@@ -1183,6 +1187,13 @@ export function App() {
           {models[agent].fallbackFrom
             ? `⚠️ ${models[agent].model} (фоллбэк с ${models[agent].fallbackFrom})`
             : models[agent].model || "модель: по умолчанию CLI"}
+        </button>
+        <button
+          className="safety-btn"
+          title="Effort — глубина размышлений выбранного агента. Клик — выбрать (применится со следующего хода)"
+          onClick={() => vscode.postMessage({ type: "pickEffort", agent })}
+        >
+          ⚡ {efforts[agent] || "effort: авто"}
         </button>
         <button
           className={`safety-btn ${safety[agent]?.dangerous ? "safety-danger" : ""}`}

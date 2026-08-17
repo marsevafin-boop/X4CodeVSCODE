@@ -6,7 +6,7 @@ import * as readline from "node:readline";
 import type { AgentBackend, AgentEvent, StartOptions } from "./types";
 
 /** Модель по умолчанию из ~/.codex/config.toml (когда в настройках не задана). */
-function codexDefaultModel(): string | null {
+export function codexDefaultModel(): string | null {
   try {
     const toml = fs.readFileSync(path.join(os.homedir(), ".codex", "config.toml"), "utf8");
     const m = toml.match(/^\s*model\s*=\s*"([^"]+)"/m);
