@@ -24,7 +24,23 @@ const CLAUDE_COMMANDS_KEY = "agentHub.claudeCommands";
 const TRANSCRIPT_MAX_ITEMS = 300;
 const MAX_SESSIONS_PER_PROJECT = 30;
 
+/** Общий лог беседы: лимиты хранения и вставки в промпт другого агента.
+ *  Вставка отбирает самые свежие записи; то, что не влезло в лимит,
+ *  сознательно отбрасывается (как при компакшне) — заголовок блока
+ *  сообщает агенту, что показан только хвост беседы. */
+const CHAT_LOG_MAX_ENTRIES = 200;
+const CHAT_LOG_ENTRY_MAX = 6000;
+const CROSS_INJECT_ENTRY_MAX = 4000;
+const CROSS_INJECT_TOTAL_MAX = 60000;
+
 type ProjectSessions = Record<AgentId, string | null>;
+
+/** Запись общего лога беседы — зеркало видимой ленты для передачи контекста между агентами. */
+interface ChatLogEntry {
+  agent: AgentId;
+  role: "user" | "assistant";
+  text: string;
+}
 
 /** Одна сессия в истории проекта. */
 interface SessionRecord {
@@ -36,6 +52,10 @@ interface SessionRecord {
   agentIds: ProjectSessions;
   /** Сохранённая лента чата (элементы webview). */
   items: unknown[];
+  /** Общий лог беседы: лента одна, а CLI-сессии агентов раздельные. */
+  chatLog?: ChatLogEntry[];
+  /** До какого индекса chatLog каждый агент видел ленту в своей CLI-сессии. */
+  chatSeen?: Partial<Record<AgentId, number>>;
   /** Последняя известная занятость контекста по агентам. */
   context?: Partial<Record<AgentId, { used: number; max: number }>>;
   /** Последняя известная модель по агентам. */
@@ -69,6 +89,47 @@ function buildAttachmentsBlock(attachments: Attachment[]): string {
     (a) => `- ${a.path}${isImagePath(a.path) ? " (изображение — открой и рассмотри)" : ""}`,
   );
   return `Приложенные файлы:\n${lines.join("\n")}`;
+}
+
+/** Обрезка текста для хранения в общем логе беседы. */
+function clipLog(text: string): string {
+  return text.length > CHAT_LOG_ENTRY_MAX
+    ? text.slice(0, CHAT_LOG_ENTRY_MAX) + "\n…[обрезано]"
+    : text;
+}
+
+/**
+ * Блок контекста для агента, не видевшего часть общей ленты: лента чата одна,
+ * а CLI-сессии Claude и Codex раздельные — при переключении агенту передаём
+ * текстом сообщения, которые обрабатывал другой агент.
+ */
+function buildCrossContext(entries: ChatLogEntry[]): { block: string; count: number } | null {
+  if (entries.length === 0) return null;
+  const picked: string[] = [];
+  let total = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    const name = e.agent === "claude" ? "Claude" : "Codex";
+    const who = e.role === "user" ? `Пользователь (агенту ${name})` : `Агент ${name}`;
+    const text =
+      e.text.length > CROSS_INJECT_ENTRY_MAX
+        ? e.text.slice(0, CROSS_INJECT_ENTRY_MAX) + "\n…[обрезано]"
+        : e.text;
+    const piece = `${who}:\n${text}`;
+    if (picked.length > 0 && total + piece.length > CROSS_INJECT_TOTAL_MAX) break;
+    picked.unshift(piece);
+    total += piece.length;
+  }
+  const note =
+    picked.length < entries.length
+      ? ` (показаны последние ${picked.length} из ${entries.length})`
+      : "";
+  const block =
+    `Контекст беседы: этот чат общий для двух агентов — Claude и Codex. ` +
+    `Ниже — сообщения этой же беседы, которые обрабатывал другой агент; ты их ещё не видел${note}:\n\n` +
+    picked.join("\n\n---\n\n") +
+    `\n\nЭто часть текущей беседы с пользователем: учитывай её и продолжай с места, где беседа остановилась.`;
+  return { block, count: picked.length };
 }
 
 /** Валидация и нормализация списка проектов из внешнего JSON. */
@@ -1174,6 +1235,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await this.saveProjectStore(projectPath, store);
   }
 
+  /** Мутация конкретной записи по id — не «активной»: пока ход шёл, пользователь
+   *  мог переключить сессию, а данные хода принадлежат записи, где он начался. */
+  private async mutateRecord(
+    projectPath: string,
+    recordId: string,
+    fn: (rec: SessionRecord) => void,
+  ) {
+    const store = this.getProjectStore(projectPath);
+    const rec = store.sessions.find((s) => s.id === recordId);
+    if (!rec) return;
+    fn(rec);
+    rec.updatedAt = Date.now();
+    await this.saveProjectStore(projectPath, store);
+  }
+
   /** Полное состояние для webview: проекты, лента активной сессии, session id. */
   private postFullState() {
     const projects = this.getProjects();
@@ -1758,6 +1834,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         current.updatedAt = Date.now();
         current.context = {};
         current.models = {};
+        current.chatLog = [];
+        current.chatSeen = {};
       } else {
         keptPrevious = !!current;
         const rec = this.createRecord();
@@ -2074,6 +2152,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Новая сессия — карточка проекта + контекст из журнала (общая память).
     const record = await this.ensureActiveRecord(cwd);
     const sessions = record.agentIds;
+
+    // Контекст между агентами: лента чата общая, а CLI-сессии раздельные.
+    // Сообщения, обработанные другим агентом, этот агент не видел — подкладываем
+    // их в промпт. Slash-команды пропускаем: их промпт обязан начинаться с «/».
+    const chatLog = record.chatLog ?? [];
+    const seenIdx = Math.min(record.chatSeen?.[agent] ?? 0, chatLog.length);
+    const unseen = chatLog.slice(seenIdx).filter((e) => e.agent !== agent);
+    const crossContext = isSlashCommand ? null : buildCrossContext(unseen);
+    if (crossContext) {
+      this.postScoped(cwd, {
+        type: "info",
+        text: `В контекст добавлены сообщения другого агента из этой ленты: ${crossContext.count}.`,
+      });
+    }
+
     let fullPrompt = promptWithAttachments;
     if (!sessions[agent] && !isSlashCommand) {
       const cfg = vscode.workspace.getConfiguration("agentHub");
@@ -2087,12 +2180,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         parts.push(journalContext);
         this.postScoped(cwd, { type: "info", text: "В контекст добавлены записи журнала сессий." });
       }
+      if (crossContext) parts.push(crossContext.block);
       parts.push(`Задача пользователя:\n${promptWithAttachments}`);
       fullPrompt = parts.join("\n\n");
+    } else if (crossContext) {
+      fullPrompt = `${crossContext.block}\n\nНовое сообщение пользователя:\n${promptWithAttachments}`;
     }
 
     // Пароль сервера — только через окружение, никогда в тексте диалога.
     const serverPassword = await this.context.secrets.get(this.passwordKey(project.path));
+
+    // Копим ответ агента для общего лога беседы (Claude — дельтами,
+    // Codex и slash-вывод — целыми сообщениями).
+    let answerBuf = "";
+    let delivered = false;
+
+    // Мутации привязаны к записи хода: пока ход шёл, «Новая сессия» могла
+    // переключить активную запись или переиспользовать эту же (тот же id,
+    // но новый createdAt) — данные хода в чужую/очищенную запись не пишем.
+    const recordGen = record.createdAt;
+    const mutateTurnRecord = (fn: (rec: SessionRecord) => void) =>
+      this.mutateRecord(cwd, record.id, (r) => {
+        if (r.createdAt !== recordGen) return;
+        fn(r);
+      });
 
     try {
       const events = this.backends[agent].start(fullPrompt, {
@@ -2107,10 +2218,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         confirmTool: (toolName, input) => this.confirmTool(toolName, input, cwd),
       });
 
+      // «Доставлено» — только содержательные события (сессия создана, текст,
+      // инструменты, успешный результат). Ошибки Codex приходят событиями, а не
+      // исключениями: сбой CLI до старта треда не должен помечать контекст
+      // «увиденным» — иначе другой агент потеряет эти сообщения навсегда.
       for await (const ev of events) {
         switch (ev.kind) {
           case "session":
-            await this.mutateActiveRecord(cwd, (r) => {
+            delivered = true;
+            await mutateTurnRecord((r) => {
               r.agentIds[agent] = ev.sessionId;
             });
             this.postScoped(cwd, { type: "sessionInfo", sessionId: ev.sessionId, agent });
@@ -2127,28 +2243,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this.post({ type: "slashCommands", agent, commands: ev.commands });
             break;
           case "contextUsage":
-            await this.mutateActiveRecord(cwd, (r) => {
+            await mutateTurnRecord((r) => {
               r.context = { ...r.context, [agent]: { used: ev.usedTokens, max: ev.maxTokens } };
             });
             this.postScoped(cwd, { type: "contextUsage", agent, used: ev.usedTokens, max: ev.maxTokens });
             break;
           case "model":
-            await this.mutateActiveRecord(cwd, (r) => {
+            await mutateTurnRecord((r) => {
               r.models = { ...r.models, [agent]: ev.model };
               r.modelFallbacks = { ...r.modelFallbacks, [agent]: ev.fallbackFrom ?? undefined };
             });
             this.postScoped(cwd, { type: "modelInfo", agent, model: ev.model, fallbackFrom: ev.fallbackFrom });
             break;
           case "textDelta":
+            delivered = true;
+            answerBuf += ev.text;
             this.postScoped(cwd, { type: "textDelta", text: ev.text });
             break;
           case "assistantText":
+            delivered = true;
+            answerBuf = answerBuf ? `${answerBuf}\n\n${ev.text}` : ev.text;
             this.postScoped(cwd, { type: "assistantText", text: ev.text });
             break;
           case "toolUse":
+            delivered = true;
             this.postScoped(cwd, { type: "toolUse", toolName: ev.toolName, summary: ev.summary });
             break;
           case "result":
+            if (ev.ok) delivered = true;
             this.postScoped(cwd, {
               type: "turnResult",
               ok: ev.ok,
@@ -2174,6 +2296,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     } finally {
       this.runs.delete(cwd);
+      // Общий лог беседы — зеркало видимой ленты: из него другой агент получит
+      // контекст. Отметку «видел до сих пор» двигаем, только если промпт реально
+      // дошёл до агента; свои же сообщения агенту не пересылаются (фильтр выше).
+      const answer = answerBuf.trim();
+      // Вложения — частью записи: другой агент должен видеть пути файлов.
+      const logUserText = attachBlock ? `${prompt}\n\n${attachBlock}` : prompt;
+      await mutateTurnRecord((r) => {
+        const log = (r.chatLog ??= []);
+        if (echoUser) log.push({ agent, role: "user", text: clipLog(logUserText) });
+        if (answer) log.push({ agent, role: "assistant", text: clipLog(answer) });
+        const seen: Partial<Record<AgentId, number>> = { ...(r.chatSeen ?? {}) };
+        if (delivered && !isSlashCommand) seen[agent] = log.length;
+        const overflow = log.length - CHAT_LOG_MAX_ENTRIES;
+        if (overflow > 0) {
+          log.splice(0, overflow);
+          for (const key of Object.keys(seen) as AgentId[]) {
+            seen[key] = Math.max(0, (seen[key] ?? 0) - overflow);
+          }
+        }
+        r.chatSeen = seen;
+      });
       this.postScoped(cwd, { type: "busy", value: false });
     }
   }
