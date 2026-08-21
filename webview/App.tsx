@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
@@ -159,6 +166,24 @@ export function App() {
   const [slashDismissed, setSlashDismissed] = useState(false);
   const [agent, setAgent] = useState<AgentId>("claude");
   const [draft, setDraft] = useState("");
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  /** Ручная высота поля ввода (px); null — автоподстройка под текст. */
+  const [composerHeight, setComposerHeight] = useState<number | null>(() => {
+    try {
+      const v = Number(localStorage.getItem("agentHub.composerHeight"));
+      return v > 0 ? v : null;
+    } catch {
+      return null;
+    }
+  });
+  /** Развёрнутое поле ввода (большая область для вычитки текста). */
+  const [composerExpanded, setComposerExpanded] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("agentHub.composerExpanded") === "1";
+    } catch {
+      return false;
+    }
+  });
   const [pending, setPending] = useState<Attachment[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [form, setForm] = useState<SettingsSnapshot | null>(null);
@@ -572,6 +597,57 @@ export function App() {
       return next;
     });
     vscode.postMessage({ type: "permission", requestId, allow, answer });
+  };
+
+  // Высота поля ввода: развёрнуто — из CSS; ручная — как потянули; иначе —
+  // автоподстройка под текст (до половины окна), чтобы написанное было видно.
+  useEffect(() => {
+    const ta = composerRef.current;
+    if (!ta) return;
+    if (composerExpanded) {
+      ta.style.height = "";
+      return;
+    }
+    if (composerHeight) {
+      ta.style.height = `${composerHeight}px`;
+      return;
+    }
+    ta.style.height = "auto";
+    const max = Math.max(120, Math.floor(window.innerHeight * 0.5));
+    ta.style.height = `${Math.min(ta.scrollHeight + 2, max)}px`;
+  }, [draft, composerHeight, composerExpanded, activePath]);
+
+  useEffect(() => {
+    try {
+      if (composerHeight) localStorage.setItem("agentHub.composerHeight", String(composerHeight));
+      else localStorage.removeItem("agentHub.composerHeight");
+      localStorage.setItem("agentHub.composerExpanded", composerExpanded ? "1" : "0");
+    } catch {
+      // хранилище недоступно — высота просто не запомнится
+    }
+  }, [composerHeight, composerExpanded]);
+
+  /** Перетаскивание разделителя над полем ввода — ручная высота. */
+  const startComposerResize = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const ta = composerRef.current;
+    if (!ta) return;
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = ta.getBoundingClientRect().height;
+    const maxH = Math.floor(window.innerHeight * 0.85);
+    const onMove = (ev: PointerEvent) => {
+      const h = Math.round(Math.min(maxH, Math.max(54, startH + (startY - ev.clientY))));
+      setComposerExpanded(false);
+      setComposerHeight(h);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      document.body.classList.remove("resizing-composer");
+    };
+    document.body.classList.add("resizing-composer");
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   };
 
   const send = () => {
@@ -1411,13 +1487,22 @@ export function App() {
       </main>
 
       <footer
-        className="composer"
+        className={`composer${composerExpanded ? " composer-expanded" : ""}`}
         onDragOver={(e) => e.preventDefault()}
         onDrop={(e) => {
           e.preventDefault();
           if (e.dataTransfer.files.length) ingestFiles(e.dataTransfer.files);
         }}
       >
+        <div
+          className="composer-resizer"
+          title="Потяните, чтобы изменить высоту поля ввода. Двойной клик — снова автоматически"
+          onPointerDown={startComposerResize}
+          onDoubleClick={() => {
+            setComposerHeight(null);
+            setComposerExpanded(false);
+          }}
+        />
         {queue.length > 0 && (
           <div className="attach-row">
             {queue.map((q, i) => (
@@ -1478,6 +1563,7 @@ export function App() {
           </div>
         )}
         <textarea
+          ref={composerRef}
           value={draft}
           placeholder="Сообщение агенту… (Enter — отправить, «/» — команды CLI, Cmd+V — вставить скриншот, файлы можно перетащить)"
           onChange={(e) => {
@@ -1521,14 +1607,31 @@ export function App() {
           rows={3}
         />
         <div className="actions">
-          <button
-            className="attach-btn"
-            title="Прикрепить файлы (или вставьте скриншот из буфера, или перетащите сюда)"
-            disabled={busy}
-            onClick={() => vscode.postMessage({ type: "pickAttachment" })}
-          >
-            📎
-          </button>
+          <div className="actions-left">
+            <button
+              className="attach-btn"
+              title="Прикрепить файлы (или вставьте скриншот из буфера, или перетащите сюда)"
+              disabled={busy}
+              onClick={() => vscode.postMessage({ type: "pickAttachment" })}
+            >
+              📎
+            </button>
+            <button
+              className="attach-btn expand-btn"
+              title={
+                composerExpanded
+                  ? "Свернуть поле ввода"
+                  : "Развернуть поле ввода — удобно вычитывать длинный текст"
+              }
+              onClick={() => {
+                setComposerExpanded((v) => !v);
+                setComposerHeight(null);
+                composerRef.current?.focus();
+              }}
+            >
+              {composerExpanded ? "⤡" : "⤢"}
+            </button>
+          </div>
           {busy ? (
             <>
               <button
