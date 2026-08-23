@@ -59,6 +59,7 @@ export type WebviewToHost =
   | { type: "selectProject"; path: string }
   | { type: "addProject" }
   | { type: "deleteProject"; path: string }
+  | { type: "manageProjects" }
   | { type: "showSessions" }
   | { type: "openFullView" }
   | { type: "getSettings" }

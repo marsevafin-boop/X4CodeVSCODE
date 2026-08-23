@@ -21,6 +21,8 @@ const LEGACY_TRANSCRIPTS_KEY = "agentHub.transcripts";
 const STORE_KEY = "agentHub.sessionStore";
 const ACTIVE_PROJECT_KEY = "agentHub.activeProject";
 const CLAUDE_COMMANDS_KEY = "agentHub.claudeCommands";
+/** Папки workspace, которые пользователь убрал из списка проектов. */
+const HIDDEN_PROJECTS_KEY = "agentHub.hiddenProjects";
 const TRANSCRIPT_MAX_ITEMS = 300;
 const MAX_SESSIONS_PER_PROJECT = 30;
 
@@ -261,14 +263,99 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
+    // Папки workspace — автоматически, кроме тех, что пользователь убрал.
+    const hidden = new Set(this.context.globalState.get<string[]>(HIDDEN_PROJECTS_KEY, []));
     for (const folder of vscode.workspace.workspaceFolders ?? []) {
       const path = folder.uri.fsPath;
-      if (!seen.has(path)) {
+      if (!seen.has(path) && !hidden.has(path)) {
         seen.add(path);
         projects.push({ name: folder.name, path });
       }
     }
     return projects;
+  }
+
+  private async setProjectHidden(path: string, hidden: boolean) {
+    const list = this.context.globalState.get<string[]>(HIDDEN_PROJECTS_KEY, []);
+    const next = hidden ? [...new Set([...list, path])] : list.filter((p) => p !== path);
+    await this.context.globalState.update(HIDDEN_PROJECTS_KEY, next);
+  }
+
+  /**
+   * Список всех проектов: переключиться (выбор строки), удалить любой
+   * (корзинка у строки — без переключения на него), добавить новый.
+   */
+  async manageProjects() {
+    type Item = vscode.QuickPickItem & { path?: string; add?: boolean };
+    const qp = vscode.window.createQuickPick<Item>();
+    qp.title = "Проекты Agent Hub";
+    qp.placeholder = "Выберите проект, чтобы переключиться (корзинка у строки — удалить)";
+    qp.ignoreFocusOut = true;
+
+    const toItems = (): Item[] => {
+      const active = this.getActiveProject();
+      const items: Item[] = this.getProjects().map((p) => ({
+        label: (p.path === active?.path ? "$(circle-filled) " : "$(folder) ") + p.name,
+        description: p.path,
+        detail:
+          [
+            p.githubRepo,
+            p.serverHost && `сервер: ${p.serverHost}`,
+            this.runs.has(p.path) && "⏳ идёт ход",
+          ]
+            .filter(Boolean)
+            .join(" · ") || undefined,
+        path: p.path,
+        buttons: [{ iconPath: new vscode.ThemeIcon("trash"), tooltip: "Удалить проект…" }],
+      }));
+      items.push({ label: "$(add) Добавить проект…", add: true });
+      return items;
+    };
+    qp.items = toItems();
+
+    // Модальное подтверждение удаления может скрыть список — не уничтожаем
+    // его, пока идёт удаление, и показываем снова.
+    let deleting = false;
+    qp.onDidTriggerItemButton(async (e) => {
+      if (!e.item.path) return;
+      deleting = true;
+      try {
+        await this.deleteProject(e.item.path);
+      } finally {
+        deleting = false;
+      }
+      qp.items = toItems();
+      qp.show();
+    });
+
+    qp.onDidAccept(async () => {
+      const picked = qp.selectedItems[0];
+      qp.hide();
+      if (!picked) return;
+      if (picked.add) {
+        await this.addProject();
+        return;
+      }
+      if (picked.path) {
+        await this.context.globalState.update(ACTIVE_PROJECT_KEY, picked.path);
+        this.postFullState();
+      }
+    });
+
+    qp.onDidHide(() => {
+      if (!deleting) qp.dispose();
+    });
+    qp.show();
+  }
+
+  /** Удаление активного проекта — для команды палитры и кнопки панели. */
+  async deleteActiveProject() {
+    const active = this.getActiveProject();
+    if (!active) {
+      void vscode.window.showWarningMessage("Нет проектов — удалять нечего.");
+      return;
+    }
+    await this.deleteProject(active.path);
   }
 
   private getActiveProject(): ProjectInfo | null {
@@ -296,6 +383,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
     if (!picked?.[0]) return;
     const path = picked[0].fsPath;
+    // Явно добавленная папка workspace больше не считается скрытой.
+    await this.setProjectHidden(path, false);
 
     const cfg = vscode.workspace.getConfiguration("agentHub");
     const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
@@ -372,6 +461,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (this.context.globalState.get<string>(ACTIVE_PROJECT_KEY) === path) {
       await this.context.globalState.update(ACTIVE_PROJECT_KEY, undefined);
     }
+    // Папка workspace иначе вернётся в список автоматически — помечаем скрытой.
+    if (isWorkspaceFolder) await this.setProjectHidden(path, true);
 
     if (choice === WITH_FOLDER) {
       // Пароль и историю сессий вычищаем вместе с папкой.
@@ -404,7 +495,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         choice === WITH_FOLDER
           ? `Проект «${project.name}» удалён, папка отправлена в Корзину.`
           : isWorkspaceFolder
-            ? `Проект «${project.name}» убран из реестра, но папка открыта в workspace — она останется в списке, пока открыта.`
+            ? `Проект «${project.name}» убран из списка (папка остаётся открытой в workspace). Вернуть — «＋ Добавить проект…».`
             : `Проект «${project.name}» убран из списка. Файлы и история сессий не тронуты.`,
     });
   }
@@ -1973,6 +2064,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case "deleteProject":
         await this.deleteProject(msg.path);
+        break;
+      case "manageProjects":
+        await this.manageProjects();
         break;
       case "saveTranscript": {
         const store = this.getProjectStore(msg.path);

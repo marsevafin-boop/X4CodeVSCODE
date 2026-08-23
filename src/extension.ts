@@ -14,6 +14,10 @@ export function activate(context: vscode.ExtensionContext) {
       provider.setServerPassword(),
     ),
     vscode.commands.registerCommand("agentHub.editProject", () => provider.editProject()),
+    vscode.commands.registerCommand("agentHub.deleteProject", () =>
+      provider.deleteActiveProject(),
+    ),
+    vscode.commands.registerCommand("agentHub.manageProjects", () => provider.manageProjects()),
     vscode.commands.registerCommand("agentHub.openFullView", () => provider.openFullView()),
     vscode.commands.registerCommand("agentHub.exportSettings", () => provider.exportSettings()),
     vscode.commands.registerCommand("agentHub.importSettings", () => provider.importSettings()),

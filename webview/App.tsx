@@ -698,6 +698,10 @@ export function App() {
       vscode.postMessage({ type: "addProject" });
       return;
     }
+    if (value === "__manage__") {
+      vscode.postMessage({ type: "manageProjects" });
+      return;
+    }
     setActivePath(value);
     vscode.postMessage({ type: "selectProject", path: value });
   };
@@ -733,6 +737,35 @@ export function App() {
             <div className="empty">Загрузка…</div>
           ) : (
             <>
+              <section>
+                <h3>🗂 Все проекты</h3>
+                {projects.length === 0 && <div className="empty">Проектов пока нет.</div>}
+                {projects.map((p) => (
+                  <div key={p.path} className="proj-row">
+                    <span className="proj-name" title={p.path}>
+                      {p.path === activePath ? "● " : "📁 "}
+                      {p.name}
+                    </span>
+                    <span className="proj-path">{p.path}</span>
+                    <button
+                      className="finish-btn delete-btn"
+                      title="Удалить проект: убрать из списка или удалить вместе с папкой (в Корзину)"
+                      onClick={() => vscode.postMessage({ type: "deleteProject", path: p.path })}
+                    >
+                      🗑
+                    </button>
+                  </div>
+                ))}
+                <div className="set-actions" style={{ paddingTop: 6, paddingBottom: 0 }}>
+                  <button
+                    className="finish-btn"
+                    onClick={() => vscode.postMessage({ type: "addProject" })}
+                  >
+                    ＋ Добавить проект…
+                  </button>
+                </div>
+              </section>
+
               {form.project && (
                 <section>
                   <h3>📁 Проект «{form.project.name}»</h3>
@@ -1208,6 +1241,7 @@ export function App() {
             </option>
           ))}
           <option value="__add__">＋ Добавить проект…</option>
+          <option value="__manage__">🗂 Все проекты: переключить / удалить…</option>
         </select>
         <select
           className="agent-select"
@@ -1233,6 +1267,13 @@ export function App() {
           onClick={() => vscode.postMessage({ type: "showSessions" })}
         >
           🕘 История
+        </button>
+        <button
+          className="finish-btn"
+          title="Все проекты: переключиться, удалить любой (🗑 у строки), добавить"
+          onClick={() => vscode.postMessage({ type: "manageProjects" })}
+        >
+          🗂 Проекты
         </button>
         <button
           className="finish-btn"
