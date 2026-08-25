@@ -139,6 +139,7 @@ export type HostToWebview =
   | { type: "settings"; settings: SettingsSnapshot }
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }
   | { type: "effortInfo"; agent: AgentId; effort: string }
+  | { type: "autoScrollMode"; mode: string }
   | { type: "attachmentAdded"; files: Attachment[] }
   | { type: "serverTestResult"; ok: boolean; message: string }
   | { type: "configJson"; json: string }
@@ -171,6 +172,8 @@ export interface SettingsSnapshot {
   autoPush: boolean;
   /** Перед каждым ходом подтягивать новые коммиты из origin. */
   autoPull: boolean;
+  /** Автопрокрутка чата: perProject (галочка у каждого проекта) | allOn | allOff. */
+  autoScrollMode: string;
   /** Активный проект (null — проектов нет). */
   project: ProjectInfo | null;
   projectHasPassword: boolean;

@@ -1011,3 +1011,61 @@ body.resizing-composer {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ---------- Автопрокрутка ---------- */
+
+.autoscroll-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  opacity: 0.85;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.autoscroll-check input {
+  margin: 0;
+}
+
+.autoscroll-check:has(input:disabled) {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Кнопка «к последнему сообщению» — прилипает к низу видимой части ленты. */
+.scroll-down-wrap {
+  position: sticky;
+  bottom: 6px;
+  height: 0;
+  display: flex;
+  justify-content: center;
+  z-index: 5;
+}
+
+.scroll-down {
+  transform: translateY(-100%);
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  color: var(--vscode-foreground);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+.scroll-down:hover {
+  background: var(--vscode-toolbar-hoverBackground);
+}
+
+.set-row select {
+  background: var(--vscode-dropdown-background);
+  color: var(--vscode-dropdown-foreground);
+  border: 1px solid var(--vscode-dropdown-border);
+  border-radius: 3px;
+  padding: 3px 6px;
+  min-width: 0;
+}

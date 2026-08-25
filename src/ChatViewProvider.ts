@@ -972,6 +972,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       autoCommit: cfg.get<boolean>("autoCommit", true),
       autoPush: cfg.get<boolean>("autoPush", false),
       autoPull: cfg.get<boolean>("autoPull", true),
+      autoScrollMode: cfg.get<string>("autoScrollMode", "perProject"),
       // Реестр + папки workspace — на другой машине всё станет реестром.
       projects: this.getProjects(),
     };
@@ -1005,6 +1006,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await setIf("autoCommit", settings.autoCommit, "boolean");
     await setIf("autoPush", settings.autoPush, "boolean");
     await setIf("autoPull", settings.autoPull, "boolean");
+    await setIf("autoScrollMode", settings.autoScrollMode, "string");
     if (Array.isArray(settings.autoAllowTools)) {
       await cfg.update("autoAllowTools", settings.autoAllowTools, g);
     }
@@ -1377,6 +1379,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
       }
     }
+    this.post({
+      type: "autoScrollMode",
+      mode: vscode.workspace
+        .getConfiguration("agentHub")
+        .get<string>("autoScrollMode", "perProject"),
+    });
     this.postSafety();
     this.postEfforts();
     this.postSlashCommands();
@@ -1436,6 +1444,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       autoCommit: cfg.get<boolean>("autoCommit", true),
       autoPush: cfg.get<boolean>("autoPush", false),
       autoPull: cfg.get<boolean>("autoPull", true),
+      autoScrollMode: cfg.get<string>("autoScrollMode", "perProject"),
       project,
       projectHasPassword: hasPassword,
     };
@@ -1469,6 +1478,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await cfg.update("autoCommit", s.autoCommit, g);
     await cfg.update("autoPush", s.autoPush, g);
     await cfg.update("autoPull", s.autoPull, g);
+    await cfg.update("autoScrollMode", s.autoScrollMode, g);
 
     if (s.project) {
       const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];

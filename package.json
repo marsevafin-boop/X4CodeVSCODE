@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.31",
+  "version": "0.0.32",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -249,6 +249,21 @@
           "type": "boolean",
           "default": true,
           "description": "Перед каждым ходом агента проверять origin (git fetch) и подтягивать новые коммиты — агент работает с актуальной версией. При конфликте ход продолжается на текущей версии с предупреждением."
+        },
+        "agentHub.autoScrollMode": {
+          "type": "string",
+          "enum": [
+            "perProject",
+            "allOn",
+            "allOff"
+          ],
+          "enumDescriptions": [
+            "У каждого проекта своя галочка «⇣ авто» в статус-баре чата",
+            "Автопрокрутка принудительно включена во всех проектах",
+            "Автопрокрутка принудительно выключена во всех проектах"
+          ],
+          "default": "perProject",
+          "description": "Автопрокрутка ленты чата к новым сообщениям."
         },
         "agentHub.journalDir": {
           "type": "string",

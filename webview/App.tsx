@@ -195,6 +195,18 @@ export function App() {
   const [configJson, setConfigJson] = useState("");
   const [configResult, setConfigResult] = useState<{ ok: boolean; message: string } | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const feedRef = useRef<HTMLElement>(null);
+  /** Общий режим автопрокрутки: perProject | allOn | allOff. */
+  const [autoScrollMode, setAutoScrollMode] = useState("perProject");
+  /** Галочка автопрокрутки — своя у каждого проекта (по умолчанию включена). */
+  const [autoScrollBy, setAutoScrollBy] = useState<Record<string, boolean>>(() => {
+    try {
+      return JSON.parse(localStorage.getItem("agentHub.autoScrollBy") || "{}");
+    } catch {
+      return {};
+    }
+  });
+  const [atBottom, setAtBottom] = useState(true);
 
   const activeRef = useRef(activePath);
   activeRef.current = activePath;
@@ -452,6 +464,9 @@ export function App() {
         case "effortInfo":
           setEfforts((prev) => ({ ...prev, [msg.agent]: msg.effort }));
           break;
+        case "autoScrollMode":
+          setAutoScrollMode(msg.mode);
+          break;
         case "settings":
           setForm(msg.settings);
           setNewPassword(undefined);
@@ -579,9 +594,37 @@ export function App() {
     return () => clearInterval(timer);
   }, [busyBy, activePath]);
 
+  const autoScrollForced = autoScrollMode !== "perProject";
+  const autoScrollOn =
+    autoScrollMode === "allOn"
+      ? true
+      : autoScrollMode === "allOff"
+        ? false
+        : (autoScrollBy[activePath] ?? true);
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [items, activity]);
+    try {
+      localStorage.setItem("agentHub.autoScrollBy", JSON.stringify(autoScrollBy));
+    } catch {
+      // хранилище недоступно — галочка просто не запомнится
+    }
+  }, [autoScrollBy]);
+
+  /** Внизу ли лента (с запасом 60px) — для показа кнопки «к последнему». */
+  const updateAtBottom = () => {
+    const el = feedRef.current;
+    if (!el) return;
+    setAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 60);
+  };
+
+  useEffect(() => {
+    if (autoScrollOn) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    } else {
+      // Контент дорос без прокрутки — пересчитать, показывать ли кнопку ⇣.
+      updateAtBottom();
+    }
+  }, [items, activity, autoScrollOn, activePath]);
 
   const answerPermission = (requestId: string, allow: boolean, answer?: string) => {
     // Карточка может лежать в любой ленте — обновляем во всех проектах.
@@ -1067,6 +1110,26 @@ export function App() {
               </section>
 
               <section>
+                <h3>Интерфейс</h3>
+                <label className="set-row">
+                  <span>Автопрокрутка чата</span>
+                  <select
+                    value={form.autoScrollMode}
+                    onChange={(e) => up((f) => (f.autoScrollMode = e.target.value))}
+                  >
+                    <option value="perProject">По проектам — галочка «⇣ авто» в статус-баре</option>
+                    <option value="allOn">Включена во всех проектах</option>
+                    <option value="allOff">Выключена во всех проектах</option>
+                  </select>
+                </label>
+                <div className="set-hint">
+                  «По проектам» — у каждого проекта своя галочка, значение запоминается.
+                  Остальные режимы принудительно включают или выключают автопрокрутку
+                  во всех проектах (галочка блокируется).
+                </div>
+              </section>
+
+              <section>
                 <h3>Git</h3>
                 <label className="set-row set-check">
                   <input
@@ -1196,6 +1259,7 @@ export function App() {
                   className="send set-save"
                   onClick={() => {
                     vscode.postMessage({ type: "saveSettings", settings: { ...form, newPassword } });
+                    setAutoScrollMode(form.autoScrollMode);
                     setSettingsOpen(false);
                   }}
                 >
@@ -1332,6 +1396,24 @@ export function App() {
         >
           {safety[agent]?.label ?? "🔒"}
         </button>
+        <label
+          className="autoscroll-check"
+          title={
+            autoScrollForced
+              ? `Задано общей настройкой (⚙ → Интерфейс): автопрокрутка ${autoScrollOn ? "включена" : "выключена"} во всех проектах`
+              : "Автопрокрутка чата к новым сообщениям. Галочка своя у каждого проекта, значение запоминается"
+          }
+        >
+          <input
+            type="checkbox"
+            checked={autoScrollOn}
+            disabled={autoScrollForced}
+            onChange={(e) =>
+              setAutoScrollBy((prev) => ({ ...prev, [activePath]: e.target.checked }))
+            }
+          />
+          ⇣ авто
+        </label>
         {contextUsage[agent] && (
           <span
             className="ctx"
@@ -1356,7 +1438,7 @@ export function App() {
         )}
       </div>
 
-      <main className="feed">
+      <main className="feed" ref={feedRef} onScroll={updateAtBottom}>
         {items.length === 0 && (
           <div className="empty">
             Спросите что-нибудь — агент работает в папке выбранного проекта: читает
@@ -1522,6 +1604,17 @@ export function App() {
             <span className="spinner" />
             {activity ?? "Работает…"}
             {elapsed > 0 && <span className="activity-time"> · {formatElapsed(elapsed)}</span>}
+          </div>
+        )}
+        {!atBottom && (
+          <div className="scroll-down-wrap">
+            <button
+              className="scroll-down"
+              title="К последнему сообщению"
+              onClick={() => bottomRef.current?.scrollIntoView({ behavior: "smooth" })}
+            >
+              ⇣
+            </button>
           </div>
         )}
         <div ref={bottomRef} />
