@@ -28,6 +28,8 @@ type ChatItem =
       text: string;
       streaming?: boolean;
       attachments?: string[];
+      /** Когда сообщение появилось (Date.now, локальное время машины). */
+      ts?: number;
     }
   | { id: number; role: "tool"; toolName: string; summary: string }
   | { id: number; role: "info" | "error"; text: string }
@@ -340,7 +342,7 @@ export function App() {
           const updated = { ...last, text: last.text + text };
           return [...prev.slice(0, -1), updated];
         }
-        return [...prev, { id: nextId++, role: "assistant", text, streaming: true }];
+        return [...prev, { id: nextId++, role: "assistant", text, streaming: true, ts: Date.now() }];
       });
     },
     [mutateItems],
@@ -498,6 +500,7 @@ export function App() {
               id: nextId++,
               role: "user",
               text: msg.text,
+              ts: Date.now(),
               ...(msg.attachments?.length ? { attachments: msg.attachments } : {}),
             },
           ]);
@@ -507,7 +510,7 @@ export function App() {
           break;
         case "assistantText":
           finalizeStreaming(p);
-          mutateItems(p, (x) => [...x, { id: nextId++, role: "assistant", text: msg.text }]);
+          mutateItems(p, (x) => [...x, { id: nextId++, role: "assistant", text: msg.text, ts: Date.now() }]);
           break;
         case "toolUse":
           finalizeStreaming(p);
@@ -751,6 +754,16 @@ export function App() {
 
   const formatElapsed = (s: number) =>
     s < 60 ? `${s} с` : `${Math.floor(s / 60)} мин ${s % 60} с`;
+
+  /** Дата и время сообщения по часам компьютера: 25.08.2026, 14:37. */
+  const formatStamp = (ts: number) =>
+    new Date(ts).toLocaleString("ru-RU", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
 
   /** Иммутабельное обновление формы настроек. */
   const up = (fn: (f: SettingsSnapshot) => void) =>
@@ -1507,6 +1520,7 @@ export function App() {
                   {it.attachments && it.attachments.length > 0 && (
                     <div className="msg-attachments">📎 {it.attachments.join(", ")}</div>
                   )}
+                  {it.ts && <div className="msg-time">{formatStamp(it.ts)}</div>}
                 </div>
               );
             case "assistant":
@@ -1516,6 +1530,7 @@ export function App() {
                     {it.text}
                   </ReactMarkdown>
                   {it.streaming && <span className="cursor">▌</span>}
+                  {it.ts && !it.streaming && <div className="msg-time">{formatStamp(it.ts)}</div>}
                 </div>
               );
             case "meta":

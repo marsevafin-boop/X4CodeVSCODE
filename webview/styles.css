@@ -1069,3 +1069,13 @@ body.resizing-composer {
   padding: 3px 6px;
   min-width: 0;
 }
+
+/* Дата и время сообщения — справа снизу пузыря. */
+.msg-time {
+  text-align: right;
+  font-size: 0.72em;
+  opacity: 0.55;
+  margin-top: 4px;
+  white-space: nowrap;
+  user-select: none;
+}
