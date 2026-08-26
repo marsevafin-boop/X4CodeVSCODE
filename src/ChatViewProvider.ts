@@ -337,7 +337,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       if (picked.path) {
-        await this.context.globalState.update(ACTIVE_PROJECT_KEY, picked.path);
+        await this.setActivePath(picked.path);
         this.postFullState();
       }
     });
@@ -358,9 +358,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await this.deleteProject(active.path);
   }
 
+  /**
+   * Активный проект — per-окно (workspaceState): у каждого окна VS Code свой.
+   * Раньше он лежал в globalState, а тот ОБЩИЙ для всех окон — окна с разными
+   * проектами перезаписывали выбор друг друга, и форма настроек показывала
+   * чужой проект. Старое глобальное значение оставлено как фолбэк-миграция.
+   */
+  private getActivePathRaw(): string | undefined {
+    return (
+      this.context.workspaceState.get<string>(ACTIVE_PROJECT_KEY) ??
+      this.context.globalState.get<string>(ACTIVE_PROJECT_KEY)
+    );
+  }
+
+  private async setActivePath(path: string | undefined) {
+    await this.context.workspaceState.update(ACTIVE_PROJECT_KEY, path);
+  }
+
   private getActiveProject(): ProjectInfo | null {
     const projects = this.getProjects();
-    const saved = this.context.globalState.get<string>(ACTIVE_PROJECT_KEY);
+    const saved = this.getActivePathRaw();
     return projects.find((p) => p.path === saved) ?? projects[0] ?? null;
   }
 
@@ -393,7 +410,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       list.push({ name: nodePath.basename(path), path });
       await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
     }
-    await this.context.globalState.update(ACTIVE_PROJECT_KEY, path);
+    await this.setActivePath(path);
     this.postFullState();
     await this.postSettings();
     // Открываем экран настроек панели: название, GitHub, ветка, сервер,
@@ -458,6 +475,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       (p) => p.path?.replace(/^~(?=\/|$)/, os.homedir()) !== path,
     );
     await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
+    if (this.getActivePathRaw() === path) await this.setActivePath(undefined);
     if (this.context.globalState.get<string>(ACTIVE_PROJECT_KEY) === path) {
       await this.context.globalState.update(ACTIVE_PROJECT_KEY, undefined);
     }
@@ -2066,7 +2084,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.finishSession(msg.agent);
         break;
       case "selectProject":
-        await this.context.globalState.update(ACTIVE_PROJECT_KEY, msg.path);
+        await this.setActivePath(msg.path);
         this.postFullState();
         break;
       case "addProject":
@@ -2521,7 +2539,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .showWarningMessage(`Agent Hub — проект «${name}»: ${what}`, "Открыть проект")
       .then(async (choice) => {
         if (choice === "Открыть проект") {
-          await this.context.globalState.update(ACTIVE_PROJECT_KEY, cwd);
+          await this.setActivePath(cwd);
           this.postFullState();
           this.revealUi();
         }
