@@ -31,7 +31,13 @@ export type AgentEvent =
       kind: "commands";
       commands: { name: string; description?: string; argumentHint?: string }[];
     }
-  | { kind: "error"; message: string };
+  | {
+      kind: "error";
+      message: string;
+      /** Codex: тред занят другим процессом (thread-store conflict). */
+      code?: "codexWriterConflict";
+      threadId?: string;
+    };
 
 /** Настройки агента из VS Code settings (модель, effort и т.п.). */
 export interface AgentRunConfig {

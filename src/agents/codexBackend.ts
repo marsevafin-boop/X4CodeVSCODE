@@ -1,9 +1,46 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import type { AgentBackend, AgentEvent, StartOptions } from "./types";
+
+/**
+ * Живые процессы codex по id треда. Codex держит flock треда, пока процесс
+ * жив: если наш же процесс завис после прошлого хода (или пережил выгрузку
+ * расширения), следующий resume падает с «already has an active writer».
+ */
+const liveByThread = new Map<string, ChildProcess>();
+
+function killGroup(child: ChildProcess, signal: NodeJS.Signals) {
+  if (child.exitCode !== null || child.pid === undefined) return;
+  try {
+    // detached → своя группа процессов; отрицательный pid бьёт всю группу
+    // (вместе с codex-code-mode-host). На Windows групп нет — обычный kill.
+    if (process.platform !== "win32") process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      // уже мёртв
+    }
+  }
+}
+
+/** SIGTERM, через 3 с — SIGKILL: Codex может игнорировать SIGTERM. */
+function hardKill(child: ChildProcess) {
+  killGroup(child, "SIGTERM");
+  setTimeout(() => killGroup(child, "SIGKILL"), 3000).unref();
+}
+
+/** При выгрузке расширения — добить всех детей, иначе они переживут хост. */
+export function killAllCodex() {
+  for (const child of liveByThread.values()) killGroup(child, "SIGKILL");
+  liveByThread.clear();
+}
+
+const WRITER_CONFLICT_RE = /already has an active writer|thread-store conflict/i;
 
 /** Модель по умолчанию из ~/.codex/config.toml (когда в настройках не задана). */
 export function codexDefaultModel(): string | null {
@@ -127,21 +164,34 @@ export class CodexBackend implements AgentBackend {
           "-", // промпт из stdin
         ];
 
+    // Свой же процесс этого треда ещё жив (завис после прошлого хода) —
+    // добиваем до resume, иначе thread-store conflict.
+    if (opts.resumeSessionId) {
+      const stale = liveByThread.get(opts.resumeSessionId);
+      if (stale && stale.exitCode === null) {
+        killGroup(stale, "SIGKILL");
+        liveByThread.delete(opts.resumeSessionId);
+        yield {
+          kind: "notice",
+          text: "⚠️ Предыдущий процесс Codex этого треда ещё висел — завершён перед новым ходом.",
+        };
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+
     const child = spawn("codex", args, {
       cwd: opts.cwd,
       env: { ...process.env, ...(opts.extraEnv ?? {}) },
       stdio: ["pipe", "pipe", "pipe"],
+      // Своя группа процессов — чтобы убивать вместе с codex-code-mode-host.
+      detached: process.platform !== "win32",
+      windowsHide: true,
     });
+    if (opts.resumeSessionId) liveByThread.set(opts.resumeSessionId, child);
     child.stdin.write(prompt);
     child.stdin.end();
 
-    const kill = () => {
-      child.kill("SIGTERM");
-      // Codex может игнорировать SIGTERM посреди запроса — добиваем.
-      setTimeout(() => {
-        if (child.exitCode === null) child.kill("SIGKILL");
-      }, 3000);
-    };
+    const kill = () => hardKill(child);
     opts.signal.addEventListener("abort", kill, { once: true });
 
     const stderrChunks: string[] = [];
@@ -172,6 +222,7 @@ export class CodexBackend implements AgentBackend {
           case "thread.started": {
             if (typeof ev.thread_id === "string") {
               threadId = ev.thread_id;
+              liveByThread.set(threadId, child);
               yield { kind: "session", sessionId: ev.thread_id };
             }
             const model = cfg.model || codexDefaultModel();
@@ -279,17 +330,39 @@ export class CodexBackend implements AgentBackend {
       );
       if (!finished && !opts.signal.aborted) {
         const stderr = stderrChunks.join("").trim();
-        yield {
-          kind: "error",
-          message:
-            `Codex завершился (код ${exitCode}) без результата.` +
-            (stderr ? `\n${stderr.slice(-800)}` : ""),
-        };
+        if (opts.resumeSessionId && WRITER_CONFLICT_RE.test(stderr)) {
+          // Тред держит другой процесс codex — хост найдёт его и предложит завершить.
+          yield {
+            kind: "error",
+            message:
+              "Codex не может продолжить тред: его держит другой процесс codex (thread-store conflict)." +
+              (stderr ? `\n${stderr.slice(-400)}` : ""),
+            code: "codexWriterConflict",
+            threadId: opts.resumeSessionId,
+          };
+        } else {
+          yield {
+            kind: "error",
+            message:
+              `Codex завершился (код ${exitCode}) без результата.` +
+              (stderr ? `\n${stderr.slice(-800)}` : ""),
+          };
+        }
         yield { kind: "result", ok: false, durationMs: Date.now() - startedAt };
       }
     } finally {
       opts.signal.removeEventListener("abort", kill);
-      if (child.exitCode === null) child.kill("SIGTERM");
+      // Процесс не должен пережить ход (штатный выход, обрыв цикла, ошибка):
+      // иначе он держит flock треда, и следующий resume упрётся в конфликт.
+      if (child.exitCode === null) hardKill(child);
+      const key = threadId ?? opts.resumeSessionId;
+      if (key && liveByThread.get(key) === child) {
+        if (child.exitCode !== null) liveByThread.delete(key);
+        else
+          child.once("exit", () => {
+            if (liveByThread.get(key) === child) liveByThread.delete(key);
+          });
+      }
     }
   }
 }

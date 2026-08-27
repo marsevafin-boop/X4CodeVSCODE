@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as nodePath from "node:path";
@@ -13,7 +13,7 @@ import type {
 } from "./shared/protocol";
 import type { AgentBackend } from "./agents/types";
 import { ClaudeBackend } from "./agents/claudeBackend";
-import { CodexBackend, codexDefaultModel } from "./agents/codexBackend";
+import { CodexBackend, codexDefaultModel, killAllCodex } from "./agents/codexBackend";
 import { buildFinishPrompt, readJournalContext } from "./journal";
 
 const LEGACY_SESSIONS_KEY = "agentHub.sessions";
@@ -2282,12 +2282,74 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** При выгрузке расширения: оборвать все ходы и добить процессы агентов. */
+  abortAll() {
+    for (const c of this.runs.values()) c.abort();
+    killAllCodex();
+  }
+
+  /**
+   * Codex не даёт resume: тред держит другой процесс codex (flock). Обычно это
+   * наш же зависший `codex exec resume` из прошлого хода или из другого окна
+   * VS Code. Находим его, спрашиваем и завершаем; true — ход можно повторить.
+   */
+  private async resolveCodexWriterConflict(cwd: string, threadId: string): Promise<boolean> {
+    if (process.platform === "win32") {
+      this.postScoped(cwd, {
+        type: "info",
+        text: "Завершите процесс codex.exe этого треда в диспетчере задач и отправьте сообщение снова.",
+      });
+      return false;
+    }
+    const run = (cmd: string, args: string[]) =>
+      new Promise<string>((resolve) =>
+        execFile(cmd, args, (err, out) => resolve(err ? "" : String(out))),
+      );
+    const pids = (await run("pgrep", ["-f", `codex exec resume.*${threadId}`]))
+      .split("\n")
+      .map((s) => Number(s.trim()))
+      .filter((n) => n > 0 && n !== process.pid);
+    if (pids.length === 0) {
+      // Владельца уже нет — блокировка отпущена только что; просто повторяем.
+      this.postScoped(cwd, { type: "info", text: "Процесс-владелец треда не найден — повторяю ход." });
+      return true;
+    }
+    const etime = (await run("ps", ["-o", "etime=", "-p", String(pids[0])])).trim() || "?";
+    const choice = await vscode.window.showWarningMessage(
+      `Agent Hub: тред Codex занят процессом codex (PID ${pids.join(", ")}, работает ${etime}). ` +
+        "Скорее всего это зависший ход этого или другого окна VS Code. Завершить его и повторить сообщение?",
+      { modal: true },
+      "Завершить и повторить",
+    );
+    if (choice !== "Завершить и повторить") return false;
+    for (const pid of pids) {
+      await run("pkill", ["-KILL", "-P", String(pid)]); // дети (code-mode-host)
+      try {
+        process.kill(-pid, "SIGKILL"); // группа, если процесс — её лидер
+      } catch {
+        // не лидер группы (старые версии плагина) — ниже обычный kill
+      }
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // уже мёртв
+      }
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+    this.postScoped(cwd, {
+      type: "info",
+      text: `Завершён зависший процесс Codex (PID ${pids.join(", ")}). Тред свободен.`,
+    });
+    return true;
+  }
+
   private async runTurn(
     prompt: string,
     agent: AgentId,
     attachments: Attachment[] = [],
     targetPath?: string,
     echoUser = false,
+    isRetry = false,
   ) {
     const project = targetPath
       ? (this.getProjects().find((p) => p.path === targetPath) ?? null)
@@ -2401,6 +2463,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Codex и slash-вывод — целыми сообщениями).
     let answerBuf = "";
     let delivered = false;
+    // Codex: тред занят чужим процессом — разобраться и повторить ход один раз.
+    let writerConflict: string | null = null;
+    let retryTurn = false;
 
     // Мутации привязаны к записи хода: пока ход шёл, «Новая сессия» могла
     // переключить активную запись или переиспользовать эту же (тот же id,
@@ -2498,9 +2563,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             });
             break;
           case "error":
+            if (ev.code === "codexWriterConflict") writerConflict = ev.threadId ?? null;
             this.postScoped(cwd, { type: "error", message: ev.message });
             break;
         }
+      }
+      if (writerConflict && !isRetry) {
+        retryTurn = await this.resolveCodexWriterConflict(cwd, writerConflict);
       }
       // Ход завершился штатно — фиксируем изменения агента в git.
       // При «Стоп»/ошибке коммита нет: остаток подберёт следующий ход.
@@ -2536,6 +2605,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         r.chatSeen = seen;
       });
       this.postScoped(cwd, { type: "busy", value: false });
+    }
+    if (retryTurn) {
+      this.postScoped(cwd, { type: "info", text: "Повторяю ход…" });
+      await this.runTurn(prompt, agent, attachments, targetPath, false, true);
     }
   }
 

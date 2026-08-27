@@ -1,8 +1,11 @@
 import * as vscode from "vscode";
 import { ChatViewProvider } from "./ChatViewProvider";
 
+let providerRef: ChatViewProvider | undefined;
+
 export function activate(context: vscode.ExtensionContext) {
   const provider = new ChatViewProvider(context);
+  providerRef = provider;
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewId, provider, {
@@ -34,4 +37,8 @@ export function activate(context: vscode.ExtensionContext) {
   );
 }
 
-export function deactivate() {}
+export function deactivate() {
+  // Дети-процессы агентов не должны пережить выгрузку расширения:
+  // живой codex держит flock треда, и следующий resume упрётся в конфликт.
+  providerRef?.abortAll();
+}
