@@ -78,6 +78,7 @@ export type WebviewToHost =
   | { type: "cycleSafety"; agent: AgentId }
   | { type: "pickModel"; agent: AgentId }
   | { type: "pickEffort"; agent: AgentId }
+  | { type: "showContext"; agent: AgentId }
   | {
       /** Клик по плашке файла в ленте: открыть файл в редакторе.
        *  project — путь проекта ленты для резолва относительных путей. */

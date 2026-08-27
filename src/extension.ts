@@ -18,6 +18,16 @@ export function activate(context: vscode.ExtensionContext) {
       provider.deleteActiveProject(),
     ),
     vscode.commands.registerCommand("agentHub.manageProjects", () => provider.manageProjects()),
+    vscode.commands.registerCommand("agentHub.showContext", async () => {
+      const pick = await vscode.window.showQuickPick(
+        [
+          { label: "Claude", agent: "claude" as const },
+          { label: "GPT (Codex)", agent: "codex" as const },
+        ],
+        { placeHolder: "Контекст какого агента показать?" },
+      );
+      if (pick) await provider.showContext(pick.agent);
+    }),
     vscode.commands.registerCommand("agentHub.openFullView", () => provider.openFullView()),
     vscode.commands.registerCommand("agentHub.exportSettings", () => provider.exportSettings()),
     vscode.commands.registerCommand("agentHub.importSettings", () => provider.importSettings()),

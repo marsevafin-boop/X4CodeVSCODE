@@ -1449,6 +1449,13 @@ export function App() {
             контекст {Math.min(100, Math.round((contextUsage[agent]!.used / contextUsage[agent]!.max) * 100))}%
           </span>
         )}
+        <button
+          className="safety-btn"
+          title="Показать контекст агента: что он получит из базы проекта со следующим сообщением (карточка проекта, журнал, лента другого агента) и точный промпт последнего хода"
+          onClick={() => vscode.postMessage({ type: "showContext", agent })}
+        >
+          🧠
+        </button>
       </div>
 
       <main className="feed" ref={feedRef} onScroll={updateAtBottom}>

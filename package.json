@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.34",
+  "version": "0.0.35",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -60,6 +60,10 @@
         "command": "agentHub.manageProjects",
         "title": "Agent Hub: Проекты — список, переключение, удаление",
         "icon": "$(folder-library)"
+      },
+      {
+        "command": "agentHub.showContext",
+        "title": "Agent Hub: Показать контекст агента (что видит нейросеть)"
       },
       {
         "command": "agentHub.openFullView",

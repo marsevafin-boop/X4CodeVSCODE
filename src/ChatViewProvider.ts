@@ -58,6 +58,8 @@ interface SessionRecord {
   chatLog?: ChatLogEntry[];
   /** До какого индекса chatLog каждый агент видел ленту в своей CLI-сессии. */
   chatSeen?: Partial<Record<AgentId, number>>;
+  /** Точный промпт последнего хода по агентам — для просмотрщика контекста. */
+  lastPrompts?: Partial<Record<AgentId, string>>;
   /** Последняя известная занятость контекста по агентам. */
   context?: Partial<Record<AgentId, { used: number; max: number }>>;
   /** Последняя известная модель по агентам. */
@@ -356,6 +358,86 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     await this.deleteProject(active.path);
+  }
+
+  /**
+   * Просмотрщик контекста: что агент получит из базы проекта со следующим
+   * сообщением (карточка, журнал, лента другого агента) и точный промпт
+   * последнего хода. Открывается отдельным markdown-документом.
+   */
+  async showContext(agent: AgentId) {
+    const project = this.getActiveProject();
+    if (!project) {
+      void vscode.window.showWarningMessage("Нет проектов — контекст показывать не для чего.");
+      return;
+    }
+    const cfg = vscode.workspace.getConfiguration("agentHub");
+    const record = this.getActiveRecord(project.path);
+    const agentName = agent === "claude" ? "Claude" : "GPT (Codex)";
+    const sessionId = record?.agentIds[agent] ?? null;
+    const journalDir = cfg.get<string>("journalDir", "docs/journal");
+
+    const parts: string[] = [
+      `# 🧠 Контекст агента ${agentName} — проект «${project.name}»`,
+      "",
+      sessionId
+        ? "CLI-сессия продолжается (resume id: " + "`" + sessionId + "`" + "). Внутри неё агент помнит все предыдущие сообщения ЭТОЙ сессии, свой системный промпт и результаты инструментов — они хранятся на стороне CLI и в файл не входят."
+        : "CLI-сессии ещё нет: следующее сообщение начнёт новую — к нему добавятся карточка проекта и журнал (ниже).",
+      "",
+      "## Что будет добавлено к следующему сообщению",
+    ];
+
+    if (!sessionId) {
+      parts.push("", "### Карточка проекта", "", "```", await this.buildProjectCard(project), "```");
+      const journal = await readJournalContext(
+        project.path,
+        journalDir,
+        cfg.get<number>("journalContextEntries", 3),
+      );
+      parts.push(
+        "",
+        "### Журнал сессий (общая память)",
+        "",
+        journal
+          ? "```\n" + journal + "\n```"
+          : `_Журнала нет — папка ${journalDir} пуста или отсутствует._`,
+      );
+    }
+
+    const chatLog = record?.chatLog ?? [];
+    const seenIdx = Math.min(record?.chatSeen?.[agent] ?? 0, chatLog.length);
+    const unseen = chatLog.slice(seenIdx).filter((e) => e.agent !== agent);
+    const cross = buildCrossContext(unseen);
+    parts.push(
+      "",
+      "### Сообщения другого агента из этой ленты",
+      "",
+      cross
+        ? "Непросмотренных: " + String(cross.count) + ".\n\n" + "```\n" + cross.block + "\n```"
+        : "_Нет: агент видел всю ленту, либо второй агент в беседе не участвовал._",
+    );
+    if (sessionId && !cross) {
+      parts.push(
+        "",
+        "_Итого: со следующим сообщением дополнительно ничего не уйдёт — только ваш текст (и блок путей вложений, если приложите файлы)._",
+      );
+    }
+
+    const last = record?.lastPrompts?.[agent];
+    parts.push(
+      "",
+      "## Точный промпт последнего хода (что реально ушло агенту)",
+      "",
+      last
+        ? "```\n" + last + "\n```"
+        : "_В этой сессии агент ещё не получал сообщений (или последний ход был до обновления)._",
+    );
+
+    const doc = await vscode.workspace.openTextDocument({
+      content: parts.join("\n"),
+      language: "markdown",
+    });
+    await vscode.window.showTextDocument(doc, { preview: false });
   }
 
   /**
@@ -2142,6 +2224,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "pickEffort":
         await this.pickEffort(msg.agent);
         break;
+      case "showContext":
+        await this.showContext(msg.agent);
+        break;
       case "openFile":
         await this.openFileFromChat(msg.path, msg.project);
         break;
@@ -2326,6 +2411,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (r.createdAt !== recordGen) return;
         fn(r);
       });
+
+    // Точный промпт хода — для просмотрщика контекста («🧠 что видит агент»).
+    await mutateTurnRecord((r) => {
+      r.lastPrompts = {
+        ...r.lastPrompts,
+        [agent]:
+          fullPrompt.length > 80_000
+            ? fullPrompt.slice(0, 80_000) + "\n…[обрезано]"
+            : fullPrompt,
+      };
+    });
 
     try {
       const events = this.backends[agent].start(fullPrompt, {
