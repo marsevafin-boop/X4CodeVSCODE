@@ -2155,12 +2155,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.post({
             type: "attachmentAdded",
             files: picked.map((u) => ({ name: nodePath.basename(u.fsPath), path: u.fsPath })),
+            path: msg.path ?? this.getActiveProject()?.path,
           });
         }
         break;
       }
       case "saveAttachment":
-        await this.saveAttachment(msg.name, msg.dataBase64);
+        await this.saveAttachment(msg.name, msg.dataBase64, msg.path);
         break;
       case "finishSession":
         await this.finishSession(msg.agent);
@@ -2247,8 +2248,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Сохранить вставленный/перетащенный файл в <проект>/.agent-hub/attachments/. */
-  private async saveAttachment(name: string, dataBase64: string) {
-    const project = this.getActiveProject();
+  private async saveAttachment(name: string, dataBase64: string, projectPath?: string) {
+    // Проект — тот, чья лента прислала файл: «активный» хоста мог отличаться
+    // (переключение, другое окно), и вложение уезжало в чужую папку.
+    const project =
+      (projectPath ? this.getProjects().find((p) => p.path === projectPath) : null) ??
+      this.getActiveProject();
     if (!project) {
       this.post({ type: "error", message: "Нет активного проекта — некуда сохранить вложение." });
       return;
@@ -2263,6 +2268,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.post({
         type: "attachmentAdded",
         files: [{ name: nodePath.basename(filePath), path: filePath }],
+        path: project.path,
       });
     } catch (err) {
       this.post({
@@ -2280,6 +2286,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.pendingPermissions.delete(requestId);
       this.postScoped(pending.path, { type: "permissionResolved", requestId, allow: false });
     }
+  }
+
+  /** Вложения из .agent-hub/attachments другого проекта — скопировать в текущий. */
+  private async relocateAttachments(cwd: string, attachments: Attachment[]): Promise<Attachment[]> {
+    if (attachments.length === 0) return attachments;
+    const marker = `${nodePath.sep}.agent-hub${nodePath.sep}attachments${nodePath.sep}`;
+    const others = this.getProjects()
+      .map((p) => p.path)
+      .filter((p) => p !== cwd);
+    const out: Attachment[] = [];
+    for (const a of attachments) {
+      const foreign =
+        a.path.includes(marker) &&
+        !a.path.startsWith(cwd + nodePath.sep) &&
+        others.some((p) => a.path.startsWith(p + nodePath.sep));
+      if (!foreign) {
+        out.push(a);
+        continue;
+      }
+      try {
+        const dir = nodePath.join(cwd, ".agent-hub", "attachments");
+        await fs.promises.mkdir(dir, { recursive: true });
+        const dest = nodePath.join(dir, nodePath.basename(a.path));
+        await fs.promises.copyFile(a.path, dest);
+        out.push({ name: a.name, path: dest });
+        this.postScoped(cwd, {
+          type: "info",
+          text: `Вложение «${a.name}» лежало в папке другого проекта — скопировано в этот проект.`,
+        });
+      } catch {
+        out.push(a);
+      }
+    }
+    return out;
   }
 
   /** При выгрузке расширения: оборвать все ходы и добить процессы агентов. */
@@ -2375,6 +2415,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.postScoped(cwd, { type: "error", message: `Папка проекта не найдена: ${cwd}` });
       return;
     }
+
+    // Изоляция проектов: вложение из папки ДРУГОГО проекта (старый дефект —
+    // сохранялось в «активный» проект хоста) копируем сюда, чтобы агент не
+    // ходил в чужую папку и не узнавал о другом проекте.
+    attachments = await this.relocateAttachments(cwd, attachments);
 
     const controller = new AbortController();
     this.runs.set(cwd, controller);

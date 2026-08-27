@@ -186,7 +186,12 @@ export function App() {
       return false;
     }
   });
-  const [pending, setPending] = useState<Attachment[]>([]);
+  /** Вложения черновика — свои у каждого проекта: при переключении проекта
+   *  они не должны уехать в чужой чат (и в чужую папку). */
+  const [pendingBy, setPendingBy] = useState<Record<string, Attachment[]>>({});
+  const pending = pendingBy[activePath] ?? [];
+  const setPending = (fn: (prev: Attachment[]) => Attachment[]) =>
+    setPendingBy((prev) => ({ ...prev, [activePath]: fn(prev[activePath] ?? []) }));
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [form, setForm] = useState<SettingsSnapshot | null>(null);
   const [newPassword, setNewPassword] = useState<string | undefined>(undefined);
@@ -486,12 +491,18 @@ export function App() {
         case "openSettingsScreen":
           setSettingsOpen(true);
           break;
-        case "attachmentAdded":
-          setPending((prev) => [
-            ...prev,
-            ...msg.files.filter((f) => !prev.some((x) => x.path === f.path)),
-          ]);
+        case "attachmentAdded": {
+          // В ленту того проекта, чья папка приняла файл, а не «текущую».
+          const target = msg.path ?? activeRef.current;
+          setPendingBy((prev) => {
+            const cur = prev[target] ?? [];
+            return {
+              ...prev,
+              [target]: [...cur, ...msg.files.filter((f) => !cur.some((x) => x.path === f.path))],
+            };
+          });
           break;
+        }
         case "userMessage":
           finalizeStreaming(p);
           mutateItems(p, (x) => [
@@ -703,7 +714,7 @@ export function App() {
     const attachments = pending;
     const path = activePath;
     setDraft("");
-    setPending([]);
+    setPendingBy((prev) => ({ ...prev, [path]: [] }));
     if (busyBy[path]) {
       // Этот проект занят — в его очередь; уйдёт сам после ответа.
       setQueueBy((prev) => ({
@@ -733,6 +744,7 @@ export function App() {
           type: "saveAttachment",
           name: file.name || "screenshot.png",
           dataBase64: base64,
+          path: activePath,
         });
       };
       reader.readAsDataURL(file);
@@ -1768,7 +1780,7 @@ export function App() {
               className="attach-btn"
               title="Прикрепить файлы (или вставьте скриншот из буфера, или перетащите сюда)"
               disabled={busy}
-              onClick={() => vscode.postMessage({ type: "pickAttachment" })}
+              onClick={() => vscode.postMessage({ type: "pickAttachment", path: activePath })}
             >
               📎
             </button>

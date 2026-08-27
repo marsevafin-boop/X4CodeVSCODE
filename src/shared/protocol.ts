@@ -50,8 +50,14 @@ export type WebviewToHost =
        *  фонового проекта, чтобы не стрелять в активный. */
       path?: string;
     }
-  | { type: "pickAttachment" }
-  | { type: "saveAttachment"; name: string; dataBase64: string }
+  | { type: "pickAttachment"; path?: string }
+  | {
+      /** path — проект ленты, в чью папку сохранить (не «активный» хоста). */
+      type: "saveAttachment";
+      name: string;
+      dataBase64: string;
+      path?: string;
+    }
   | { type: "stop"; path?: string }
   | { type: "newSession" }
   | { type: "finishSession"; agent: AgentId }
@@ -141,7 +147,7 @@ export type HostToWebview =
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }
   | { type: "effortInfo"; agent: AgentId; effort: string }
   | { type: "autoScrollMode"; mode: string }
-  | { type: "attachmentAdded"; files: Attachment[] }
+  | { type: "attachmentAdded"; files: Attachment[]; path?: string }
   | { type: "serverTestResult"; ok: boolean; message: string }
   | { type: "configJson"; json: string }
   | { type: "configJsonResult"; ok: boolean; message: string }
