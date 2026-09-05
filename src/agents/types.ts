@@ -32,6 +32,16 @@ export type AgentEvent =
       commands: { name: string; description?: string; argumentHint?: string }[];
     }
   | {
+      /** Актуальные модели CLI (Claude: supportedModels после init). */
+      kind: "models";
+      models: {
+        value: string;
+        displayName?: string;
+        description?: string;
+        supportedEffortLevels?: string[];
+      }[];
+    }
+  | {
       kind: "error";
       message: string;
       /** Codex: тред занят другим процессом (thread-store conflict). */

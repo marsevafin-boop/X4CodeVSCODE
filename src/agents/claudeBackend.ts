@@ -144,6 +144,34 @@ export class ClaudeBackend implements AgentBackend {
             } catch {
               // список команд не критичен
             }
+            // Актуальные модели CLI (+ уровни effort каждой) — для пикеров.
+            // Только на первом ходе, кэшируется хостом.
+            try {
+              const models = (await Promise.race([
+                stream.supportedModels(),
+                new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error("timeout")), 2500),
+                ),
+              ])) as {
+                value: string;
+                displayName?: string;
+                description?: string;
+                supportedEffortLevels?: string[];
+              }[];
+              if (Array.isArray(models) && models.length > 0) {
+                yield {
+                  kind: "models",
+                  models: models.map((m) => ({
+                    value: m.value,
+                    displayName: m.displayName,
+                    description: m.description,
+                    supportedEffortLevels: m.supportedEffortLevels,
+                  })),
+                };
+              }
+            } catch {
+              // список моделей не критичен
+            }
           } else if ((msg as { subtype?: string }).subtype === "local_command_output") {
             // Вывод локальной slash-команды (/usage, /model и т.п.) — в ленту.
             const content = (msg as unknown as { content?: string }).content;

@@ -21,6 +21,15 @@ const LEGACY_TRANSCRIPTS_KEY = "agentHub.transcripts";
 const STORE_KEY = "agentHub.sessionStore";
 const ACTIVE_PROJECT_KEY = "agentHub.activeProject";
 const CLAUDE_COMMANDS_KEY = "agentHub.claudeCommands";
+const CLAUDE_MODELS_KEY = "agentHub.claudeModels";
+/** Модель Claude из supportedModels SDK (кэш в globalState). */
+interface ClaudeModelInfo {
+  value: string;
+  displayName?: string;
+  description?: string;
+  supportedEffortLevels?: string[];
+}
+
 /** Папки workspace, которые пользователь убрал из списка проектов. */
 const HIDDEN_PROJECTS_KEY = "agentHub.hiddenProjects";
 const TRANSCRIPT_MAX_ITEMS = 300;
@@ -1644,11 +1653,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       agent === "claude"
         ? [
             { label: "По умолчанию CLI", detail: "модель из настроек claude", value: "" },
-            { label: "claude-fable-5", detail: "максимальные способности", value: "claude-fable-5" },
-            { label: "claude-opus-5", detail: "топ для агентной работы", value: "claude-opus-5" },
-            { label: "claude-opus-4-8", value: "claude-opus-4-8" },
-            { label: "claude-sonnet-5", detail: "быстрее и дешевле", value: "claude-sonnet-5" },
-            { label: "claude-haiku-4-5", detail: "самый быстрый", value: "claude-haiku-4-5" },
+            // Актуальный список из самого CLI (supportedModels, кэшируется
+            // после первого хода); до первого хода — запасной статический.
+            ...this.listClaudeModels().map((m) => ({
+              label: m.value,
+              detail:
+                [
+                  m.displayName && m.displayName !== m.value ? m.displayName : undefined,
+                  m.description,
+                ]
+                  .filter(Boolean)
+                  .join(" — ") || undefined,
+              value: m.value,
+            })),
             { label: "$(edit) Ввести вручную…", value: CUSTOM },
           ]
         : [
@@ -1696,6 +1713,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /** Модели Claude: кэш supportedModels CLI; до первого хода — статический список. */
+  private listClaudeModels(): ClaudeModelInfo[] {
+    const cached = this.context.globalState.get<ClaudeModelInfo[]>(CLAUDE_MODELS_KEY, []);
+    if (cached.length > 0) return cached;
+    return [
+      { value: "claude-fable-5-1", description: "новейшая, максимальные способности" },
+      { value: "claude-fable-5", description: "максимальные способности" },
+      { value: "claude-opus-5", description: "топ для агентной работы" },
+      { value: "claude-opus-4-8" },
+      { value: "claude-sonnet-5", description: "быстрее и дешевле" },
+      { value: "claude-haiku-4-5", description: "самый быстрый" },
+    ];
+  }
+
   /** Текущий effort обоих агентов — для кнопки в статус-баре чата. */
   private postEfforts() {
     for (const a of ["claude", "codex"] as const) {
@@ -1715,14 +1746,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let base: Item[];
     let subject = "Claude";
     if (agent === "claude") {
+      // Уровни effort выбранной модели — из supportedModels CLI (кэш);
+      // модель не выбрана или неизвестна — полный набор SDK.
+      const model = section.get<string>("model", "");
+      const info = model ? this.listClaudeModels().find((m) => m.value === model) : undefined;
+      const levels = info?.supportedEffortLevels?.length
+        ? info.supportedEffortLevels
+        : ["low", "medium", "high", "xhigh", "max"];
+      const hints: Record<string, string> = {
+        low: "быстрые ответы, лёгкие размышления",
+        medium: "баланс скорости и глубины",
+        high: "глубже — для сложных задач",
+        xhigh: "ещё глубже — для самых сложных задач",
+        max: "максимальная глубина размышлений",
+      };
       base = [
         { label: "По умолчанию", detail: "как настроено в CLI claude", value: "" },
-        { label: "low", detail: "быстрые ответы, лёгкие размышления", value: "low" },
-        { label: "medium", detail: "баланс скорости и глубины", value: "medium" },
-        { label: "high", detail: "глубже — для сложных задач", value: "high" },
-        { label: "xhigh", detail: "ещё глубже — для самых сложных задач", value: "xhigh" },
-        { label: "max", detail: "максимальная глубина размышлений", value: "max" },
+        ...levels.map((l) => ({ label: l, detail: hints[l], value: l })),
       ];
+      subject = `Claude (${model || "модель по умолчанию"})`;
     } else {
       // Уровни берём из кэша CLI для выбранной модели (у разных моделей
       // разный набор, у gpt-5.6-sol есть ultra); нет в кэше — типовой список.
@@ -2569,6 +2611,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             // Реальный список команд CLI — кэшируем и обновляем меню.
             await this.context.globalState.update(CLAUDE_COMMANDS_KEY, ev.commands);
             this.post({ type: "slashCommands", agent, commands: ev.commands });
+            break;
+          case "models":
+            // Актуальные модели CLI (+ effort-уровни) — в кэш для пикеров.
+            await this.context.globalState.update(CLAUDE_MODELS_KEY, ev.models);
             break;
           case "contextUsage":
             await mutateTurnRecord((r) => {

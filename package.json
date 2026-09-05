@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.37",
+  "version": "0.0.38",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -160,7 +160,7 @@
         "agentHub.claude.model": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Модель Claude для агента. Пусто — как настроено в CLI `claude`. Примеры: `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5`."
+          "markdownDescription": "Модель Claude для агента. Пусто — как настроено в CLI `claude`. Примеры: `claude-fable-5-1`, `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5`."
         },
         "agentHub.claude.effort": {
           "type": "string",
@@ -303,7 +303,7 @@
     "package": "vsce package --allow-missing-repository"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.228",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.261",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-markdown": "^10.1.0",
