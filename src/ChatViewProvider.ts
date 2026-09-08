@@ -2387,10 +2387,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       new Promise<string>((resolve) =>
         execFile(cmd, args, (err, out) => resolve(err ? "" : String(out))),
       );
-    const pids = (await run("pgrep", ["-f", `codex exec resume.*${threadId}`]))
+    // Держателя ищем по файлу блокировки треда (lsof -t): это работает и для
+    // «свежего» запуска codex, в чьей командной строке нет ни «resume», ни id
+    // треда (id рождается уже после старта). pgrep — запасной вариант.
+    const lockFile = nodePath.join(
+      os.homedir(),
+      ".codex",
+      "thread-writer-locks",
+      `${threadId}.lock`,
+    );
+    const viaLsof = (await run("lsof", ["-t", lockFile]))
       .split("\n")
       .map((s) => Number(s.trim()))
-      .filter((n) => n > 0 && n !== process.pid);
+      .filter((n) => n > 0);
+    const viaPgrep = (await run("pgrep", ["-f", `codex exec.*${threadId}`]))
+      .split("\n")
+      .map((s) => Number(s.trim()))
+      .filter((n) => n > 0);
+    const pids = [...new Set([...viaLsof, ...viaPgrep])].filter((n) => n !== process.pid);
     if (pids.length === 0) {
       // Владельца уже нет — блокировка отпущена только что; просто повторяем.
       this.postScoped(cwd, { type: "info", text: "Процесс-владелец треда не найден — повторяю ход." });
