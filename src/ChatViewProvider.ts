@@ -823,7 +823,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       "-o", "ConnectTimeout=8",
       "-o", "StrictHostKeyChecking=accept-new",
     ];
-    const probe = "echo AGENT_HUB_OK && uname -sr";
+    // Пробник ДОЛЖЕН быть переносимым: «&&» не понимает Windows PowerShell
+    // (шелл OpenSSH на Windows-серверах) — парсер падает с InvalidEndOfLine,
+    // маркер не печатается, и рабочий пароль выглядел как отказ. Поэтому
+    // маркер — одной командой (echo есть в sh, cmd и PowerShell), а ОС
+    // узнаём отдельным вызовом уже после успеха.
+    const probe = "echo AGENT_HUB_OK";
+
+    // ОС сервера: uname на Linux/BSD/macOS; на Windows его нет — распознаём по ошибке.
+    const osProbe = async (
+      run: (probeCmd: string) => Promise<{ code: number; out: string; err: string; timedOut: boolean }>,
+    ): Promise<string | undefined> => {
+      try {
+        const r = await run("uname -sr");
+        const line = r.out.split("\n").map((l) => l.trim()).filter(Boolean)[0];
+        if (r.code === 0 && line) return line;
+        if (/not recognized|CommandNotFoundException|не является внутренней/i.test(r.err + r.out)) {
+          return "Windows-сервер";
+        }
+      } catch {
+        // информация об ОС не критична
+      }
+      return undefined;
+    };
 
     // 1) Ключи / алиас из ~/.ssh/config.
     const key = isSftp
@@ -831,8 +853,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       : await spawnRun("ssh", ["-o", "BatchMode=yes", ...commonOpts, ...portArgs, target, probe]);
     const keyOk = isSftp ? key.code === 0 : key.out.includes("AGENT_HUB_OK");
     if (keyOk) {
-      const uname = key.out.split("\n").map((l) => l.trim()).filter((l) => l && l !== "AGENT_HUB_OK")[0];
-      report(true, `${protocol.toUpperCase()} ${target} — доступ по SSH-ключу${uname ? ` · ${uname}` : ""}`);
+      const os = isSftp
+        ? undefined
+        : await osProbe((p) =>
+            spawnRun("ssh", ["-o", "BatchMode=yes", ...commonOpts, ...portArgs, target, p]),
+          );
+      report(true, `${protocol.toUpperCase()} ${target} — доступ по SSH-ключу${os ? ` · ${os}` : ""}`);
       return;
     }
     if (key.timedOut) {
@@ -876,8 +902,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         );
     const pwOk = isSftp ? pw.code === 0 : pw.out.includes("AGENT_HUB_OK");
     if (pwOk) {
-      const uname = pw.out.split("\n").map((l) => l.trim()).filter((l) => l && l !== "AGENT_HUB_OK")[0];
-      report(true, `${protocol.toUpperCase()} ${target} — доступ по паролю${uname && !isSftp ? ` · ${uname}` : ""}`);
+      const os = isSftp
+        ? undefined
+        : await osProbe((p) =>
+            spawnRun(
+              "sshpass",
+              [
+                "-e", "ssh",
+                ...commonOpts,
+                "-o", "PreferredAuthentications=password,keyboard-interactive",
+                ...portArgs,
+                target,
+                p,
+              ],
+              { env },
+            ),
+          );
+      report(true, `${protocol.toUpperCase()} ${target} — доступ по паролю${os ? ` · ${os}` : ""}`);
       return;
     }
     report(
