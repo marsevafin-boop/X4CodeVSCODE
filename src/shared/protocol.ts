@@ -87,6 +87,13 @@ export type WebviewToHost =
   | { type: "showContext"; agent: AgentId }
   | { type: "manageSecretEnv" }
   | {
+      /** Текст сообщения с доступами (KEY=value построчно) — сохранить в env
+       *  выбранных проектов, агенту НЕ отправлять. path — проект ленты. */
+      type: "sendSecretEnv";
+      text: string;
+      path?: string;
+    }
+  | {
       /** Клик по плашке файла в ленте: открыть файл в редакторе.
        *  project — путь проекта ленты для резолва относительных путей. */
       type: "openFile";
@@ -148,6 +155,11 @@ export type HostToWebview =
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }
   | { type: "effortInfo"; agent: AgentId; effort: string }
   | { type: "autoScrollMode"; mode: string }
+  | {
+      /** Черновик обработан хостом (доступы сохранены) — очистить поле ввода. */
+      type: "draftHandled";
+      path?: string;
+    }
   | { type: "attachmentAdded"; files: Attachment[]; path?: string }
   | { type: "serverTestResult"; ok: boolean; message: string }
   | { type: "configJson"; json: string }

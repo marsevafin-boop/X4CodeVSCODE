@@ -1403,6 +1403,79 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /**
+   * Доступы из сообщения чата → переменные окружения выбранных проектов.
+   * Текст разбирается построчно (KEY=value | KEY: value | export KEY=value),
+   * агенту НЕ отправляется; в ленту попадают только имена переменных.
+   */
+  async sendSecretEnvFromMessage(text: string, sourcePath?: string) {
+    const post = (m: HostToWebview) =>
+      sourcePath ? this.postScoped(sourcePath, m as HostToWebview & { path?: string }) : this.post(m);
+
+    const pairs: Record<string, string> = {};
+    const bad: string[] = [];
+    for (const raw of text.split("\n")) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      const m = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[=:]\s*(.+)$/);
+      if (!m) {
+        bad.push(line);
+        continue;
+      }
+      let v = m[2].trim();
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+        v = v.slice(1, -1);
+      }
+      pairs[m[1]] = v;
+    }
+    const names = Object.keys(pairs);
+    if (names.length === 0) {
+      post({
+        type: "error",
+        message:
+          "Не нашёл ни одной пары «ИМЯ=значение». Формат — по строке на переменную: " +
+          "SSH_PASSWORD=секрет, API_KEY: значение или export DB_URL=… (# — комментарий).",
+      });
+      return;
+    }
+
+    const projects = this.getProjects();
+    if (projects.length === 0) {
+      post({ type: "error", message: "Нет проектов — доступы сохранять некуда." });
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      projects.map((p) => ({
+        label: p.name,
+        description: p.serverHost ?? p.path,
+        picked: p.path === (sourcePath ?? this.getActiveProject()?.path),
+        path: p.path,
+      })),
+      {
+        canPickMany: true,
+        placeHolder: `В env каких проектов сохранить: ${names.join(", ")} (значения в чат не попадут)`,
+        ignoreFocusOut: true,
+      },
+    );
+    if (!picked || picked.length === 0) return;
+
+    for (const p of picked) {
+      const env = await this.getSecretEnv(p.path);
+      Object.assign(env, pairs);
+      await this.context.secrets.store(this.secretEnvKey(p.path), JSON.stringify(env));
+    }
+    await this.postSettings();
+    // Поле ввода можно очищать только после успешного сохранения.
+    this.post({ type: "draftHandled", path: sourcePath });
+    post({
+      type: "info",
+      text:
+        `🔐 Сохранено в env (значения скрыты): ${names.join(", ")} → ` +
+        `${picked.map((p) => p.label).join(", ")}.` +
+        (bad.length ? ` Пропущены строки не по формату: ${bad.length}.` : ""),
+    });
+  }
+
   /** Карточка проекта для контекста новой сессии. */
   private async buildProjectCard(p: ProjectInfo): Promise<string> {
     const lines = [`Ты работаешь над проектом «${p.name}».`, `Рабочая папка: ${p.path}`];
@@ -2380,6 +2453,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case "manageSecretEnv":
         await this.manageSecretEnv();
+        break;
+      case "sendSecretEnv":
+        await this.sendSecretEnvFromMessage(msg.text, msg.path);
         break;
       case "openFile":
         await this.openFileFromChat(msg.path, msg.project);

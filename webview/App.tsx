@@ -474,6 +474,10 @@ export function App() {
         case "autoScrollMode":
           setAutoScrollMode(msg.mode);
           break;
+        case "draftHandled":
+          // Доступы из черновика сохранены хостом — очищаем поле ввода.
+          if (!msg.path || msg.path === activeRef.current) setDraft("");
+          break;
         case "settings":
           setForm(msg.settings);
           setNewPassword(undefined);
@@ -1799,6 +1803,16 @@ export function App() {
               onClick={() => vscode.postMessage({ type: "pickAttachment", path: activePath })}
             >
               📎
+            </button>
+            <button
+              className="attach-btn"
+              title="Не отправлять агенту, а сохранить доступы из сообщения в переменные окружения выбранных проектов. Формат — по строке на переменную: SSH_PASSWORD=секрет"
+              disabled={!draft.trim()}
+              onClick={() =>
+                vscode.postMessage({ type: "sendSecretEnv", text: draft, path: activePath })
+              }
+            >
+              🔐 в env
             </button>
             <button
               className="attach-btn expand-btn"
