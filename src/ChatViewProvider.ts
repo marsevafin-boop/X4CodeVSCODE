@@ -477,6 +477,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return `agentHub.serverPassword:${projectPath}`;
   }
 
+  /** Ключ секретных переменных окружения проекта (JSON-объект в Keychain). */
+  private secretEnvKey(projectPath: string): string {
+    return `agentHub.secretEnv:${projectPath}`;
+  }
+
+  /** Секретные переменные окружения проекта: {ИМЯ: значение}. */
+  private async getSecretEnv(projectPath: string): Promise<Record<string, string>> {
+    try {
+      const raw = await this.context.secrets.get(this.secretEnvKey(projectPath));
+      const obj = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+      return typeof obj === "object" && obj !== null ? obj : {};
+    } catch {
+      return {};
+    }
+  }
+
   /**
    * Добавление проекта: единственный нативный шаг — выбор папки. Запись
    * создаётся сразу, дальше все поля заполняются в форме настроек панели —
@@ -574,8 +590,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (isWorkspaceFolder) await this.setProjectHidden(path, true);
 
     if (choice === WITH_FOLDER) {
-      // Пароль и историю сессий вычищаем вместе с папкой.
+      // Пароль, доступы и историю сессий вычищаем вместе с папкой.
       await this.context.secrets.delete(this.passwordKey(path));
+      await this.context.secrets.delete(this.secretEnvKey(path));
       const all = { ...this.getStoreAll() };
       delete all[path];
       await this.context.globalState.update(STORE_KEY, all);
@@ -1303,6 +1320,89 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /**
+   * Доступы проекта в переменных окружения: значения хранятся в Keychain и
+   * попадают ТОЛЬКО в окружение процессов агентов — в чат и промпт идут лишь
+   * имена переменных. Для логинов, ключей API, паролей БД и т.п.
+   */
+  async manageSecretEnv() {
+    const project = this.getActiveProject();
+    if (!project) {
+      void vscode.window.showWarningMessage("Сначала добавьте проект.");
+      return;
+    }
+    const key = this.secretEnvKey(project.path);
+    for (;;) {
+      const env = await this.getSecretEnv(project.path);
+      type Item = vscode.QuickPickItem & { name?: string; add?: boolean };
+      const items: Item[] = Object.keys(env)
+        .sort()
+        .map((n) => ({
+          label: `$(key) ${n}`,
+          description: "значение скрыто · клик — изменить",
+          name: n,
+          buttons: [{ iconPath: new vscode.ThemeIcon("trash"), tooltip: "Удалить переменную" }],
+        }));
+      items.push({ label: "$(add) Добавить переменную…", add: true });
+
+      const picked = await new Promise<Item | { removed: string } | undefined>((resolve) => {
+        const qp = vscode.window.createQuickPick<Item>();
+        qp.title = `Доступы в env — «${project.name}»`;
+        qp.placeholder =
+          "Агент получает их переменными окружения; значения в чат не попадают";
+        qp.items = items;
+        qp.ignoreFocusOut = true;
+        qp.onDidTriggerItemButton((e) => {
+          qp.hide();
+          resolve(e.item.name ? { removed: e.item.name } : undefined);
+        });
+        qp.onDidAccept(() => {
+          const sel = qp.selectedItems[0];
+          qp.hide();
+          resolve(sel);
+        });
+        qp.onDidHide(() => {
+          qp.dispose();
+          resolve(undefined);
+        });
+        qp.show();
+      });
+
+      if (!picked) return;
+      if ("removed" in picked) {
+        delete env[picked.removed];
+        await this.context.secrets.store(key, JSON.stringify(env));
+        await this.postSettings();
+        continue;
+      }
+      let name = picked.name;
+      if (picked.add) {
+        name = (
+          await vscode.window.showInputBox({
+            prompt: "Имя переменной окружения (латиница, цифры, _)",
+            placeHolder: "например: DB_PASSWORD, API_KEY, SSH_LOGIN",
+            ignoreFocusOut: true,
+            validateInput: (v) =>
+              /^[A-Za-z_][A-Za-z0-9_]*$/.test(v.trim())
+                ? undefined
+                : "Только латиница, цифры и _, не с цифры",
+          })
+        )?.trim();
+        if (!name) continue;
+      }
+      if (!name) continue;
+      const value = await vscode.window.showInputBox({
+        prompt: `Значение ${name} (пусто — отмена). Хранится в защищённом хранилище, в чат не выводится`,
+        password: true,
+        ignoreFocusOut: true,
+      });
+      if (!value) continue;
+      env[name] = value;
+      await this.context.secrets.store(key, JSON.stringify(env));
+      await this.postSettings();
+    }
+  }
+
   /** Карточка проекта для контекста новой сессии. */
   private async buildProjectCard(p: ProjectInfo): Promise<string> {
     const lines = [`Ты работаешь над проектом «${p.name}».`, `Рабочая папка: ${p.path}`];
@@ -1352,6 +1452,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     if (p.server) lines.push(`Заметки о сервере: ${p.server}`);
+    const envNames = Object.keys(await this.getSecretEnv(p.path)).sort();
+    if (envNames.length > 0) {
+      lines.push(
+        `Доступы проекта заданы в переменных окружения: ${envNames.join(", ")}. ` +
+          `Бери значения из окружения ($ИМЯ в shell); в текст диалога, логи и файлы их никогда не выводи.`,
+      );
+    }
     return lines.join("\n");
   }
 
@@ -1556,6 +1663,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       autoScrollMode: cfg.get<string>("autoScrollMode", "perProject"),
       project,
       projectHasPassword: hasPassword,
+      secretEnvNames: project ? Object.keys(await this.getSecretEnv(project.path)).sort() : [],
     };
   }
 
@@ -2270,6 +2378,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "showContext":
         await this.showContext(msg.agent);
         break;
+      case "manageSecretEnv":
+        await this.manageSecretEnv();
+        break;
       case "openFile":
         await this.openFileFromChat(msg.path, msg.project);
         break;
@@ -2557,8 +2668,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       fullPrompt = `${crossContext.block}\n\nНовое сообщение пользователя:\n${promptWithAttachments}`;
     }
 
-    // Пароль сервера — только через окружение, никогда в тексте диалога.
+    // Пароль сервера и доступы — только через окружение, никогда в тексте диалога.
     const serverPassword = await this.context.secrets.get(this.passwordKey(project.path));
+    const secretEnv = await this.getSecretEnv(project.path);
 
     // Копим ответ агента для общего лога беседы (Claude — дельтами,
     // Codex и slash-вывод — целыми сообщениями).
@@ -2594,9 +2706,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         cwd,
         resumeSessionId: sessions[agent] ?? undefined,
         signal: controller.signal,
-        extraEnv: serverPassword
-          ? { AGENT_HUB_SERVER_PASSWORD: serverPassword, LFTP_PASSWORD: serverPassword }
-          : undefined,
+        extraEnv: {
+          ...secretEnv,
+          ...(serverPassword
+            ? { AGENT_HUB_SERVER_PASSWORD: serverPassword, LFTP_PASSWORD: serverPassword }
+            : {}),
+        },
         config: this.buildAgentConfig(agent),
         attachments: attachments.map((a) => ({ path: a.path, isImage: isImagePath(a.path) })),
         confirmTool: (toolName, input) => this.confirmTool(toolName, input, cwd),

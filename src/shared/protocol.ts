@@ -85,6 +85,7 @@ export type WebviewToHost =
   | { type: "pickModel"; agent: AgentId }
   | { type: "pickEffort"; agent: AgentId }
   | { type: "showContext"; agent: AgentId }
+  | { type: "manageSecretEnv" }
   | {
       /** Клик по плашке файла в ленте: открыть файл в редакторе.
        *  project — путь проекта ленты для резолва относительных путей. */
@@ -184,6 +185,8 @@ export interface SettingsSnapshot {
   /** Активный проект (null — проектов нет). */
   project: ProjectInfo | null;
   projectHasPassword: boolean;
+  /** Имена секретных переменных окружения проекта (значения — в Keychain). */
+  secretEnvNames: string[];
 }
 
 /** То же + пароль: undefined — не менять, "" — удалить, иначе — новый. */

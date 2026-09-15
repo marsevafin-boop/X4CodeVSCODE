@@ -928,6 +928,22 @@ export function App() {
                     </button>
                   )}
                   <label className="set-row">
+                    <span>Доступы (env)</span>
+                    <button
+                      className="finish-btn"
+                      onClick={() => vscode.postMessage({ type: "manageSecretEnv" })}
+                    >
+                      🔐 {form.secretEnvNames.length > 0
+                        ? form.secretEnvNames.join(", ")
+                        : "Добавить доступы…"}
+                    </button>
+                  </label>
+                  <div className="set-hint">
+                    Логины, ключи API, пароли БД и т.п. Значения хранятся в защищённом
+                    хранилище и передаются агенту только переменными окружения — в чат
+                    и промпт попадают лишь имена переменных.
+                  </div>
+                  <label className="set-row">
                     <span>Заметки</span>
                     <input
                       value={form.project.server ?? ""}
