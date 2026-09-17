@@ -12,7 +12,26 @@ Claude Max) и **GPT (Codex CLI**, аккаунт ChatGPT) — с проекта
   <a href="https://github.com/marsevafin-boop/X4CodeVSCODE/releases/latest/download/agent-hub-win32-x64.vsix">
     <img src="https://img.shields.io/badge/⬇%20Скачать%20для%20Windows-x64-2D7D46?style=for-the-badge&logoColor=white" alt="Скачать для Windows (x64)">
   </a>
+  &nbsp;
+  <a href="https://github.com/marsevafin-boop/X4CodeVSCODE/releases/latest/download/agent-hub-android.apk">
+    <img src="https://img.shields.io/badge/⬇%20Android-приложение%20(APK)-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Скачать Android APK">
+  </a>
 </p>
+
+## Мобильный доступ (Android)
+
+Чат работает и с телефона — агенты при этом выполняются на компьютере, где
+открыт VS Code с Agent Hub:
+
+1. В VS Code: команда **«Agent Hub: Мобильный доступ»** (или иконка 📱 в
+   заголовке панели) — включит сервер и покажет ссылки с QR-кодами.
+2. На телефоне установите [Tailscale](https://tailscale.com) (тот же аккаунт,
+   что на компьютере) — доступ извне только через него, порты наружу не открываются.
+3. Установите `agent-hub-android.apk` (кнопка выше) и отсканируйте QR
+   «Приложение Android» камерой — ссылка `agenthub://…` откроет чат. Либо просто
+   откройте ссылку «Браузер / PWA» в Chrome и добавьте на главный экран.
+
+Ссылка содержит секретный токен — не публикуйте её; сбросить токен можно в той же команде.
 
 ## Установка
 

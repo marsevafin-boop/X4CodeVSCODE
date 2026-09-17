@@ -2,3 +2,9 @@ node_modules/
 dist/
 *.vsix
 .DS_Store
+
+# Android-обёртка: сборочные артефакты и ключ подписи (ключ — только в секретах GitHub / ~/.agent-hub)
+mobile/android/.gradle/
+mobile/android/**/build/
+mobile/android/release.p12
+mobile/android/local.properties

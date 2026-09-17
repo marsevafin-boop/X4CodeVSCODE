@@ -20,6 +20,8 @@ import type {
 
 declare function acquireVsCodeApi(): { postMessage(msg: WebviewToHost): void };
 const vscode = acquireVsCodeApi();
+/** Мобильный клиент (страница из remoteServer): без нативных диалогов VS Code. */
+const REMOTE = Boolean((window as unknown as { __AGENT_HUB_REMOTE__?: boolean }).__AGENT_HUB_REMOTE__);
 
 type ChatItem =
   | {
@@ -169,6 +171,7 @@ export function App() {
   const [agent, setAgent] = useState<AgentId>("claude");
   const [draft, setDraft] = useState("");
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   /** Ручная высота поля ввода (px); null — автоподстройка под текст. */
   const [composerHeight, setComposerHeight] = useState<number | null>(() => {
     try {
@@ -214,6 +217,15 @@ export function App() {
     }
   });
   const [atBottom, setAtBottom] = useState(true);
+  /** Нижний лист выбора (мобильный клиент): модель / effort / сессия. */
+  const [choice, setChoice] = useState<{
+    kind: "model" | "effort" | "session";
+    agent?: AgentId;
+    title: string;
+    items: { label: string; detail?: string; value: string; current?: boolean }[];
+    step: "pick" | "scope";
+    value?: string;
+  } | null>(null);
 
   const activeRef = useRef(activePath);
   activeRef.current = activePath;
@@ -477,6 +489,9 @@ export function App() {
         case "draftHandled":
           // Доступы из черновика сохранены хостом — очищаем поле ввода.
           if (!msg.path || msg.path === activeRef.current) setDraft("");
+          break;
+        case "choices":
+          setChoice({ kind: msg.kind, agent: msg.agent, title: msg.title, items: msg.items, step: "pick" });
           break;
         case "settings":
           setForm(msg.settings);
@@ -821,6 +836,7 @@ export function App() {
                     <span className="proj-path">{p.path}</span>
                     <button
                       className="finish-btn delete-btn"
+                      hidden={REMOTE}
                       title="Удалить проект: убрать из списка или удалить вместе с папкой (в Корзину)"
                       onClick={() => vscode.postMessage({ type: "deleteProject", path: p.path })}
                     >
@@ -831,6 +847,7 @@ export function App() {
                 <div className="set-actions" style={{ paddingTop: 6, paddingBottom: 0 }}>
                   <button
                     className="finish-btn"
+                    hidden={REMOTE}
                     onClick={() => vscode.postMessage({ type: "addProject" })}
                   >
                     ＋ Добавить проект…
@@ -931,7 +948,7 @@ export function App() {
                       Удалить сохранённый пароль
                     </button>
                   )}
-                  <label className="set-row">
+                  <label className="set-row" hidden={REMOTE}>
                     <span>Доступы (env)</span>
                     <button
                       className="finish-btn"
@@ -984,6 +1001,7 @@ export function App() {
                   <div className="set-actions" style={{ paddingBottom: 0 }}>
                     <button
                       className="finish-btn delete-btn"
+                      hidden={REMOTE}
                       title="Убрать проект из списка или удалить вместе с папкой (папка уедет в Корзину)"
                       onClick={() =>
                         vscode.postMessage({ type: "deleteProject", path: form.project!.path })
@@ -1233,7 +1251,7 @@ export function App() {
                 </label>
               </section>
 
-              <section>
+              <section hidden={REMOTE}>
                 <h3>JSON-конфиг (продвинутое)</h3>
                 <div className="set-hint">
                   Весь текущий конфиг: настройки агентов, allowlist, журнал и все
@@ -1279,7 +1297,7 @@ export function App() {
                 )}
               </section>
 
-              <section>
+              <section hidden={REMOTE}>
                 <h3>Перенос настроек</h3>
                 <div className="set-actions" style={{ paddingBottom: 0 }}>
                   <button
@@ -1349,8 +1367,8 @@ export function App() {
               {p.name}
             </option>
           ))}
-          <option value="__add__">＋ Добавить проект…</option>
-          <option value="__manage__">🗂 Все проекты: переключить / удалить…</option>
+          <option value="__add__" hidden={REMOTE}>＋ Добавить проект…</option>
+          <option value="__manage__" hidden={REMOTE}>🗂 Все проекты: переключить / удалить…</option>
         </select>
         <select
           className="agent-select"
@@ -1379,6 +1397,7 @@ export function App() {
         </button>
         <button
           className="finish-btn"
+          hidden={REMOTE}
           title="Все проекты: переключиться, удалить любой (🗑 у строки), добавить"
           onClick={() => vscode.postMessage({ type: "manageProjects" })}
         >
@@ -1404,6 +1423,7 @@ export function App() {
         </button>
         <button
           className="finish-btn"
+          hidden={REMOTE}
           title="Во всю ширину: открыть чат вкладкой редактора (сайдбар спрячется)"
           onClick={() => vscode.postMessage({ type: "openFullView" })}
         >
@@ -1484,6 +1504,7 @@ export function App() {
         )}
         <button
           className="safety-btn"
+          hidden={REMOTE}
           title="Показать контекст агента: что он получит из базы проекта со следующим сообщением (карточка проекта, журнал, лента другого агента) и точный промпт последнего хода"
           onClick={() => vscode.postMessage({ type: "showContext", agent })}
         >
@@ -1797,16 +1818,31 @@ export function App() {
         />
         <div className="actions">
           <div className="actions-left">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              hidden
+              onChange={(e) => {
+                if (e.target.files?.length) ingestFiles(e.target.files);
+                e.target.value = "";
+              }}
+            />
             <button
               className="attach-btn"
               title="Прикрепить файлы (или вставьте скриншот из буфера, или перетащите сюда)"
               disabled={busy}
-              onClick={() => vscode.postMessage({ type: "pickAttachment", path: activePath })}
+              onClick={() =>
+                REMOTE
+                  ? fileInputRef.current?.click()
+                  : vscode.postMessage({ type: "pickAttachment", path: activePath })
+              }
             >
               📎
             </button>
             <button
               className="attach-btn"
+              hidden={REMOTE}
               title="Не отправлять агенту, а сохранить доступы из сообщения в переменные окружения выбранных проектов. Формат — по строке на переменную: SSH_PASSWORD=секрет"
               disabled={!draft.trim()}
               onClick={() =>
@@ -1859,6 +1895,48 @@ export function App() {
           )}
         </div>
       </footer>
+      {choice && (
+        <div className="choice-backdrop" onClick={() => setChoice(null)}>
+          <div className="choice-sheet" onClick={(e) => e.stopPropagation()}>
+            <div className="choice-title">
+              {choice.step === "scope" ? `Где применять: ${choice.value || "по умолчанию"}` : choice.title}
+            </div>
+            {(choice.step === "scope"
+              ? [
+                  { label: "Только этот чат", detail: "новый чат начнётся с базовой модели", value: "chat" },
+                  { label: "Базовая — для новых чатов", detail: "сохранится в настройках", value: "base" },
+                ]
+              : choice.items
+            ).map((it: { label: string; detail?: string; value: string; current?: boolean }) => (
+              <button
+                key={it.value + it.label}
+                className={`choice-item${it.current ? " current" : ""}`}
+                onClick={() => {
+                  if (choice.kind === "model" && choice.step === "pick") {
+                    setChoice({ ...choice, step: "scope", value: it.value });
+                    return;
+                  }
+                  if (choice.step === "scope") {
+                    vscode.postMessage({
+                      type: "choose",
+                      kind: "model",
+                      agent: choice.agent,
+                      value: choice.value ?? "",
+                      scope: it.value === "base" ? "base" : "chat",
+                    });
+                  } else {
+                    vscode.postMessage({ type: "choose", kind: choice.kind, agent: choice.agent, value: it.value });
+                  }
+                  setChoice(null);
+                }}
+              >
+                {it.label}
+                {it.detail && <span className="choice-detail">{it.detail}</span>}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

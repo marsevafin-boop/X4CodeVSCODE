@@ -1,0 +1,149 @@
+/* Тема для мобильного клиента: в браузере нет переменных VS Code —
+   задаём палитру Dark Modern и мобильные размеры. */
+:root {
+  color-scheme: dark;
+  --vscode-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --vscode-font-size: 15px;
+  --vscode-editor-font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+  --vscode-foreground: #cccccc;
+  --vscode-editor-background: #1f1f1f;
+  --vscode-sideBar-background: #181818;
+  --vscode-input-background: #313131;
+  --vscode-input-foreground: #cccccc;
+  --vscode-input-border: #3c3c3c;
+  --vscode-panel-border: #2b2b2b;
+  --vscode-widget-border: #313131;
+  --vscode-button-background: #0078d4;
+  --vscode-button-foreground: #ffffff;
+  --vscode-button-secondaryBackground: #3a3d41;
+  --vscode-button-secondaryForeground: #ffffff;
+  --vscode-focusBorder: #0078d4;
+  --vscode-dropdown-background: #313131;
+  --vscode-dropdown-foreground: #cccccc;
+  --vscode-dropdown-border: #3c3c3c;
+  --vscode-errorForeground: #f88070;
+  --vscode-toolbar-hoverBackground: rgba(90, 93, 94, 0.31);
+  --vscode-editorWidget-background: #202020;
+  --vscode-editorWidget-border: #313131;
+  --vscode-badge-background: #616161;
+  --vscode-badge-foreground: #f8f8f8;
+  --vscode-charts-green: #89d185;
+  --vscode-charts-red: #f14c4c;
+  --vscode-charts-yellow: #cca700;
+  --vscode-inputValidation-errorBackground: #5a1d1d;
+  --vscode-inputValidation-errorBorder: #be1100;
+  --vscode-inputValidation-warningBackground: #352a05;
+  --vscode-inputValidation-warningBorder: #b89500;
+  --vscode-list-activeSelectionBackground: #04395e;
+  --vscode-list-activeSelectionForeground: #ffffff;
+  --vscode-progressBar-background: #0078d4;
+  --vscode-textCodeBlock-background: #2b2b2b;
+  --vscode-textLink-foreground: #4daafc;
+}
+
+html.remote,
+html.remote body {
+  height: 100%;
+  margin: 0;
+  -webkit-text-size-adjust: 100%;
+  background: var(--vscode-sideBar-background);
+  overscroll-behavior: none;
+}
+
+/* Safe-area на телефонах с вырезом; композер не прячется за жестовой полосой. */
+html.remote .app {
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* Тач-размеры кнопок и полей. */
+html.remote .finish-btn,
+html.remote .safety-btn,
+html.remote .model-badge,
+html.remote .attach-btn,
+html.remote .actions button,
+html.remote .project-select,
+html.remote .agent-select {
+  min-height: 38px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+html.remote .composer textarea {
+  font-size: 16px;
+}
+
+html.remote .msg {
+  font-size: 15px;
+}
+
+/* Меню выбора (модель, effort, сессии) — нижний лист. */
+.choice-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 50;
+  display: flex;
+  align-items: flex-end;
+}
+
+.choice-sheet {
+  width: 100%;
+  max-height: 70vh;
+  overflow-y: auto;
+  background: var(--vscode-editorWidget-background);
+  border-top: 1px solid var(--vscode-editorWidget-border);
+  border-radius: 12px 12px 0 0;
+  padding: 10px 10px calc(10px + env(safe-area-inset-bottom));
+  box-sizing: border-box;
+}
+
+.choice-title {
+  font-weight: 600;
+  padding: 6px 8px 10px;
+  opacity: 0.85;
+}
+
+.choice-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: var(--vscode-foreground);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 10px 8px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.choice-item:hover,
+.choice-item:active {
+  background: var(--vscode-toolbar-hoverBackground);
+}
+
+.choice-item.current {
+  border-color: var(--vscode-focusBorder);
+}
+
+.choice-detail {
+  font-size: 0.85em;
+  opacity: 0.6;
+  margin-top: 2px;
+}
+
+/* Плашка связи с компьютером. */
+#ah-conn {
+  position: fixed;
+  top: env(safe-area-inset-top, 0);
+  left: 0;
+  right: 0;
+  z-index: 100;
+  padding: 6px 12px;
+  background: #b89500;
+  color: #000;
+  font: 13px var(--vscode-font-family);
+  text-align: center;
+}

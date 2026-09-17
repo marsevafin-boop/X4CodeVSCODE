@@ -7,3 +7,5 @@ tsconfig.json
 ai-dev-environment.md
 dist/**/*.map
 **/*.vsix
+mobile/**
+.github/**

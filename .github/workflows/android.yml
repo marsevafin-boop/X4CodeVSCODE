@@ -1,0 +1,63 @@
+name: Android APK
+
+# Собирает Android-обёртку Agent Hub (mobile/android) и прикладывает APK
+# к опубликованному релизу рядом с .vsix. Локально Android SDK не нужен.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-35 build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Keystore from secrets
+        env:
+          KS: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KS" ]; then
+            echo "$KS" | base64 -d > mobile/android/release.p12
+            echo "keystore: release (PKCS12)"
+          else
+            echo "keystore: none — debug signing"
+          fi
+
+      - name: Build release APK
+        working-directory: mobile/android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          APP_VERSION_NAME: ${{ github.event.release.tag_name || 'dev' }}
+          APP_VERSION_CODE: ${{ github.run_number }}
+        run: gradle --no-daemon --console=plain assembleRelease
+
+      - name: Rename
+        run: cp mobile/android/app/build/outputs/apk/release/app-release.apk agent-hub-android.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-hub-android
+          path: agent-hub-android.apk
+
+      - name: Attach APK to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" agent-hub-android.apk --clobber --repo "${{ github.repository }}"

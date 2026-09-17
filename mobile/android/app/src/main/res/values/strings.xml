@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Agent Hub</string>
+    <string name="setup_title">Подключение к компьютеру</string>
+    <string name="setup_message">Отсканируйте QR-код из команды VS Code «Agent Hub: Мобильный доступ» камерой телефона — или вставьте ссылку сюда.</string>
+    <string name="url_hint">agenthub://100.x.x.x:47831/t/…/</string>
+    <string name="connect">Подключиться</string>
+    <string name="retry">Повторить</string>
+    <string name="change_server">Сменить сервер…</string>
+    <string name="exit">Выйти</string>
+    <string name="error_load">Не удалось открыть чат: %1$s. Проверьте, что VS Code с Agent Hub запущен на компьютере, а телефон подключён к Tailscale или той же Wi-Fi-сети.</string>
+</resources>

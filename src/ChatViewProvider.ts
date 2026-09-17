@@ -15,6 +15,15 @@ import type { AgentBackend } from "./agents/types";
 import { ClaudeBackend } from "./agents/claudeBackend";
 import { CodexBackend, codexDefaultModel, killAllCodex } from "./agents/codexBackend";
 import { buildFinishPrompt, readJournalContext } from "./journal";
+import * as QRCode from "qrcode";
+import {
+  RemoteServer,
+  enableTailscaleServe,
+  generateToken,
+  lanAddresses,
+  tailscaleInfo,
+  type RemoteClient,
+} from "./remoteServer";
 
 const LEGACY_SESSIONS_KEY = "agentHub.sessions";
 const LEGACY_TRANSCRIPTS_KEY = "agentHub.transcripts";
@@ -22,6 +31,27 @@ const STORE_KEY = "agentHub.sessionStore";
 const ACTIVE_PROJECT_KEY = "agentHub.activeProject";
 const CLAUDE_COMMANDS_KEY = "agentHub.claudeCommands";
 const CLAUDE_MODELS_KEY = "agentHub.claudeModels";
+const REMOTE_TOKEN_KEY = "agentHub.remoteToken";
+/** Действия с нативными диалогами VS Code — мобильному клиенту недоступны. */
+const VSCODE_ONLY_ACTIONS = new Set<string>([
+  "addProject",
+  "deleteProject",
+  "manageProjects",
+  "manageSecretEnv",
+  "showContext",
+  "exportSettings",
+  "importSettings",
+  "applyConfigJson",
+  "openFullView",
+  "pickAttachment",
+  "sendSecretEnv",
+]);
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string,
+  );
+}
 /** Модель Claude из supportedModels SDK (кэш в globalState). */
 interface ClaudeModelInfo {
   value: string;
@@ -217,6 +247,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private runs = new Map<string, AbortController>();
   /** Отложенные ходы: ответ на вопрос Codex уходит после текущего хода. */
   private deferred = new Map<string, { prompt: string; agent: AgentId }[]>();
+  /** Сервер мобильного доступа (третья поверхность рядом с сайдбаром и панелью). */
+  private remote: RemoteServer | null = null;
   /** Ожидающие решения запросы canUseTool: requestId → {проект, resolve}. */
   private pendingPermissions = new Map<
     string,
@@ -239,7 +271,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  constructor(private readonly context: vscode.ExtensionContext) {}
+  constructor(private readonly context: vscode.ExtensionContext) {
+    void this.syncRemoteServer();
+    context.subscriptions.push(
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration("agentHub.remote")) void this.syncRemoteServer();
+      }),
+    );
+  }
 
   resolveWebviewView(view: vscode.WebviewView) {
     this.view = view;
@@ -1872,7 +1911,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * Быстрый выбор модели по клику на бейдж. Применяется со следующего хода —
    * в т.ч. чтобы вернуться на основную модель после «липкого» фоллбэка.
    */
-  async pickModel(agent: AgentId) {
+  async pickModel(agent: AgentId, remote?: RemoteClient) {
     const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
     const current = section.get<string>("model", "");
     const CUSTOM = "__custom__";
@@ -1907,6 +1946,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             })),
             { label: "$(edit) Ввести вручную…", value: CUSTOM },
           ];
+
+    if (remote) {
+      remote.send({
+        type: "choices",
+        kind: "model",
+        agent,
+        title: `Модель для ${agent === "claude" ? "Claude" : "Codex"}`,
+        items: base
+          .filter((i) => i.value !== CUSTOM)
+          .map((i) => ({ label: i.label, detail: i.detail, value: i.value, current: i.value === current })),
+      });
+      return;
+    }
 
     const pick = await vscode.window.showQuickPick(
       base.map((i) => ({
@@ -1953,9 +2005,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     );
     if (!scope) return;
+    await this.applyModel(agent, value, scope.base);
+  }
 
+  /** Применить выбор модели: только в этот чат или как базовую для новых. */
+  async applyModel(agent: AgentId, value: string, base: boolean) {
+    const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
+    const agentName = agent === "claude" ? "Claude" : "Codex";
     const project = this.getActiveProject();
-    if (scope.base) {
+    if (base) {
       await section.update("model", value, vscode.ConfigurationTarget.Global);
       // Базовая изменилась — текущий чат следует ей, свой выбор снимаем.
       if (project) {
@@ -1976,14 +2034,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (value) o[agent] = value;
         else delete o[agent];
       });
-      const base =
-        vscode.workspace.getConfiguration(`agentHub.${agent}`).get<string>("model", "") ||
-        "по умолчанию CLI";
+      const baseModel = section.get<string>("model", "") || "по умолчанию CLI";
       this.post({
         type: "info",
         text: value
-          ? `Модель ${agentName} для ЭТОГО чата: ${value}. Новый чат начнётся с базовой (${base}).`
-          : `Свой выбор модели ${agentName} в этом чате снят — действует базовая (${base}).`,
+          ? `Модель ${agentName} для ЭТОГО чата: ${value}. Новый чат начнётся с базовой (${baseModel}).`
+          : `Свой выбор модели ${agentName} в этом чате снят — действует базовая (${baseModel}).`,
       });
     }
     await this.postSettings();
@@ -2015,7 +2071,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Быстрый выбор effort (глубины размышлений) по клику в статус-баре. */
-  async pickEffort(agent: AgentId) {
+  async pickEffort(agent: AgentId, remote?: RemoteClient) {
     const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
     const current = section.get<string>("effort", "");
     type Item = vscode.QuickPickItem & { value: string };
@@ -2058,6 +2114,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       subject = `Codex (${model || "модель по умолчанию"})`;
     }
 
+    if (remote) {
+      remote.send({
+        type: "choices",
+        kind: "effort",
+        agent,
+        title: `Effort для ${subject}`,
+        items: base.map((i) => ({ label: i.label, detail: i.detail, value: i.value, current: i.value === current })),
+      });
+      return;
+    }
+
     const pick = await vscode.window.showQuickPick(
       base.map((i) => ({
         ...i,
@@ -2069,14 +2136,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     );
     if (!pick) return;
+    await this.applyEffort(agent, pick.value);
+  }
 
-    await section.update("effort", pick.value, vscode.ConfigurationTarget.Global);
+  /** Применить effort агента (глобальная настройка). */
+  async applyEffort(agent: AgentId, value: string) {
+    const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
+    await section.update("effort", value, vscode.ConfigurationTarget.Global);
     await this.postSettings();
     this.postEfforts();
     this.post({
       type: "info",
-      text: pick.value
-        ? `Effort ${agent === "claude" ? "Claude" : "Codex"} со следующего хода: ${pick.value}.`
+      text: value
+        ? `Effort ${agent === "claude" ? "Claude" : "Codex"} со следующего хода: ${value}.`
         : `Effort ${agent === "claude" ? "Claude" : "Codex"}: по умолчанию.`,
     });
   }
@@ -2250,7 +2322,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Список сессий проекта: переключение по клику, удаление корзинкой. */
-  async showSessions() {
+  /** Переключиться на сессию активного проекта (меню мобильного клиента). */
+  async applySession(id: string) {
+    const project = this.getActiveProject();
+    if (!project) return;
+    if (this.runs.has(project.path)) {
+      this.post({ type: "error", message: "В этом проекте идёт ход — дождитесь завершения." });
+      return;
+    }
+    const store = this.getProjectStore(project.path);
+    if (!store.sessions.some((s) => s.id === id)) return;
+    store.activeId = id;
+    this.pruneEmptySessions(store);
+    await this.saveProjectStore(project.path, store);
+    this.postFullState();
+  }
+
+  async showSessions(remote?: RemoteClient) {
     const project = this.getActiveProject();
     if (!project) return;
     if (this.runs.has(project.path)) {
@@ -2262,6 +2350,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await this.saveProjectStore(project.path, store);
     if (store.sessions.length === 0) {
       this.post({ type: "info", text: "История сессий этого проекта пуста." });
+      return;
+    }
+
+    if (remote) {
+      const fmt = (ts: number) =>
+        new Date(ts).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+      remote.send({
+        type: "choices",
+        kind: "session",
+        title: `Сессии — ${project.name}`,
+        items: [...store.sessions]
+          .sort((a, b) => b.updatedAt - a.updatedAt)
+          .map((s) => ({
+            label: s.title,
+            detail: `${fmt(s.updatedAt)} · ${
+              [s.agentIds.claude && "Claude", s.agentIds.codex && "Codex"].filter(Boolean).join(" + ") ||
+              "без запусков"
+            }`,
+            value: s.id,
+            current: s.id === store.activeId,
+          })),
+      });
       return;
     }
 
@@ -2384,6 +2494,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private post(msg: HostToWebview) {
     this.view?.webview.postMessage(msg);
     this.panel?.webview.postMessage(msg);
+    this.remote?.broadcast(msg);
   }
 
   /** Показать чат пользователю: вкладка приоритетнее сайдбара. */
@@ -2421,7 +2532,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await this.postSettings();
   }
 
-  private async onMessage(msg: WebviewToHost) {
+  private async onMessage(
+    msg: WebviewToHost,
+    source: "vscode" | "remote" = "vscode",
+    client?: RemoteClient,
+  ) {
+    // Мобильный клиент: действия с нативными диалогами VS Code недоступны,
+    // а пикеры модели/effort/сессий заменяются меню в самом webview.
+    if (source === "remote") {
+      if (VSCODE_ONLY_ACTIONS.has(msg.type)) {
+        client?.send({ type: "info", text: "Это действие доступно только в VS Code на компьютере." });
+        return;
+      }
+      if (msg.type === "pickModel") {
+        await this.pickModel(msg.agent, client);
+        return;
+      }
+      if (msg.type === "pickEffort") {
+        await this.pickEffort(msg.agent, client);
+        return;
+      }
+      if (msg.type === "showSessions") {
+        await this.showSessions(client);
+        return;
+      }
+    }
     switch (msg.type) {
       case "ready":
         this.postFullState();
@@ -2557,6 +2692,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "openFile":
         await this.openFileFromChat(msg.path, msg.project);
         break;
+      case "choose":
+        if (msg.kind === "model") {
+          await this.applyModel(msg.agent ?? "claude", msg.value, msg.scope === "base");
+        } else if (msg.kind === "effort") {
+          await this.applyEffort(msg.agent ?? "claude", msg.value);
+        } else {
+          await this.applySession(msg.value);
+        }
+        break;
       case "permission": {
         const pending = this.pendingPermissions.get(msg.requestId);
         if (pending) {
@@ -2659,10 +2803,162 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     void this.runTurn(prompt, agent, [], cwd, true);
   }
 
+  // ---------- Мобильный доступ (удалённый клиент) ----------
+
+  private async remoteToken(): Promise<string> {
+    let t = await this.context.secrets.get(REMOTE_TOKEN_KEY);
+    if (!t) {
+      t = generateToken();
+      await this.context.secrets.store(REMOTE_TOKEN_KEY, t);
+    }
+    return t;
+  }
+
+  /** Поднять/остановить сервер по настройке agentHub.remote.enabled. */
+  private async syncRemoteServer() {
+    const cfg = vscode.workspace.getConfiguration("agentHub.remote");
+    const enabled = cfg.get<boolean>("enabled", false);
+    const port = cfg.get<number>("port", 47831);
+    if (!enabled) {
+      this.remote?.stop();
+      this.remote = null;
+      return;
+    }
+    if (this.remote?.running && this.remote.port === port) return;
+    this.remote?.stop();
+    this.remote = null;
+    const token = await this.remoteToken();
+    const server = new RemoteServer({
+      port,
+      token,
+      distDir: vscode.Uri.joinPath(this.context.extensionUri, "dist").fsPath,
+      mediaDir: vscode.Uri.joinPath(this.context.extensionUri, "media").fsPath,
+      onMessage: (client, msg) => void this.onMessage(msg as WebviewToHost, "remote", client),
+    });
+    try {
+      await server.start();
+      this.remote = server;
+    } catch (err) {
+      void vscode.window.showErrorMessage(
+        `Agent Hub: не удалось запустить мобильный доступ на порту ${port}: ${err instanceof Error ? err.message : err}`,
+      );
+    }
+  }
+
+  /** Команда «Мобильный доступ»: включить сервер и показать ссылки + QR. */
+  async showRemoteAccess() {
+    const cfg = vscode.workspace.getConfiguration("agentHub.remote");
+    if (!cfg.get<boolean>("enabled", false)) {
+      await cfg.update("enabled", true, vscode.ConfigurationTarget.Global);
+    }
+    await this.syncRemoteServer();
+    if (!this.remote) return;
+    const port = this.remote.port;
+    const token = await this.remoteToken();
+    const ts = await tailscaleInfo(port);
+
+    const links: { title: string; url: string; note: string }[] = [];
+    if (ts?.serveHttps && ts.dnsName) {
+      links.push({
+        title: "Tailscale HTTPS (рекомендуется)",
+        url: `https://${ts.dnsName}/t/${token}/`,
+        note: "Через Tailscale Serve: в Chrome доступно «Установить приложение»",
+      });
+    }
+    if (ts?.ip) {
+      links.push({
+        title: "Tailscale",
+        url: `http://${ts.ip}:${port}/t/${token}/`,
+        note: "Телефон должен быть в той же tailnet (приложение Tailscale)",
+      });
+    }
+    for (const a of lanAddresses()) {
+      links.push({
+        title: `Wi-Fi / локальная сеть (${a.name})`,
+        url: `http://${a.address}:${port}/t/${token}/`,
+        note: "Только когда телефон в той же сети",
+      });
+    }
+    if (links.length === 0) {
+      links.push({ title: "Локально", url: `http://127.0.0.1:${port}/t/${token}/`, note: "Сетевые интерфейсы не найдены" });
+    }
+    const cards = await Promise.all(
+      links.map(async (l) => {
+        // Схема для Android-приложения: agenthub:// → http, agenthubs:// → https.
+        const app = l.url.startsWith("https://")
+          ? l.url.replace(/^https:\/\//, "agenthubs://")
+          : l.url.replace(/^http:\/\//, "agenthub://");
+        const [svg, appSvg] = await Promise.all([
+          QRCode.toString(l.url, { type: "svg", margin: 1, width: 220 }),
+          QRCode.toString(app, { type: "svg", margin: 1, width: 220 }),
+        ]);
+        return (
+          `<section><h2>${escapeHtml(l.title)}</h2><p class="note">${escapeHtml(l.note)}</p>` +
+          `<div class="row"><div><div class="cap">Браузер / PWA</div>${svg}<code>${escapeHtml(l.url)}</code></div>` +
+          `<div><div class="cap">Приложение Android</div>${appSvg}<code>${escapeHtml(app)}</code></div></div></section>`
+        );
+      }),
+    );
+    const panel = vscode.window.createWebviewPanel(
+      "agentHub.remoteAccess",
+      "Agent Hub: мобильный доступ",
+      vscode.ViewColumn.Beside,
+      {},
+    );
+    panel.webview.html =
+      `<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><style>` +
+      `body{font-family:var(--vscode-font-family);padding:12px 18px;color:var(--vscode-foreground)}h1{font-size:18px}` +
+      `h2{font-size:15px;margin:18px 0 4px}.note{opacity:.7;margin:0 0 8px}.row{display:flex;gap:24px;flex-wrap:wrap}` +
+      `.cap{font-size:12px;opacity:.7;margin-bottom:4px}svg{width:220px;height:220px;background:#fff;padding:6px;border-radius:6px}` +
+      `code{display:block;max-width:260px;word-break:break-all;font-size:11px;margin-top:6px;opacity:.85}` +
+      `.warn{border-left:3px solid #cca700;padding:6px 10px;margin:10px 0}</style></head><body>` +
+      `<h1>📱 Мобильный доступ</h1>` +
+      `<div class="warn">Ссылка содержит секретный токен — по ней агенты выполняют команды на этом компьютере. Не публикуйте её. VS Code должен быть открыт.</div>` +
+      `<p>Порт ${port}${ts ? " · Tailscale " + escapeHtml(ts.ip ?? "") : " · Tailscale не запущен"}` +
+      `${this.remote.clientCount ? ` · подключено клиентов: ${this.remote.clientCount}` : ""}</p>` +
+      cards.join("") +
+      `<p class="note">Android-приложение Agent Hub: отсканируйте QR «Приложение Android» камерой — ссылка agenthub:// откроет его. В Chrome ссылку можно добавить на главный экран.</p>` +
+      `</body></html>`;
+
+    const buttons = [
+      ...(ts && !ts.serveHttps ? ["Включить HTTPS через Tailscale Serve"] : []),
+      "Сбросить токен",
+      "Выключить",
+    ];
+    const choice = await vscode.window.showInformationMessage(
+      "Agent Hub: мобильный доступ включён — ссылки и QR открыты рядом.",
+      ...buttons,
+    );
+    if (choice === "Включить HTTPS через Tailscale Serve") {
+      const r = await enableTailscaleServe(port);
+      if (r.ok) {
+        void vscode.window.showInformationMessage(
+          "Tailscale Serve включён — откройте команду ещё раз, появится HTTPS-ссылка.",
+        );
+      } else {
+        void vscode.window.showErrorMessage(`Tailscale Serve: ${r.message || "не удалось включить"}`);
+      }
+    } else if (choice === "Сбросить токен") {
+      await this.context.secrets.delete(REMOTE_TOKEN_KEY);
+      this.remote.stop();
+      this.remote = null;
+      await this.syncRemoteServer();
+      void vscode.window.showInformationMessage(
+        "Токен сброшен — старые ссылки больше не работают. Откройте команду ещё раз.",
+      );
+    } else if (choice === "Выключить") {
+      await cfg.update("enabled", false, vscode.ConfigurationTarget.Global);
+      this.remote?.stop();
+      this.remote = null;
+    }
+  }
+
   /** При выгрузке расширения: оборвать все ходы и добить процессы агентов. */
   abortAll() {
     for (const c of this.runs.values()) c.abort();
     killAllCodex();
+    this.remote?.stop();
+    this.remote = null;
   }
 
   /**

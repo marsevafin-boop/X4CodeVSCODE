@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Два «пузыря» чата: агенты и пользователь. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,32 h34 a8,8 0 0 1 8,8 v18 a8,8 0 0 1 -8,8 h-18 l-10,8 v-8 h-6 a8,8 0 0 1 -8,-8 v-18 a8,8 0 0 1 8,-8 z" />
+    <path
+        android:fillColor="#CDE6FF"
+        android:pathData="M52,50 h26 a6,6 0 0 1 6,6 v14 a6,6 0 0 1 -6,6 h-4 v7 l-9,-7 h-13 a6,6 0 0 1 -6,-6 v-14 a6,6 0 0 1 6,-6 z" />
+</vector>

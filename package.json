@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.44",
+  "version": "0.0.45",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -66,6 +66,11 @@
         "title": "Agent Hub: Доступы проекта в переменных окружения…"
       },
       {
+        "command": "agentHub.remoteAccess",
+        "title": "Agent Hub: Мобильный доступ (ссылка и QR-код)…",
+        "icon": "$(device-mobile)"
+      },
+      {
         "command": "agentHub.showContext",
         "title": "Agent Hub: Показать контекст агента (что видит нейросеть)"
       },
@@ -93,6 +98,11 @@
           "command": "agentHub.manageProjects",
           "when": "view == agentHub.chat",
           "group": "navigation@2"
+        },
+        {
+          "command": "agentHub.remoteAccess",
+          "when": "view == agentHub.chat",
+          "group": "navigation@3"
         }
       ]
     },
@@ -272,6 +282,16 @@
           ],
           "default": "perProject",
           "description": "Автопрокрутка ленты чата к новым сообщениям."
+        },
+        "agentHub.remote.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Мобильный доступ: HTTP/WebSocket-сервер чата для телефона. Включается командой «Agent Hub: Мобильный доступ». Ссылка с токеном даёт агентам выполнять команды на этом компьютере — доступ извне только через Tailscale."
+        },
+        "agentHub.remote.port": {
+          "type": "number",
+          "default": 47831,
+          "description": "Порт сервера мобильного доступа."
         },
         "agentHub.journalDir": {
           "type": "string",

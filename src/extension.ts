@@ -22,6 +22,7 @@ export function activate(context: vscode.ExtensionContext) {
     ),
     vscode.commands.registerCommand("agentHub.manageProjects", () => provider.manageProjects()),
     vscode.commands.registerCommand("agentHub.manageSecretEnv", () => provider.manageSecretEnv()),
+    vscode.commands.registerCommand("agentHub.remoteAccess", () => provider.showRemoteAccess()),
     vscode.commands.registerCommand("agentHub.showContext", async () => {
       const pick = await vscode.window.showQuickPick(
         [

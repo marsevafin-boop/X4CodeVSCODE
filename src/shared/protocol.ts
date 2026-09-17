@@ -85,6 +85,14 @@ export type WebviewToHost =
   | { type: "pickModel"; agent: AgentId }
   | { type: "pickEffort"; agent: AgentId }
   | { type: "showContext"; agent: AgentId }
+  | {
+      /** Выбор из меню мобильного клиента (вместо QuickPick VS Code). */
+      type: "choose";
+      kind: "model" | "effort" | "session";
+      agent?: AgentId;
+      value: string;
+      scope?: "chat" | "base";
+    }
   | { type: "manageSecretEnv" }
   | {
       /** Текст сообщения с доступами (KEY=value построчно) — сохранить в env
@@ -155,6 +163,14 @@ export type HostToWebview =
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }
   | { type: "effortInfo"; agent: AgentId; effort: string }
   | { type: "autoScrollMode"; mode: string }
+  | {
+      /** Меню выбора для мобильного клиента (модель / effort / сессия). */
+      type: "choices";
+      kind: "model" | "effort" | "session";
+      agent?: AgentId;
+      title: string;
+      items: { label: string; detail?: string; value: string; current?: boolean }[];
+    }
   | {
       /** Черновик обработан хостом (доступы сохранены) — очистить поле ввода. */
       type: "draftHandled";
