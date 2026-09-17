@@ -1419,7 +1419,8 @@ export function App() {
           title={
             (models[agent].fallbackFrom
               ? `Сработал фоллбэк: фактически отвечает ${models[agent].model}, хотя сессия начиналась на ${models[agent].fallbackFrom}. `
-              : "") + "Клик — выбрать модель (применится со следующего хода)"
+              : "") +
+            "Клик — выбрать модель: только для этого чата или базовую для новых чатов (применится со следующего хода)"
           }
           onClick={() => vscode.postMessage({ type: "pickModel", agent })}
         >

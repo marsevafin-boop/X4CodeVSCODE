@@ -69,6 +69,8 @@ interface SessionRecord {
   chatSeen?: Partial<Record<AgentId, number>>;
   /** Точный промпт последнего хода по агентам — для просмотрщика контекста. */
   lastPrompts?: Partial<Record<AgentId, string>>;
+  /** Модель, выбранная ТОЛЬКО для этого чата (пусто — базовая из настроек). */
+  modelOverrides?: Partial<Record<AgentId, string>>;
   /** Последняя известная занятость контекста по агентам. */
   context?: Partial<Record<AgentId, { used: number; max: number }>>;
   /** Последняя известная модель по агентам. */
@@ -1721,12 +1723,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Настройки агента (модель, effort и т.п.) из VS Code settings. */
-  private buildAgentConfig(agent: AgentId): import("./agents/types").AgentRunConfig {
+  private buildAgentConfig(
+    agent: AgentId,
+    modelOverride?: string,
+  ): import("./agents/types").AgentRunConfig {
     const cfg = vscode.workspace.getConfiguration(`agentHub.${agent}`);
     if (agent === "claude") {
       const cw = cfg.get<number>("contextWindow", 0);
       return {
-        model: cfg.get<string>("model") || undefined,
+        model: modelOverride || cfg.get<string>("model") || undefined,
         effort: cfg.get<string>("effort") || undefined,
         permissionMode: cfg.get<string>("permissionMode") || "default",
         maxTurns: cfg.get<number>("maxTurns") || 0,
@@ -1736,7 +1741,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     const cw = cfg.get<number>("contextWindow", 0);
     return {
-      model: cfg.get<string>("model") || undefined,
+      model: modelOverride || cfg.get<string>("model") || undefined,
       effort: cfg.get<string>("effort") || undefined,
       sandbox: cfg.get<string>("sandbox") || "workspace-write",
       yolo: cfg.get<boolean>("yolo") || false,
@@ -1925,14 +1930,61 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       value = input.trim();
     }
 
-    await section.update("model", value, vscode.ConfigurationTarget.Global);
+    // Область действия: только текущий чат или базовая (для всех новых чатов).
+    const agentName = agent === "claude" ? "Claude" : "Codex";
+    const scope = await vscode.window.showQuickPick(
+      [
+        {
+          label: "Только этот чат",
+          description: "новый чат начнётся с базовой модели",
+          base: false,
+        },
+        {
+          label: "Базовая — по умолчанию для новых чатов",
+          description: "сохранится в настройках",
+          base: true,
+        },
+      ],
+      {
+        placeHolder: `Где применять: ${value || "модель по умолчанию CLI"}`,
+        ignoreFocusOut: true,
+      },
+    );
+    if (!scope) return;
+
+    const project = this.getActiveProject();
+    if (scope.base) {
+      await section.update("model", value, vscode.ConfigurationTarget.Global);
+      // Базовая изменилась — текущий чат следует ей, свой выбор снимаем.
+      if (project) {
+        await this.mutateActiveRecord(project.path, (r) => {
+          if (r.modelOverrides) delete r.modelOverrides[agent];
+        });
+      }
+      this.post({
+        type: "info",
+        text: value
+          ? `Базовая модель ${agentName} (новые чаты и этот): ${value}.`
+          : `Базовая модель ${agentName}: по умолчанию CLI.`,
+      });
+    } else {
+      if (!project) return;
+      await this.mutateActiveRecord(project.path, (r) => {
+        const o = (r.modelOverrides ??= {});
+        if (value) o[agent] = value;
+        else delete o[agent];
+      });
+      const base =
+        vscode.workspace.getConfiguration(`agentHub.${agent}`).get<string>("model", "") ||
+        "по умолчанию CLI";
+      this.post({
+        type: "info",
+        text: value
+          ? `Модель ${agentName} для ЭТОГО чата: ${value}. Новый чат начнётся с базовой (${base}).`
+          : `Свой выбор модели ${agentName} в этом чате снят — действует базовая (${base}).`,
+      });
+    }
     await this.postSettings();
-    this.post({
-      type: "info",
-      text: value
-        ? `Модель ${agent === "claude" ? "Claude" : "Codex"} со следующего хода: ${value}.`
-        : `Модель ${agent === "claude" ? "Claude" : "Codex"}: по умолчанию CLI.`,
-    });
   }
 
   /** Модели Claude: кэш supportedModels CLI; до первого хода — статический список. */
@@ -2301,6 +2353,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         current.models = {};
         current.chatLog = [];
         current.chatSeen = {};
+        current.modelOverrides = {};
+        current.lastPrompts = {};
       } else {
         keptPrevious = !!current;
         const rec = this.createRecord();
@@ -2829,7 +2883,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             ? { AGENT_HUB_SERVER_PASSWORD: serverPassword, LFTP_PASSWORD: serverPassword }
             : {}),
         },
-        config: this.buildAgentConfig(agent),
+        config: this.buildAgentConfig(agent, record.modelOverrides?.[agent]),
         attachments: attachments.map((a) => ({ path: a.path, isImage: isImagePath(a.path) })),
         confirmTool: (toolName, input) => this.confirmTool(toolName, input, cwd),
       });

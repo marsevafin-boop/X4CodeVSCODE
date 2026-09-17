@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.42",
+  "version": "0.0.43",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -164,7 +164,7 @@
         "agentHub.claude.model": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Модель Claude для агента. Пусто — как настроено в CLI `claude`. Примеры: `claude-fable-5-1`, `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5`."
+          "markdownDescription": "Базовая модель Claude — с неё начинается каждый новый чат (в чате можно выбрать свою через бейдж модели). Пусто — как настроено в CLI `claude`. Примеры: `claude-fable-5-1`, `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5`."
         },
         "agentHub.claude.effort": {
           "type": "string",
@@ -207,7 +207,7 @@
         "agentHub.codex.model": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Модель для Codex (`codex exec -m …`). Пусто — как настроено в `~/.codex/config.toml`."
+          "markdownDescription": "Базовая модель Codex (`codex exec -m …`) — с неё начинается каждый новый чат (в чате можно выбрать свою через бейдж модели). Пусто — как настроено в `~/.codex/config.toml`."
         },
         "agentHub.codex.effort": {
           "type": "string",
