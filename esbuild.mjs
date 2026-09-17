@@ -12,7 +12,8 @@ const extensionCtx = await esbuild.context({
   format: "cjs",
   target: "node20",
   sourcemap: true,
-  external: ["vscode", "@anthropic-ai/claude-agent-sdk"],
+  // bufferutil/utf-8-validate — необязательные ускорители ws, подключаются через try/require.
+  external: ["vscode", "@anthropic-ai/claude-agent-sdk", "bufferutil", "utf-8-validate"],
 });
 
 /** Сборка webview: браузерный бандл + CSS (импортируется из index.tsx). */

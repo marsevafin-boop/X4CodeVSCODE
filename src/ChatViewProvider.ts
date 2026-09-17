@@ -215,6 +215,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   };
   /** Запущенные ходы по проектам: путь → контроллер. Разные проекты — параллельно. */
   private runs = new Map<string, AbortController>();
+  /** Отложенные ходы: ответ на вопрос Codex уходит после текущего хода. */
+  private deferred = new Map<string, { prompt: string; agent: AgentId }[]>();
   /** Ожидающие решения запросы canUseTool: requestId → {проект, resolve}. */
   private pendingPermissions = new Map<
     string,
@@ -2646,6 +2648,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return out;
   }
 
+  /** Ход после завершения текущего (или сразу, если проект свободен). */
+  private deferTurn(cwd: string, agent: AgentId, prompt: string) {
+    if (this.runs.has(cwd)) {
+      const list = this.deferred.get(cwd) ?? [];
+      list.push({ prompt, agent });
+      this.deferred.set(cwd, list);
+      return;
+    }
+    void this.runTurn(prompt, agent, [], cwd, true);
+  }
+
   /** При выгрузке расширения: оборвать все ходы и добить процессы агентов. */
   abortAll() {
     for (const c of this.runs.values()) c.abort();
@@ -2850,6 +2863,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Codex: тред занят чужим процессом — разобраться и повторить ход один раз.
     let writerConflict: string | null = null;
     let retryTurn = false;
+    let nextDeferred: { prompt: string; agent: AgentId } | undefined;
 
     // Мутации привязаны к записи хода: пока ход шёл, «Новая сессия» могла
     // переключить активную запись или переиспользовать эту же (тот же id,
@@ -2916,6 +2930,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             // Актуальные модели CLI (+ effort-уровни) — в кэш для пикеров.
             await this.context.globalState.update(CLAUDE_MODELS_KEY, ev.models);
             break;
+          case "question": {
+            // Codex спросил через request_user_input, но в exec-режиме ответа не
+            // ждёт: показываем карточку с вариантами, ответ уйдёт следующим ходом.
+            delivered = true;
+            for (const [i, q] of ev.questions.entries()) {
+              const requestId = `codexq-${ev.id || Date.now()}-${i}`;
+              this.postScoped(cwd, {
+                type: "permissionRequest",
+                requestId,
+                toolName: "request_user_input",
+                inputPreview: "",
+                kind: "question",
+                question: q.title,
+                options: q.options,
+              });
+              this.pendingPermissions.set(requestId, {
+                path: cwd,
+                resolve: (res) => {
+                  if (!res.answer) return;
+                  this.deferTurn(
+                    cwd,
+                    agent,
+                    `Ответ на твой вопрос «${q.title.slice(0, 160)}»: ${res.answer}`,
+                  );
+                },
+              });
+              answerBuf = answerBuf ? `${answerBuf}\n\n${q.title}` : q.title;
+            }
+            this.postScoped(cwd, {
+              type: "info",
+              text: "Codex задал вопрос и продолжает работу, не дожидаясь ответа: выбранный вариант уйдёт ему следующим сообщением.",
+            });
+            this.revealUi();
+            this.notifyBackgroundPermission(cwd, "Codex задаёт вопрос");
+            break;
+          }
           case "contextUsage":
             await mutateTurnRecord((r) => {
               r.context = { ...r.context, [agent]: { used: ev.usedTokens, max: ev.maxTokens } };
@@ -2995,11 +3045,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         r.chatSeen = seen;
       });
-      this.postScoped(cwd, { type: "busy", value: false });
+      // Отложенный ход (ответ на вопрос Codex) — без промежуточного busy:false,
+      // иначе очередь webview стартует параллельно и упрётся в «агент работает».
+      nextDeferred = retryTurn ? undefined : this.deferred.get(cwd)?.shift();
+      if (!nextDeferred) this.postScoped(cwd, { type: "busy", value: false });
     }
     if (retryTurn) {
       this.postScoped(cwd, { type: "info", text: "Повторяю ход…" });
       await this.runTurn(prompt, agent, attachments, targetPath, false, true);
+    } else if (nextDeferred) {
+      await this.runTurn(nextDeferred.prompt, nextDeferred.agent, [], cwd, true);
     }
   }
 

@@ -110,6 +110,78 @@ async function readCodexContext(
   }
 }
 
+/** Вопрос агента пользователю (request_user_input) — заголовок и варианты. */
+interface CodexQuestion {
+  title: string;
+  options: { label: string; description?: string }[];
+}
+
+function normalizeQuestions(raw: unknown): CodexQuestion[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: CodexQuestion[] = [];
+  for (const q of raw as { title?: unknown; question?: unknown; options?: unknown }[]) {
+    const title =
+      typeof q?.title === "string" ? q.title : typeof q?.question === "string" ? q.question : "";
+    if (!title) continue;
+    const options = Array.isArray(q.options)
+      ? (q.options as unknown[])
+          .map((o) => {
+            if (typeof o === "string") return { label: o };
+            const obj = o as { label?: unknown; description?: unknown };
+            return {
+              label: typeof obj?.label === "string" ? obj.label : "",
+              description: typeof obj?.description === "string" ? obj.description : undefined,
+            };
+          })
+          .filter((o) => o.label)
+      : [];
+    out.push({ title, options });
+  }
+  return out.length > 0 ? out : null;
+}
+
+/**
+ * В exec-режиме request_user_input(_async) ответа не ждёт: в поток приходит
+ * agent_message с вопросом, свёрнутым в список. Структуру (варианты) берём из
+ * rollout-файла треда — function_call с тем же call_id, что id сообщения.
+ */
+async function readCodexQuestions(
+  threadId: string,
+  callId: string,
+  cache: { file?: string },
+): Promise<CodexQuestion[] | null> {
+  try {
+    if (!cache.file) {
+      const root = path.join(os.homedir(), ".codex", "sessions");
+      const entries = (await fs.promises.readdir(root, { recursive: true })) as string[];
+      const rel = entries.find((e) => e.endsWith(`-${threadId}.jsonl`));
+      if (!rel) return null;
+      cache.file = path.join(root, rel);
+    }
+    const stat = await fs.promises.stat(cache.file);
+    const readSize = Math.min(stat.size, 512 * 1024);
+    const fd = await fs.promises.open(cache.file, "r");
+    const buf = Buffer.alloc(readSize);
+    await fd.read(buf, 0, readSize, stat.size - readSize);
+    await fd.close();
+    const needle = `"call_id":"${callId}"`;
+    for (const line of buf.toString("utf8").split("\n").reverse()) {
+      if (!line.includes(needle) || !line.includes("request_user_input")) continue;
+      try {
+        const j = JSON.parse(line) as { payload?: { name?: string; arguments?: string } };
+        if (!j.payload?.name?.startsWith("request_user_input")) continue;
+        const args = JSON.parse(j.payload.arguments ?? "{}") as { questions?: unknown };
+        return normalizeQuestions(args.questions);
+      } catch {
+        // строка обрезана границей буфера — ищем дальше
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Бэкенд Codex CLI (OpenAI) через `codex exec --json` — JSONL-события в stdout.
  * Проверено на codex-cli 0.147.0: thread.started / item.* / turn.completed.
@@ -242,6 +314,18 @@ export class CodexBackend implements AgentBackend {
             if (!item?.type) break;
 
             if (item.type === "agent_message" && ev.type === "item.completed") {
+              // Вопрос пользователю (request_user_input): варианты — из самого
+              // события или из rollout-файла; иначе это обычный текст ответа.
+              const inline = normalizeQuestions((item as { questions?: unknown }).questions);
+              const questions =
+                inline ??
+                (threadId && item.id?.startsWith("call_")
+                  ? await readCodexQuestions(threadId, item.id, rolloutCache)
+                  : null);
+              if (questions) {
+                yield { kind: "question", id: item.id ?? "", questions };
+                break;
+              }
               if (item.text) yield { kind: "assistantText", text: item.text };
               break;
             }

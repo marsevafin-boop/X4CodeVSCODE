@@ -27,6 +27,12 @@ export type AgentEvent =
     }
   | { kind: "notice"; text: string }
   | {
+      /** Агент задаёт вопрос с вариантами (Codex request_user_input). */
+      kind: "question";
+      id: string;
+      questions: { title: string; options: { label: string; description?: string }[] }[];
+    }
+  | {
       /** Доступные slash-команды CLI (Claude отдаёт их после init). */
       kind: "commands";
       commands: { name: string; description?: string; argumentHint?: string }[];
