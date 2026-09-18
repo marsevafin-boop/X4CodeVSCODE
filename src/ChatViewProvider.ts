@@ -249,6 +249,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private deferred = new Map<string, { prompt: string; agent: AgentId }[]>();
   /** Сервер мобильного доступа (третья поверхность рядом с сайдбаром и панелью). */
   private remote: RemoteServer | null = null;
+  /** Включён на эту сессию, когда настройку сохранить нельзя (окно не перезагружено). */
+  private remoteForced = false;
   /** Ожидающие решения запросы canUseTool: requestId → {проект, resolve}. */
   private pendingPermissions = new Map<
     string,
@@ -2817,7 +2819,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Поднять/остановить сервер по настройке agentHub.remote.enabled. */
   private async syncRemoteServer() {
     const cfg = vscode.workspace.getConfiguration("agentHub.remote");
-    const enabled = cfg.get<boolean>("enabled", false);
+    const enabled = this.remoteForced || cfg.get<boolean>("enabled", false);
     const port = cfg.get<number>("port", 47831);
     if (!enabled) {
       this.remote?.stop();
@@ -2849,7 +2851,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   async showRemoteAccess() {
     const cfg = vscode.workspace.getConfiguration("agentHub.remote");
     if (!cfg.get<boolean>("enabled", false)) {
-      await cfg.update("enabled", true, vscode.ConfigurationTarget.Global);
+      try {
+        await cfg.update("enabled", true, vscode.ConfigurationTarget.Global);
+      } catch {
+        // Окно не перезагружено после обновления расширения: команда уже есть,
+        // а схема настроек ещё старая — включаем до перезапуска и просим Reload.
+        this.remoteForced = true;
+        void vscode.window.showWarningMessage(
+          "Agent Hub: настройка не сохранилась — окно VS Code не перезагружено после обновления. " +
+            "Мобильный доступ включён до перезапуска; выполните «Developer: Reload Window», чтобы он включался сам.",
+        );
+      }
     }
     await this.syncRemoteServer();
     if (!this.remote) return;
@@ -2947,7 +2959,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         "Токен сброшен — старые ссылки больше не работают. Откройте команду ещё раз.",
       );
     } else if (choice === "Выключить") {
-      await cfg.update("enabled", false, vscode.ConfigurationTarget.Global);
+      this.remoteForced = false;
+      try {
+        await cfg.update("enabled", false, vscode.ConfigurationTarget.Global);
+      } catch {
+        // окно не перезагружено — просто останавливаем сервер
+      }
       this.remote?.stop();
       this.remote = null;
     }
