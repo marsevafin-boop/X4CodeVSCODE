@@ -55,6 +55,9 @@ export class ClaudeBackend implements AgentBackend {
         };
       },
     };
+    // Внешний CLI (настройка agentHub.claude.cliPath): свежие модели сразу
+    // после обновления claude, без перевыпуска плагина.
+    if (opts.cliPath) options.pathToClaudeCodeExecutable = opts.cliPath;
     if (cfg.model) options.model = cfg.model;
     if (cfg.effort) options.effort = cfg.effort;
     if (cfg.maxTurns && cfg.maxTurns > 0) options.maxTurns = cfg.maxTurns;
@@ -102,8 +105,8 @@ export class ClaudeBackend implements AgentBackend {
             // Пока CLI жив — точный замер: окно модели + базовая занятость
             // (системный промпт, инструменты, память) ещё до первого шага.
             // Только на первом ходе сессии (~1.3 с): на resume окно уже известно.
-            if (opts.resumeSessionId) break;
-            try {
+            const fresh = !opts.resumeSessionId;
+            if (fresh) try {
               const ctx = (await Promise.race([
                 stream.getContextUsage(),
                 new Promise((_, reject) =>
@@ -124,7 +127,7 @@ export class ClaudeBackend implements AgentBackend {
             }
             // Список slash-команд CLI (встроенные + .claude/commands) — для
             // меню автодополнения. Только на первом ходе, кэшируется хостом.
-            try {
+            if (fresh) try {
               const commands = (await Promise.race([
                 stream.supportedCommands(),
                 new Promise((_, reject) =>
@@ -145,8 +148,9 @@ export class ClaudeBackend implements AgentBackend {
               // список команд не критичен
             }
             // Актуальные модели CLI (+ уровни effort каждой) — для пикеров.
-            // Только на первом ходе, кэшируется хостом.
-            try {
+            // На первом ходе и когда хост считает кэш устаревшим (новые модели
+            // появляются после обновления CLI — без пересоздания сессии).
+            if (fresh || opts.refreshModels) try {
               const models = (await Promise.race([
                 stream.supportedModels(),
                 new Promise((_, reject) =>

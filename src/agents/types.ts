@@ -81,6 +81,10 @@ export interface StartOptions {
   attachments?: { path: string; isImage: boolean }[];
   /** Сигнал отмены (кнопка «Стоп»). */
   signal: AbortSignal;
+  /** Claude: запросить список моделей у CLI даже при resume (кэш устарел). */
+  refreshModels?: boolean;
+  /** Claude: путь к исполняемому claude вместо встроенного в SDK. */
+  cliPath?: string;
   /**
    * Колбэк подтверждения инструмента.
    * allow=true — разрешить; allow=false + answer — пользователь ответил на

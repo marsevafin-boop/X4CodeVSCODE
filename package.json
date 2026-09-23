@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.46",
+  "version": "0.0.47",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -174,7 +174,7 @@
         "agentHub.claude.model": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Базовая модель Claude — с неё начинается каждый новый чат (в чате можно выбрать свою через бейдж модели). Пусто — как настроено в CLI `claude`. Примеры: `claude-fable-5-1`, `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5`."
+          "markdownDescription": "Базовая модель Claude — с неё начинается каждый новый чат (в чате можно выбрать свою через бейдж модели). Пусто — как настроено в CLI `claude`. Примеры: `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, `claude-haiku-4-5`."
         },
         "agentHub.claude.effort": {
           "type": "string",
@@ -213,6 +213,11 @@
           "type": "number",
           "default": 0,
           "description": "Окно контекста Claude в токенах для индикатора. 0 — автоматически по модели (haiku — 200k, остальные — 1M)."
+        },
+        "agentHub.claude.cliPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Какой Claude Code запускать. Пусто — встроенный в плагин (обновляется вместе с плагином). `auto` — установленный в системе `claude` (новые модели появляются сразу после `claude update`). Или полный путь к исполняемому файлу."
         },
         "agentHub.codex.model": {
           "type": "string",
@@ -327,7 +332,7 @@
     "package": "vsce package --allow-missing-repository"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.261",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.280",
     "qrcode": "^1.5.4",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",

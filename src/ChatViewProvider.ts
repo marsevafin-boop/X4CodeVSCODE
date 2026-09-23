@@ -31,6 +31,9 @@ const STORE_KEY = "agentHub.sessionStore";
 const ACTIVE_PROJECT_KEY = "agentHub.activeProject";
 const CLAUDE_COMMANDS_KEY = "agentHub.claudeCommands";
 const CLAUDE_MODELS_KEY = "agentHub.claudeModels";
+const CLAUDE_MODELS_AT_KEY = "agentHub.claudeModelsAt";
+/** Список моделей Claude перезапрашивается у CLI не реже раза в 6 часов. */
+const CLAUDE_MODELS_TTL_MS = 6 * 60 * 60 * 1000;
 const REMOTE_TOKEN_KEY = "agentHub.remoteToken";
 /** Действия с нативными диалогами VS Code — мобильному клиенту недоступны. */
 const VSCODE_ONLY_ACTIONS = new Set<string>([
@@ -1917,6 +1920,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
     const current = section.get<string>("model", "");
     const CUSTOM = "__custom__";
+    const REFRESH = "__refresh__";
 
     type Item = vscode.QuickPickItem & { value: string };
     const base: Item[] =
@@ -1936,6 +1940,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                   .join(" — ") || undefined,
               value: m.value,
             })),
+            { label: "$(sync) Обновить список из Claude Code", value: REFRESH },
             { label: "$(edit) Ввести вручную…", value: CUSTOM },
           ]
         : [
@@ -1956,7 +1961,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         agent,
         title: `Модель для ${agent === "claude" ? "Claude" : "Codex"}`,
         items: base
-          .filter((i) => i.value !== CUSTOM)
+          .filter((i) => i.value !== CUSTOM && i.value !== REFRESH)
           .map((i) => ({ label: i.label, detail: i.detail, value: i.value, current: i.value === current })),
       });
       return;
@@ -1974,6 +1979,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     if (!pick) return;
 
+    if (pick.value === REFRESH) {
+      // Сброс кэша: следующий ход Claude перезапросит модели у CLI.
+      await this.context.globalState.update(CLAUDE_MODELS_KEY, undefined);
+      await this.context.globalState.update(CLAUDE_MODELS_AT_KEY, 0);
+      const cli = this.resolveClaudeCli();
+      this.post({
+        type: "info",
+        text:
+          "Список моделей обновится при следующем ходе Claude " +
+          (cli ? `(CLI: ${cli}).` : "(Claude Code, встроенный в плагин; чтобы брать модели из установленного claude — настройка agentHub.claude.cliPath = auto)."),
+      });
+      return;
+    }
     let value = pick.value;
     if (value === CUSTOM) {
       const input = await vscode.window.showInputBox({
@@ -2047,12 +2065,58 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await this.postSettings();
   }
 
+  /** Кэш моделей Claude устарел (или пуст) — пора перезапросить у CLI. */
+  private claudeModelsStale(): boolean {
+    const at = this.context.globalState.get<number>(CLAUDE_MODELS_AT_KEY, 0);
+    return Date.now() - at > CLAUDE_MODELS_TTL_MS;
+  }
+
+  /**
+   * Какой claude запускать: пусто — встроенный в SDK плагина; «auto» — тот,
+   * что установлен в системе (PATH и типовые места); иначе — заданный путь.
+   */
+  private resolveClaudeCli(): string | undefined {
+    const setting = vscode.workspace
+      .getConfiguration("agentHub.claude")
+      .get<string>("cliPath", "")
+      .trim();
+    if (!setting) return undefined;
+    const exists = (p: string) => {
+      try {
+        return fs.statSync(p).isFile();
+      } catch {
+        return false;
+      }
+    };
+    if (setting !== "auto") {
+      const p = setting.replace(/^~(?=\/|$)/, os.homedir());
+      return exists(p) ? p : undefined;
+    }
+    const names = process.platform === "win32" ? ["claude.exe", "claude.cmd", "claude"] : ["claude"];
+    const dirs = [
+      ...(process.env.PATH ?? "").split(nodePath.delimiter),
+      nodePath.join(os.homedir(), ".local", "bin"),
+      nodePath.join(os.homedir(), ".claude", "local"),
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+    ];
+    for (const d of dirs) {
+      if (!d) continue;
+      for (const n of names) {
+        const p = nodePath.join(d, n);
+        if (exists(p)) return p;
+      }
+    }
+    return undefined;
+  }
+
   /** Модели Claude: кэш supportedModels CLI; до первого хода — статический список. */
   private listClaudeModels(): ClaudeModelInfo[] {
     const cached = this.context.globalState.get<ClaudeModelInfo[]>(CLAUDE_MODELS_KEY, []);
     if (cached.length > 0) return cached;
     return [
       { value: "claude-fable-5-1", description: "новейшая, максимальные способности" },
+      { value: "claude-opus-5-5", description: "новый Opus" },
       { value: "claude-fable-5", description: "максимальные способности" },
       { value: "claude-opus-5", description: "топ для агентной работы" },
       { value: "claude-opus-4-8" },
@@ -3204,6 +3268,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         cwd,
         resumeSessionId: sessions[agent] ?? undefined,
         signal: controller.signal,
+        refreshModels: agent === "claude" && this.claudeModelsStale(),
+        cliPath: agent === "claude" ? this.resolveClaudeCli() : undefined,
         extraEnv: {
           ...secretEnv,
           ...(serverPassword
@@ -3242,6 +3308,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           case "models":
             // Актуальные модели CLI (+ effort-уровни) — в кэш для пикеров.
             await this.context.globalState.update(CLAUDE_MODELS_KEY, ev.models);
+            await this.context.globalState.update(CLAUDE_MODELS_AT_KEY, Date.now());
             break;
           case "question": {
             // Codex спросил через request_user_input, но в exec-режиме ответа не
