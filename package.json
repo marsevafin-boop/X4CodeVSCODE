@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.48",
+  "version": "0.0.49",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -102,6 +102,23 @@
         {
           "command": "agentHub.remoteAccess",
           "when": "view == agentHub.chat",
+          "group": "navigation@3"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "agentHub.newSession",
+          "when": "activeWebviewPanelId == 'agentHub.chatPanel'",
+          "group": "navigation@1"
+        },
+        {
+          "command": "agentHub.manageProjects",
+          "when": "activeWebviewPanelId == 'agentHub.chatPanel'",
+          "group": "navigation@2"
+        },
+        {
+          "command": "agentHub.remoteAccess",
+          "when": "activeWebviewPanelId == 'agentHub.chatPanel'",
           "group": "navigation@3"
         }
       ]

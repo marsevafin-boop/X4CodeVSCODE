@@ -22,6 +22,9 @@ declare function acquireVsCodeApi(): { postMessage(msg: WebviewToHost): void };
 const vscode = acquireVsCodeApi();
 /** Мобильный клиент (страница из remoteServer): без нативных диалогов VS Code. */
 const REMOTE = Boolean((window as unknown as { __AGENT_HUB_REMOTE__?: boolean }).__AGENT_HUB_REMOTE__);
+/** Где открыт чат в VS Code: боковая панель (view) или вкладка редактора (panel). */
+const IN_PANEL =
+  (window as unknown as { __AGENT_HUB_SURFACE__?: string }).__AGENT_HUB_SURFACE__ === "panel";
 
 type ChatItem =
   | {
@@ -1445,10 +1448,14 @@ export function App() {
         <button
           className="finish-btn"
           hidden={REMOTE}
-          title="Во всю ширину: открыть чат вкладкой редактора (сайдбар спрячется)"
+          title={
+            IN_PANEL
+              ? "Свернуть: вернуть чат в боковую панель"
+              : "Во всю ширину: открыть чат вкладкой редактора (сайдбар спрячется)"
+          }
           onClick={() => vscode.postMessage({ type: "openFullView" })}
         >
-          ⛶
+          {IN_PANEL ? "⇲" : "⛶"}
         </button>
         <span className="session" title={sessionId ?? ""}>
           {sessionId ? `сессия ${sessionId.slice(0, 8)}…` : "новая сессия"}

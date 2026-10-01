@@ -299,8 +299,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "dist")],
     };
-    view.webview.html = this.renderHtml(view.webview);
-    view.webview.onDidReceiveMessage((msg: WebviewToHost) => this.onMessage(msg));
+    view.webview.html = this.renderHtml(view.webview, "view");
+    view.webview.onDidReceiveMessage((msg: WebviewToHost) =>
+      this.onMessage(msg, "vscode", undefined, "view"),
+    );
   }
 
   // ---------- Проекты ----------
@@ -2577,10 +2579,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     else this.view?.show?.(true);
   }
 
-  /** «Во всю ширину»: чат вкладкой редактора + прячем сайдбар. */
-  async openFullView() {
+  /**
+   * Переключатель «во всю ширину»: из боковой панели — открыть чат вкладкой
+   * редактора и спрятать сайдбар; из вкладки (или повторный вызов командой) —
+   * закрыть вкладку и вернуть чат в боковую панель, как было.
+   */
+  async openFullView(from?: "view" | "panel") {
+    if (this.panel && from !== "view") {
+      this.panel.dispose(); // onDidDispose обнулит this.panel
+      await vscode.commands.executeCommand("agentHub.chat.focus");
+      return;
+    }
     if (this.panel) {
       this.panel.reveal();
+      await vscode.commands.executeCommand("workbench.action.closeSidebar");
       return;
     }
     const panel = vscode.window.createWebviewPanel(
@@ -2594,8 +2606,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     );
     panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, "media", "icon.svg");
-    panel.webview.html = this.renderHtml(panel.webview);
-    panel.webview.onDidReceiveMessage((msg: WebviewToHost) => this.onMessage(msg));
+    panel.webview.html = this.renderHtml(panel.webview, "panel");
+    panel.webview.onDidReceiveMessage((msg: WebviewToHost) =>
+      this.onMessage(msg, "vscode", undefined, "panel"),
+    );
     panel.onDidDispose(() => {
       this.panel = null;
     });
@@ -2610,6 +2624,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     msg: WebviewToHost,
     source: "vscode" | "remote" = "vscode",
     client?: RemoteClient,
+    /** Поверхность VS Code, приславшая сообщение: боковая панель или вкладка. */
+    surface?: "view" | "panel",
   ) {
     // Мобильный клиент: действия с нативными диалогами VS Code недоступны,
     // а пикеры модели/effort/сессий заменяются меню в самом webview.
@@ -2761,7 +2777,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.showSessions();
         break;
       case "openFullView":
-        await this.openFullView();
+        await this.openFullView(surface);
         break;
       case "getSettings":
         await this.postSettings();
@@ -3641,7 +3657,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.runs.clear();
   }
 
-  private renderHtml(webview: vscode.Webview): string {
+  private renderHtml(webview: vscode.Webview, surface: "view" | "panel"): string {
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, "dist", "webview.js"),
     );
@@ -3662,6 +3678,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
   <div id="root"></div>
+  <script nonce="${nonce}">window.__AGENT_HUB_SURFACE__ = "${surface}";</script>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
