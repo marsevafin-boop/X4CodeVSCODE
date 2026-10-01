@@ -11,14 +11,15 @@ import type {
   SlashCommandInfo,
   WebviewToHost,
 } from "./shared/protocol";
-import type { AgentBackend } from "./agents/types";
+import type { AgentBackend, SteerChannel } from "./agents/types";
 import { ClaudeBackend } from "./agents/claudeBackend";
 import { CodexBackend, codexDefaultModel, killAllCodex } from "./agents/codexBackend";
+import { CodexAppServerBackend } from "./agents/codexAppServerBackend";
 import { buildFinishPrompt, readJournalContext } from "./journal";
 import * as QRCode from "qrcode";
 import {
   RemoteServer,
-  enableTailscaleServe,
+  enableTailscaleFunnel,
   generateToken,
   lanAddresses,
   tailscaleInfo,
@@ -244,8 +245,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private panel: vscode.WebviewPanel | null = null;
   private readonly backends: Record<AgentId, AgentBackend> = {
     claude: new ClaudeBackend(),
-    codex: new CodexBackend(),
+    // app-server: корректировка на лету, стриминг, синхронные вопросы.
+    codex: new CodexAppServerBackend(),
   };
+  /** Запасной транспорт Codex (настройка agentHub.codex.transport = exec). */
+  private readonly codexExec = new CodexBackend();
+  /** Каналы докидывания сообщений в идущие ходы — по проектам. */
+  private steers = new Map<string, SteerChannel>();
+  /** Тексты, докинутые в текущий ход, — для общего лога беседы. */
+  private steerTexts = new Map<string, string[]>();
   /** Запущенные ходы по проектам: путь → контроллер. Разные проекты — параллельно. */
   private runs = new Map<string, AbortController>();
   /** Отложенные ходы: ответ на вопрос Codex уходит после текущего хода. */
@@ -2665,6 +2673,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "send":
         await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], msg.path, true);
         break;
+      case "steer": {
+        const target = msg.path ?? this.getActiveProject()?.path;
+        const channel = target ? this.steers.get(target) : undefined;
+        if (!target || !this.runs.has(target) || !channel?.handler) {
+          // Ход уже закончился или агент не принимает сообщения на лету — обычная отправка.
+          await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], msg.path, true);
+          break;
+        }
+        const files = await this.relocateAttachments(target, msg.attachments ?? []);
+        const text = files.length > 0 ? `${buildAttachmentsBlock(files)}\n\n${msg.text}` : msg.text;
+        this.postScoped(target, {
+          type: "userMessage",
+          text: msg.text,
+          attachments: files.length > 0 ? files.map((a) => a.name) : undefined,
+        });
+        try {
+          await channel.handler(text, msg.mode);
+          const list = this.steerTexts.get(target) ?? [];
+          list.push(text);
+          this.steerTexts.set(target, list);
+          this.postScoped(target, {
+            type: "info",
+            text:
+              msg.mode === "now"
+                ? "⚡ Сообщение отправлено агенту немедленно — текущий шаг прерывается."
+                : "↪ Сообщение докинуто в идущий ход — агент учтёт его на ближайшем шаге.",
+          });
+        } catch (err) {
+          this.postScoped(target, {
+            type: "info",
+            text: `Докинуть в идущий ход не удалось (${err instanceof Error ? err.message : err}) — сообщение уйдёт после завершения хода.`,
+          });
+          this.deferTurn(target, msg.agent, msg.text);
+        }
+        break;
+      }
       case "pickAttachment": {
         const picked = await vscode.window.showOpenDialog({
           canSelectFiles: true,
@@ -2934,6 +2978,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const ts = await tailscaleInfo(port);
 
     const links: { title: string; url: string; note: string }[] = [];
+    if (ts?.funnel && ts.dnsName) {
+      links.push({
+        title: "Интернет — из любой сети (Tailscale Funnel)",
+        url: `https://${ts.dnsName}/t/${token}/`,
+        note: "Телефону не нужен ни VPN, ни общая Wi-Fi. Адрес публичный — защищён только токеном, не публикуйте ссылку.",
+      });
+    }
     if (ts?.serveHttps && ts.dnsName) {
       links.push({
         title: "Tailscale HTTPS (рекомендуется)",
@@ -2990,14 +3041,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       `.warn{border-left:3px solid #cca700;padding:6px 10px;margin:10px 0}</style></head><body>` +
       `<h1>📱 Мобильный доступ</h1>` +
       `<div class="warn">Ссылка содержит секретный токен — по ней агенты выполняют команды на этом компьютере. Не публикуйте её. VS Code должен быть открыт.</div>` +
-      `<p>Порт ${port}${ts ? " · Tailscale " + escapeHtml(ts.ip ?? "") : " · Tailscale не запущен"}` +
+      `<p>Порт ${port}${ts?.state === "Running" ? " · Tailscale " + escapeHtml(ts.ip ?? "") : " · Tailscale выключен"}` +
+      `${ts?.funnel ? " · доступ из интернета включён" : ""}` +
       `${this.remote.clientCount ? ` · подключено клиентов: ${this.remote.clientCount}` : ""}</p>` +
       cards.join("") +
       `<p class="note">Android-приложение Agent Hub: отсканируйте QR «Приложение Android» камерой — ссылка agenthub:// откроет его. В Chrome ссылку можно добавить на главный экран.</p>` +
       `</body></html>`;
 
     const buttons = [
-      ...(ts && !ts.serveHttps ? ["Включить HTTPS через Tailscale Serve"] : []),
+      ...(!ts?.funnel ? ["Доступ из любой сети"] : []),
       "Сбросить токен",
       "Выключить",
     ];
@@ -3005,14 +3057,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       "Agent Hub: мобильный доступ включён — ссылки и QR открыты рядом.",
       ...buttons,
     );
-    if (choice === "Включить HTTPS через Tailscale Serve") {
-      const r = await enableTailscaleServe(port);
-      if (r.ok) {
+    if (choice === "Доступ из любой сети") {
+      const r = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: "Agent Hub: включаю Tailscale Funnel…" },
+        () => enableTailscaleFunnel(port),
+      );
+      if (r.url) {
+        // Нужен шаг в браузере: вход в Tailscale или разрешение Funnel для сети.
+        void vscode.env.openExternal(vscode.Uri.parse(r.url));
         void vscode.window.showInformationMessage(
-          "Tailscale Serve включён — откройте команду ещё раз, появится HTTPS-ссылка.",
+          `${r.message} Открыл страницу Tailscale в браузере — подтвердите там и запустите «Мобильный доступ» ещё раз.`,
         );
+      } else if (r.ok) {
+        panel.dispose();
+        void vscode.window.showInformationMessage(
+          "Доступ из любой сети включён — ссылка «Интернет» в обновлённой панели.",
+        );
+        void this.showRemoteAccess();
       } else {
-        void vscode.window.showErrorMessage(`Tailscale Serve: ${r.message || "не удалось включить"}`);
+        void vscode.window.showErrorMessage(`Tailscale Funnel: ${r.message || "не удалось включить"}`);
       }
     } else if (choice === "Сбросить токен") {
       await this.context.secrets.delete(REMOTE_TOKEN_KEY);
@@ -3264,10 +3327,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     try {
-      const events = this.backends[agent].start(fullPrompt, {
+      const backend =
+        agent === "codex" &&
+        vscode.workspace.getConfiguration("agentHub.codex").get<string>("transport", "appServer") ===
+          "exec"
+          ? this.codexExec
+          : this.backends[agent];
+      const steer: SteerChannel = {};
+      this.steers.set(cwd, steer);
+      const events = backend.start(fullPrompt, {
         cwd,
         resumeSessionId: sessions[agent] ?? undefined,
         signal: controller.signal,
+        steer,
         refreshModels: agent === "claude" && this.claudeModelsStale(),
         cliPath: agent === "claude" ? this.resolveClaudeCli() : undefined,
         extraEnv: {
@@ -3404,6 +3476,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     } finally {
       this.runs.delete(cwd);
+      this.steers.delete(cwd);
+      const steered = this.steerTexts.get(cwd) ?? [];
+      this.steerTexts.delete(cwd);
       // Общий лог беседы — зеркало видимой ленты: из него другой агент получит
       // контекст. Отметку «видел до сих пор» двигаем, только если промпт реально
       // дошёл до агента; свои же сообщения агенту не пересылаются (фильтр выше).
@@ -3413,6 +3488,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await mutateTurnRecord((r) => {
         const log = (r.chatLog ??= []);
         if (echoUser) log.push({ agent, role: "user", text: clipLog(logUserText) });
+        for (const t of steered) log.push({ agent, role: "user", text: clipLog(t) });
         if (answer) log.push({ agent, role: "assistant", text: clipLog(answer) });
         const seen: Partial<Record<AgentId, number>> = { ...(r.chatSeen ?? {}) };
         if (delivered && !isSlashCommand) seen[agent] = log.length;

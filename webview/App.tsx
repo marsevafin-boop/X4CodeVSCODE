@@ -172,6 +172,22 @@ export function App() {
   const [draft, setDraft] = useState("");
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  /** Что делать с сообщением, отправленным во время хода: сразу / на шаге / после. */
+  const [sendMode, setSendMode] = useState<"now" | "next" | "later">(() => {
+    try {
+      const v = localStorage.getItem("agentHub.sendMode");
+      return v === "now" || v === "later" ? v : "next";
+    } catch {
+      return "next";
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("agentHub.sendMode", sendMode);
+    } catch {
+      // не запомнится — не страшно
+    }
+  }, [sendMode]);
   /** Ручная высота поля ввода (px); null — автоподстройка под текст. */
   const [composerHeight, setComposerHeight] = useState<number | null>(() => {
     try {
@@ -734,8 +750,13 @@ export function App() {
     const path = activePath;
     setDraft("");
     setPendingBy((prev) => ({ ...prev, [path]: [] }));
+    if (busyBy[path] && sendMode !== "later") {
+      // Корректировка на лету: сообщение уходит в идущий ход.
+      vscode.postMessage({ type: "steer", text: finalText, mode: sendMode, agent, attachments, path });
+      return;
+    }
     if (busyBy[path]) {
-      // Этот проект занят — в его очередь; уйдёт сам после ответа.
+      // Режим «после хода»: в очередь проекта; уйдёт сам после ответа.
       setQueueBy((prev) => ({
         ...prev,
         [path]: [...(prev[path] ?? []), { text: finalText, attachments, agent }],
@@ -1721,6 +1742,26 @@ export function App() {
                 {q.text.length > 60 ? "…" : ""}
                 <button
                   className="attach-remove"
+                  title="Скорректировать: докинуть это сообщение в идущий ход сейчас"
+                  onClick={() => {
+                    setQueueBy((prev) => ({
+                      ...prev,
+                      [activePath]: (prev[activePath] ?? []).filter((_, j) => j !== i),
+                    }));
+                    vscode.postMessage({
+                      type: "steer",
+                      text: q.text,
+                      mode: "next",
+                      agent: q.agent,
+                      attachments: q.attachments,
+                      path: activePath,
+                    });
+                  }}
+                >
+                  ↪
+                </button>
+                <button
+                  className="attach-remove"
                   title="Убрать из очереди"
                   onClick={() =>
                     setQueueBy((prev) => ({
@@ -1866,16 +1907,42 @@ export function App() {
             >
               {composerExpanded ? "⤡" : "⤢"}
             </button>
+            <div className="mode-seg" role="radiogroup" aria-label="Режим отправки во время хода">
+              {(
+                [
+                  ["now", "⚡ сразу", "Сразу: прервать текущий шаг агента и учесть сообщение немедленно"],
+                  ["next", "↪ на шаге", "На ближайшем шаге: агент учтёт сообщение между шагами, не прерываясь"],
+                  ["later", "⏳ после", "После хода: сообщение встанет в очередь и уйдёт, когда агент закончит"],
+                ] as const
+              ).map(([value, label, hint]) => (
+                <button
+                  key={value}
+                  role="radio"
+                  aria-checked={sendMode === value}
+                  className={`mode-seg-btn${sendMode === value ? " active" : ""}`}
+                  title={`Сообщение во время работы агента — ${hint}`}
+                  onClick={() => setSendMode(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
           {busy ? (
             <>
               <button
                 className="send"
-                title="Сообщение отправится автоматически после ответа агента"
+                title={
+                  sendMode === "now"
+                    ? "Отправить немедленно: агент прервёт текущий шаг и учтёт сообщение"
+                    : sendMode === "next"
+                      ? "Докинуть в идущий ход: агент учтёт сообщение на ближайшем шаге"
+                      : "Сообщение отправится автоматически после ответа агента"
+                }
                 onClick={send}
                 disabled={!draft.trim() && pending.length === 0}
               >
-                ⏳ В очередь
+                {sendMode === "now" ? "⚡ Сразу" : sendMode === "next" ? "↪ Докинуть" : "⏳ В очередь"}
               </button>
               <button
                 className="stop"

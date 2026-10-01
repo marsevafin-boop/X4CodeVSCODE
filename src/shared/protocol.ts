@@ -50,6 +50,16 @@ export type WebviewToHost =
        *  фонового проекта, чтобы не стрелять в активный. */
       path?: string;
     }
+  | {
+      /** Докинуть сообщение в идущий ход (корректировка на лету). */
+      type: "steer";
+      text: string;
+      /** now — немедленно, прервав шаг; next — на ближайшей границе шага. */
+      mode: "now" | "next";
+      agent: AgentId;
+      attachments?: Attachment[];
+      path?: string;
+    }
   | { type: "pickAttachment"; path?: string }
   | {
       /** path — проект ленты, в чью папку сохранить (не «активный» хоста). */

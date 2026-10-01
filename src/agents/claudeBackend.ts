@@ -6,9 +6,45 @@ function inferClaudeWindow(model: string): number {
   return /haiku|claude-3/i.test(model) ? 200_000 : 1_000_000;
 }
 
-/** Канонизация id модели для сравнения (без датированного суффикса). */
-function canonicalModel(m: string): string {
-  return m.replace(/-\d{8}$/, "");
+/** Очередь входящих сообщений для потокового ввода SDK (push во время хода). */
+class InputQueue<T> implements AsyncIterable<T> {
+  private items: T[] = [];
+  private waiters: ((r: IteratorResult<T>) => void)[] = [];
+  private closed = false;
+
+  push(value: T) {
+    if (this.closed) return;
+    const w = this.waiters.shift();
+    if (w) w({ value, done: false });
+    else this.items.push(value);
+  }
+
+  close() {
+    this.closed = true;
+    for (const w of this.waiters) w({ value: undefined as never, done: true });
+    this.waiters = [];
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    return {
+      next: () =>
+        this.items.length > 0
+          ? Promise.resolve({ value: this.items.shift() as T, done: false })
+          : this.closed
+            ? Promise.resolve({ value: undefined as never, done: true })
+            : new Promise((resolve) => this.waiters.push(resolve)),
+    };
+  }
+}
+
+/** Сообщение пользователя в формате потокового ввода SDK. */
+function userMessage(text: string, priority?: "now" | "next" | "later") {
+  return {
+    type: "user" as const,
+    message: { role: "user" as const, content: text },
+    parent_tool_use_id: null,
+    ...(priority ? { priority } : {}),
+  };
 }
 
 /**
@@ -65,16 +101,61 @@ export class ClaudeBackend implements AgentBackend {
       options.allowDangerouslySkipPermissions = true;
     }
 
+    /** Модель сессии, как её объявляет сам CLI (init и события смены). */
+    let currentModel = cfg.model ?? "";
+    /** События из колбэков SDK (хуки) — выдаются в основном цикле. */
+    const pendingEvents: AgentEvent[] = [];
+    let lastSwitchKey = "";
+
+    // Смена модели — ТОЛЬКО по явному сигналу CLI, без сравнения названий:
+    // хук PostModelSwitch сообщает from/to и причину (auto = автофоллбэк).
+    options.hooks = {
+      PostModelSwitch: [
+        {
+          hooks: [
+            async (input: unknown) => {
+              const i = input as { from_model?: string; to_model?: string; source?: string };
+              if (i.to_model) {
+                const key = `${i.from_model ?? ""}>${i.to_model}`;
+                currentModel = i.to_model;
+                if (key !== lastSwitchKey) {
+                  lastSwitchKey = key;
+                  if (i.source === "auto" && i.from_model) {
+                    pendingEvents.push({ kind: "model", model: i.to_model, fallbackFrom: i.from_model });
+                    pendingEvents.push({
+                      kind: "notice",
+                      text: `⚠️ CLI автоматически сменил модель: ${i.from_model} → ${i.to_model}.`,
+                    });
+                  } else {
+                    pendingEvents.push({ kind: "model", model: i.to_model });
+                  }
+                }
+              }
+              return {};
+            },
+          ],
+        },
+      ],
+    };
+
+    // Потоковый ввод: первое сообщение — промпт; пока ход идёт, хост может
+    // докинуть сообщения (корректировка на лету) с приоритетом now/next.
+    const input = new InputQueue<ReturnType<typeof userMessage>>();
+    input.push(userMessage(prompt));
+    let lastSteerAt = 0;
+    let initCount = 0;
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
+    if (opts.steer) {
+      opts.steer.handler = async (text, mode) => {
+        lastSteerAt = Date.now();
+        input.push(userMessage(text, mode));
+      };
+    }
+
     const stream = query({
-      prompt,
+      prompt: input as unknown as Parameters<typeof query>[0]["prompt"],
       options: options as Parameters<typeof query>[0]["options"],
     });
-
-    let currentModel = cfg.model ?? "";
-    /** Модель сессии из init — то, что «должно» работать. */
-    let sessionModel = "";
-    /** Фактически обслуживающая модель (меняется при серверном фоллбэке). */
-    let servingModel = "";
     /**
      * Занятость контекста = размер промпта ПОСЛЕДНЕГО запроса + его выход
      * (in + cache_read + cache_write + out одного API-вызова). Суммировать
@@ -90,7 +171,14 @@ export class ClaudeBackend implements AgentBackend {
           ? knownWindow
           : inferClaudeWindow(currentModel);
 
+    try {
     for await (const msg of stream) {
+      while (pendingEvents.length > 0) yield pendingEvents.shift() as AgentEvent;
+      // После result CLI начал новый ход по докинутому сообщению — ввод не закрываем.
+      if (closeTimer && (msg.type === "assistant" || msg.type === "stream_event")) {
+        clearTimeout(closeTimer);
+        closeTimer = undefined;
+      }
       switch (msg.type) {
         case "system":
           if (msg.subtype === "init") {
@@ -98,14 +186,14 @@ export class ClaudeBackend implements AgentBackend {
             const model = (msg as unknown as { model?: string }).model;
             if (model) {
               currentModel = model;
-              sessionModel = model;
-              servingModel = model;
               yield { kind: "model", model };
             }
             // Пока CLI жив — точный замер: окно модели + базовая занятость
             // (системный промпт, инструменты, память) ещё до первого шага.
             // Только на первом ходе сессии (~1.3 с): на resume окно уже известно.
-            const fresh = !opts.resumeSessionId;
+            // Тяжёлые запросы — только на первом init свежей сессии: после
+            // прерывания (режим «сразу») CLI присылает init повторно.
+            const fresh = !opts.resumeSessionId && initCount++ === 0;
             if (fresh) try {
               const ctx = (await Promise.race([
                 stream.getContextUsage(),
@@ -194,6 +282,33 @@ export class ClaudeBackend implements AgentBackend {
               text: `Контекст сжат (compaction)${meta?.pre_tokens ? `: было ~${meta.pre_tokens.toLocaleString("ru-RU")} токенов` : ""}.`,
             };
             yield { kind: "activity", label: "Контекст сжат, продолжает…" };
+          } else if ((msg as { subtype?: string }).subtype === "model_refusal_fallback") {
+            // Явный фоллбэк от CLI: модели — из самого события.
+            const f = msg as unknown as {
+              direction?: string;
+              scope?: string;
+              original_model?: string;
+              fallback_model?: string;
+            };
+            if (f.scope !== "local" && f.original_model && f.fallback_model) {
+              if (f.direction === "revert") {
+                currentModel = f.original_model;
+                lastSwitchKey = `${f.fallback_model}>${f.original_model}`;
+                yield { kind: "model", model: f.original_model };
+                yield { kind: "notice", text: `Модель восстановлена: ${f.original_model}.` };
+              } else {
+                currentModel = f.fallback_model;
+                lastSwitchKey = `${f.original_model}>${f.fallback_model}`;
+                yield { kind: "model", model: f.fallback_model, fallbackFrom: f.original_model };
+                yield {
+                  kind: "notice",
+                  text: `⚠️ Сработал фоллбэк: ${f.original_model} → ${f.fallback_model} (модель отказалась отвечать).`,
+                };
+              }
+            }
+          } else if ((msg as { subtype?: string }).subtype === "model_refusal_no_fallback") {
+            const f = msg as unknown as { content?: string };
+            if (f.content) yield { kind: "notice", text: `⚠️ ${f.content}` };
           }
           break;
 
@@ -232,24 +347,6 @@ export class ClaudeBackend implements AgentBackend {
           const parentId = (msg as unknown as { parent_tool_use_id?: string | null })
             .parent_tool_use_id;
           if (!parentId) {
-            // Автодетект фоллбэка: message.model — модель, реально обслужившая
-            // ЭТОТ ответ. При серверном фоллбэке (opus5/fable5 → запасная) она
-            // отличается от модели сессии из init.
-            const actual = (msg.message as unknown as { model?: string }).model;
-            if (actual && sessionModel && canonicalModel(actual) !== canonicalModel(servingModel)) {
-              const downgraded = canonicalModel(actual) !== canonicalModel(sessionModel);
-              servingModel = actual;
-              if (downgraded) {
-                yield { kind: "model", model: actual, fallbackFrom: sessionModel };
-                yield {
-                  kind: "notice",
-                  text: `⚠️ Сработал фоллбэк: ответ обслуживает ${actual} вместо ${sessionModel}.`,
-                };
-              } else {
-                yield { kind: "model", model: actual };
-                yield { kind: "notice", text: `Модель восстановлена: ${actual}.` };
-              }
-            }
             const u = (msg.message as unknown as { usage?: Record<string, number> }).usage;
             if (u) {
               const used =
@@ -278,6 +375,13 @@ export class ClaudeBackend implements AgentBackend {
         }
 
         case "result": {
+          // Ход закрыт. Если прямо перед этим докинули сообщение, CLI может
+          // начать по нему новый ход — даём 3 с, иначе закрываем ввод сразу.
+          if (Date.now() - lastSteerAt < 5000) {
+            closeTimer = setTimeout(() => input.close(), 3000);
+          } else {
+            input.close();
+          }
           yield {
             kind: "result",
             ok: msg.subtype === "success",
@@ -309,6 +413,11 @@ export class ClaudeBackend implements AgentBackend {
           break;
         }
       }
+    }
+    } finally {
+      if (closeTimer) clearTimeout(closeTimer);
+      input.close();
+      if (opts.steer) opts.steer.handler = undefined;
     }
   }
 }

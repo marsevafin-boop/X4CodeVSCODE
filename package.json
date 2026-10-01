@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.47",
+  "version": "0.0.48",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -257,6 +257,19 @@
           "type": "number",
           "default": 0,
           "description": "Окно контекста Codex в токенах для индикатора. 0 — автоматически (400k)."
+        },
+        "agentHub.codex.transport": {
+          "type": "string",
+          "enum": [
+            "appServer",
+            "exec"
+          ],
+          "enumDescriptions": [
+            "codex app-server: корректировка на лету, стриминг ответа, вопросы с ожиданием ответа (рекомендуется)",
+            "codex exec: прежний одноразовый режим без корректировки на лету"
+          ],
+          "default": "appServer",
+          "description": "Как запускать Codex."
         },
         "agentHub.autoCommit": {
           "type": "boolean",

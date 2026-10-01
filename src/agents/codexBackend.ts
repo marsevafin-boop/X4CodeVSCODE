@@ -29,7 +29,7 @@ function killGroup(child: ChildProcess, signal: NodeJS.Signals) {
 }
 
 /** SIGTERM, через 3 с — SIGKILL: Codex может игнорировать SIGTERM. */
-function hardKill(child: ChildProcess) {
+export function hardKill(child: ChildProcess) {
   killGroup(child, "SIGTERM");
   setTimeout(() => killGroup(child, "SIGKILL"), 3000).unref();
 }
@@ -40,7 +40,27 @@ export function killAllCodex() {
   liveByThread.clear();
 }
 
-const WRITER_CONFLICT_RE = /already has an active writer|thread-store conflict/i;
+/** Реестр живых процессов по треду — общий для exec- и app-server-бэкендов. */
+export function trackCodex(key: string, child: ChildProcess) {
+  liveByThread.set(key, child);
+}
+
+export function untrackCodex(key: string, child: ChildProcess) {
+  if (liveByThread.get(key) === child) liveByThread.delete(key);
+}
+
+/** Добить свой зависший процесс этого треда перед resume; true — был и убит. */
+export function killStaleCodex(key: string): boolean {
+  const stale = liveByThread.get(key);
+  if (stale && stale.exitCode === null) {
+    killGroup(stale, "SIGKILL");
+    liveByThread.delete(key);
+    return true;
+  }
+  return false;
+}
+
+export const WRITER_CONFLICT_RE = /already has an active writer|thread-store conflict/i;
 
 /** Модель по умолчанию из ~/.codex/config.toml (когда в настройках не задана). */
 export function codexDefaultModel(): string | null {

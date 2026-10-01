@@ -1079,3 +1079,44 @@ body.resizing-composer {
   white-space: nowrap;
   user-select: none;
 }
+
+/* ---------- Режим доставки сообщения во время хода: сразу / на шаге / после ---------- */
+
+.actions-left {
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.actions .mode-seg {
+  display: inline-flex;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.actions .mode-seg .mode-seg-btn {
+  background: transparent;
+  color: var(--vscode-foreground);
+  border: none;
+  border-radius: 0;
+  padding: 4px 9px;
+  cursor: pointer;
+  opacity: 0.6;
+  font-size: 0.9em;
+  white-space: nowrap;
+}
+
+.actions .mode-seg .mode-seg-btn + .mode-seg-btn {
+  border-left: 1px solid var(--vscode-panel-border);
+}
+
+.actions .mode-seg .mode-seg-btn:hover {
+  background: var(--vscode-toolbar-hoverBackground);
+  opacity: 1;
+}
+
+.actions .mode-seg .mode-seg-btn.active {
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  opacity: 1;
+}

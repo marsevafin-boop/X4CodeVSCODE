@@ -68,6 +68,15 @@ export interface AgentRunConfig {
   contextWindow: number;
 }
 
+/**
+ * Канал корректировки на лету: бэкенд на время хода ставит handler,
+ * хост вызывает его, чтобы докинуть сообщение в идущий ход.
+ * now — немедленно (прерывает текущий шаг), next — на ближайшей границе шага.
+ */
+export interface SteerChannel {
+  handler?: (text: string, mode: "now" | "next") => Promise<void>;
+}
+
 export interface StartOptions {
   /** Рабочая папка проекта, в которой действует агент. */
   cwd: string;
@@ -85,6 +94,8 @@ export interface StartOptions {
   refreshModels?: boolean;
   /** Claude: путь к исполняемому claude вместо встроенного в SDK. */
   cliPath?: string;
+  /** Докидывание сообщений в идущий ход (если бэкенд умеет). */
+  steer?: SteerChannel;
   /**
    * Колбэк подтверждения инструмента.
    * allow=true — разрешить; allow=false + answer — пользователь ответил на

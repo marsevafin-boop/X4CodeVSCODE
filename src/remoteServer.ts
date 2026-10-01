@@ -50,8 +50,18 @@ export class RemoteServer {
   private server: http.Server | null = null;
   private wss: WebSocketServer | null = null;
   private readonly clients = new Map<WebSocket, RemoteClient>();
+  /** Моменты запросов с неверным токеном — для отсечки перебора (сервер может быть в интернете). */
+  private badHits: number[] = [];
 
   constructor(private readonly opts: RemoteServerOptions) {}
+
+  /** true — слишком много неверных токенов за минуту, отвечаем 429. */
+  private throttled(): boolean {
+    const now = Date.now();
+    this.badHits = this.badHits.filter((t) => now - t < 60_000);
+    this.badHits.push(now);
+    return this.badHits.length > 30;
+  }
 
   get clientCount(): number {
     return this.clients.size;
@@ -129,6 +139,12 @@ export class RemoteServer {
     const url = req.url ?? "/";
     const route = this.route(url);
     if (!route.ok) {
+      const probing = url !== "/" && url !== "/health";
+      if (probing && this.throttled()) {
+        res.writeHead(429, { "Content-Type": "text/plain; charset=utf-8", "Retry-After": "60" });
+        res.end("too many requests");
+        return;
+      }
       res.writeHead(url === "/" || url === "/health" ? 200 : 401, {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "no-store",
@@ -328,7 +344,10 @@ const TAILSCALE_BINS = [
   "C:\\Program Files\\Tailscale\\tailscale.exe",
 ];
 
-function runTailscale(args: string[]): Promise<{ ok: boolean; out: string; err: string }> {
+function runTailscale(
+  args: string[],
+  timeoutMs = 8000,
+): Promise<{ ok: boolean; out: string; err: string }> {
   return new Promise((resolve) => {
     let i = 0;
     const tryNext = () => {
@@ -337,7 +356,7 @@ function runTailscale(args: string[]): Promise<{ ok: boolean; out: string; err: 
         return;
       }
       const bin = TAILSCALE_BINS[i++];
-      execFile(bin, args, { timeout: 8000 }, (err, stdout, stderr) => {
+      execFile(bin, args, { timeout: timeoutMs }, (err, stdout, stderr) => {
         if (err && (err as NodeJS.ErrnoException).code === "ENOENT") {
           tryNext();
           return;
@@ -355,6 +374,10 @@ export interface TailscaleInfo {
   dnsName?: string;
   /** Tailscale Serve уже проксирует HTTPS на наш порт. */
   serveHttps?: boolean;
+  /** Tailscale Funnel: порт опубликован в интернет (доступ из любой сети). */
+  funnel?: boolean;
+  /** Состояние клиента Tailscale: Running, Stopped, NeedsLogin… */
+  state?: string;
 }
 
 export async function tailscaleInfo(port: number): Promise<TailscaleInfo | null> {
@@ -365,13 +388,17 @@ export async function tailscaleInfo(port: number): Promise<TailscaleInfo | null>
       Self?: { TailscaleIPs?: string[]; DNSName?: string };
       BackendState?: string;
     };
-    if (j.BackendState && j.BackendState !== "Running") return null;
+    const running = !j.BackendState || j.BackendState === "Running";
     const info: TailscaleInfo = {
-      ip: j.Self?.TailscaleIPs?.find((a) => a.includes(".")),
+      state: j.BackendState ?? "Running",
+      ip: running ? j.Self?.TailscaleIPs?.find((a) => a.includes(".")) : undefined,
       dnsName: j.Self?.DNSName?.replace(/\.$/, ""),
     };
+    if (!running) return info;
     const serve = await runTailscale(["serve", "status"]);
-    info.serveHttps = serve.ok && serve.out.includes(`127.0.0.1:${port}`);
+    const proxied = serve.ok && serve.out.includes(`127.0.0.1:${port}`);
+    info.funnel = proxied && /Funnel on/i.test(serve.out);
+    info.serveHttps = proxied && !info.funnel;
     return info;
   } catch {
     return null;
@@ -382,4 +409,37 @@ export async function tailscaleInfo(port: number): Promise<TailscaleInfo | null>
 export async function enableTailscaleServe(port: number): Promise<{ ok: boolean; message: string }> {
   const r = await runTailscale(["serve", "--bg", "--https=443", `http://127.0.0.1:${port}`]);
   return { ok: r.ok, message: (r.out + "\n" + r.err).trim() };
+}
+
+/**
+ * Доступ из любой сети: Tailscale Funnel публикует наш порт в интернет по
+ * HTTPS (https://<машина>.<tailnet>.ts.net) — телефону не нужен ни VPN, ни
+ * общая Wi-Fi. Если Tailscale выключен — сначала поднимаем его. Когда нужен
+ * шаг в браузере (вход или включение Funnel для tailnet), возвращаем ссылку.
+ */
+export async function enableTailscaleFunnel(
+  port: number,
+): Promise<{ ok: boolean; message: string; url?: string }> {
+  const findUrl = (text: string) => /https:\/\/login\.tailscale\.com\/\S+/.exec(text)?.[0];
+  const st = await runTailscale(["status", "--json"]);
+  let state = "";
+  try {
+    state = (JSON.parse(st.out) as { BackendState?: string }).BackendState ?? "";
+  } catch {
+    // tailscale не установлен или не отвечает — сообщим ниже
+  }
+  if (!st.ok && !state) {
+    return { ok: false, message: "Tailscale не найден. Установите его с tailscale.com и войдите в аккаунт." };
+  }
+  if (state && state !== "Running") {
+    const up = await runTailscale(["up"], 20000);
+    const url = findUrl(up.out + "\n" + up.err);
+    if (url) return { ok: false, message: "Нужно войти в Tailscale.", url };
+    if (!up.ok) return { ok: false, message: (up.out + "\n" + up.err).trim() || "tailscale up не удался" };
+  }
+  const r = await runTailscale(["funnel", "--bg", String(port)], 20000);
+  const text = (r.out + "\n" + r.err).trim();
+  const url = findUrl(text);
+  if (url) return { ok: false, message: "Нужно разрешить Funnel для вашей сети Tailscale.", url };
+  return { ok: r.ok, message: text };
 }
