@@ -3,6 +3,7 @@ src/**
 webview/**
 esbuild.mjs
 tsconfig.json
+tests/**
 .gitignore
 ai-dev-environment.md
 dist/**/*.map

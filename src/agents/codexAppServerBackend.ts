@@ -6,9 +6,10 @@ import {
   WRITER_CONFLICT_RE,
   codexDefaultModel,
   hardKill,
-  killStaleCodex,
+  stopCodex,
+  stopStaleCodex,
   trackCodex,
-  untrackCodex,
+  trackCodexProcess,
 } from "./codexBackend";
 
 type Json = Record<string, unknown>;
@@ -38,21 +39,22 @@ export class CodexAppServerBackend implements AgentBackend {
     const sandbox = cfg.yolo ? "danger-full-access" : cfg.sandbox || "workspace-write";
     const startedAt = Date.now();
 
-    if (opts.resumeSessionId && killStaleCodex(opts.resumeSessionId)) {
-      yield {
-        kind: "notice",
-        text: "⚠️ Предыдущий процесс Codex этого треда ещё висел — завершён перед новым ходом.",
-      };
-      await new Promise((r) => setTimeout(r, 1000));
+    if (opts.signal.aborted) return;
+    if (opts.resumeSessionId && !(await stopStaleCodex(opts.resumeSessionId))) {
+      yield { kind: "error", message: "Не удалось завершить предыдущий процесс Codex этого треда. Повторный запуск остановлен." };
+      yield { kind: "result", ok: false, durationMs: Date.now() - startedAt };
+      return;
     }
+    if (opts.signal.aborted) return;
 
-    const child = spawn("codex", ["app-server"], {
+    const child = spawn("codex", ["app-server", "--listen", "stdio://"], {
       cwd: opts.cwd,
       env: { ...process.env, ...(opts.extraEnv ?? {}) },
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,
     });
+    trackCodexProcess(child);
 
     // ---------- мост «колбэки → генератор» ----------
     const queue: (AgentEvent | End)[] = [];
@@ -85,6 +87,8 @@ export class CodexAppServerBackend implements AgentBackend {
 
     let threadId: string | null = opts.resumeSessionId ?? null;
     let turnId: string | null = null;
+    let turnStartPending: Promise<void> | null = null;
+    let earlyNotifications: { method: string; params: Json }[] = [];
     /** Режим «сразу»: текст, с которым стартует новый ход после прерывания. */
     let restartWith: string | null = null;
     const seenItems = new Set<string>();
@@ -106,16 +110,50 @@ export class CodexAppServerBackend implements AgentBackend {
         : []),
     ];
     const startTurn = async (text: string, withImages: boolean) => {
-      const r = await request("turn/start", {
-        threadId,
-        input: turnInput(text, withImages),
-        ...(cfg.effort ? { effort: cfg.effort } : {}),
-      });
-      turnId = ((r.turn as Json | undefined)?.id as string | undefined) ?? turnId;
+      if (opts.signal.aborted) throw new Error("ход отменён");
+      // Уведомления могут обогнать ответ turn/start. Только ответ определяет ID
+      // нашего хода: старые ходы и субагенты не должны его подменять.
+      turnId = null;
+      seenItems.clear();
+      deltaItems.clear();
+      earlyNotifications = [];
+      let ready!: () => void;
+      const starting = new Promise<void>((resolve) => { ready = resolve; });
+      turnStartPending = starting;
+      try {
+        const r = await request("turn/start", {
+          threadId,
+          input: turnInput(text, withImages),
+          ...(cfg.effort ? { effort: cfg.effort } : {}),
+        });
+        const id = (r.turn as Json | undefined)?.id;
+        if (typeof id !== "string" || !id) throw new Error("turn/start не вернул ID хода");
+        turnId = id;
+        turnStartPending = null;
+        const notifications = earlyNotifications;
+        earlyNotifications = [];
+        for (const n of notifications) handleNotification(n.method, n.params);
+      } finally {
+        if (turnStartPending === starting) {
+          turnStartPending = null;
+          earlyNotifications = [];
+        }
+        ready();
+      }
+    };
+
+    const isMainThread = (p: Json) => Boolean(threadId) && p.threadId === threadId;
+    const isActiveTurn = (id: unknown) => Boolean(turnId) && id === turnId && !finished;
+    const requireActiveRequest = (p: Json) => {
+      if (opts.signal.aborted || !isMainThread(p) || !isActiveTurn(p.turnId)) {
+        throw Object.assign(new Error("server request is outside the active Codex thread/turn"), { code: -32602 });
+      }
     };
 
     // ---------- серверные запросы (ждут ответа) ----------
     const handleServerRequest = async (method: string, p: Json): Promise<Json> => {
+      if (isMainThread(p) && turnStartPending) await turnStartPending;
+      requireActiveRequest(p);
       if (method === "item/tool/requestUserInput") {
         const answers: Record<string, { answers: string[] }> = {};
         const questions = (p.questions as Json[] | undefined) ?? [];
@@ -123,6 +161,7 @@ export class CodexAppServerBackend implements AgentBackend {
           const res = await opts.confirmTool("AskUserQuestion", {
             questions: [{ question: q.question, options: q.options ?? [] }],
           });
+          requireActiveRequest(p);
           answers[String(q.id)] = { answers: res.answer ? [res.answer] : [] };
         }
         return { answers };
@@ -132,6 +171,7 @@ export class CodexAppServerBackend implements AgentBackend {
           command: (p.command as string | null) ?? "",
           description: (p.reason as string | null) ?? undefined,
         });
+        requireActiveRequest(p);
         return { decision: res.allow ? "accept" : "decline" };
       }
       if (method === "item/fileChange/requestApproval") {
@@ -139,6 +179,7 @@ export class CodexAppServerBackend implements AgentBackend {
           file_path: (p.grantRoot as string | null) ?? "(изменение файлов)",
           description: (p.reason as string | null) ?? undefined,
         });
+        requireActiveRequest(p);
         return { decision: res.allow ? "accept" : "decline" };
       }
       if (method === "item/permissions/requestApproval") {
@@ -149,11 +190,21 @@ export class CodexAppServerBackend implements AgentBackend {
 
     // ---------- уведомления ----------
     const handleNotification = (method: string, p: Json) => {
+      if (finished || !isMainThread(p)) return;
+      if (turnStartPending) {
+        earlyNotifications.push({ method, params: p });
+        return;
+      }
+      const notificationTurn = method === "turn/started" || method === "turn/completed"
+        ? (p.turn as Json | undefined)?.id
+        : p.turnId;
+      // thread/compacted — старое уведомление без turnId, но с threadId.
+      if (method !== "thread/compacted" || p.turnId !== undefined) {
+        if (!isActiveTurn(notificationTurn)) return;
+      }
       const item = (p.item as (Json & { id?: string; type?: string }) | undefined) ?? undefined;
       switch (method) {
         case "turn/started": {
-          const t = p.turn as Json | undefined;
-          if (typeof t?.id === "string") turnId = t.id;
           emit({ kind: "activity", label: "Думает…" });
           break;
         }
@@ -176,7 +227,7 @@ export class CodexAppServerBackend implements AgentBackend {
             if (seenItems.has(key)) break;
             seenItems.add(key);
             const summary = String(
-              item.command ?? item.query ?? item.tool ?? item.path ?? item.text ?? "",
+              item.command ?? item.query ?? item.tool ?? item.path ?? item.text ?? item.agentPath ?? item.kind ?? "",
             );
             if (item.type === "commandExecution") {
               emit({ kind: "activity", label: `Выполняет: ${summary.slice(0, 60)}…` });
@@ -285,9 +336,13 @@ export class CodexAppServerBackend implements AgentBackend {
         return;
       }
       if (typeof m.method === "string" && id !== undefined) {
-        handleServerRequest(m.method, (m.params as Json) ?? {})
-          .then((result) => write({ id, result }))
-          .catch((err: Error) => write({ id, error: { code: -32601, message: err.message } }));
+        const params = (m.params as Json) ?? {};
+        handleServerRequest(m.method, params)
+          .then((result) => {
+            requireActiveRequest(params);
+            write({ id, result });
+          })
+          .catch((err: Error & { code?: number }) => write({ id, error: { code: err.code ?? -32601, message: err.message } }));
         return;
       }
       if (typeof m.method === "string") handleNotification(m.method, (m.params as Json) ?? {});
@@ -326,10 +381,12 @@ export class CodexAppServerBackend implements AgentBackend {
     try {
       // ---------- рукопожатие и запуск хода ----------
       let threadReady = false;
+      let forkRecovery = false;
       try {
         await request("initialize", {
           clientInfo: { name: "agent-hub", title: "Agent Hub", version: "1.0.0" },
         });
+        if (opts.signal.aborted) return;
         write({ method: "initialized", params: {} });
         const common: Json = {
           cwd: opts.cwd,
@@ -337,9 +394,36 @@ export class CodexAppServerBackend implements AgentBackend {
           approvalPolicy: "never",
           ...(cfg.model ? { model: cfg.model } : {}),
         };
-        const th = opts.resumeSessionId
-          ? await request("thread/resume", { threadId: opts.resumeSessionId, ...common })
-          : await request("thread/start", common);
+        let th: Json;
+        if (opts.resumeSessionId) {
+          try {
+            th = await request("thread/resume", { threadId: opts.resumeSessionId, ...common });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            if (opts.signal.aborted || !WRITER_CONFLICT_RE.test(message)) throw err;
+            // Пока turn/start не отправлен, продолжаем в копии сохранённой истории.
+            // Исходный тред и удерживающий его чужой процесс не трогаем.
+            forkRecovery = true;
+            th = await request("thread/fork", {
+              threadId: opts.resumeSessionId,
+              ...common,
+              excludeTurns: true,
+            });
+            if (opts.signal.aborted) return;
+            const forkId = (th.thread as Json | undefined)?.id;
+            if (typeof forkId !== "string" || !forkId.trim() || forkId === opts.resumeSessionId) {
+              throw new Error("thread/fork не вернул ID нового треда");
+            }
+            threadId = forkId;
+            yield {
+              kind: "notice",
+              text: "⚠️ Исходный тред Codex занят другим процессом. Продолжаю в отдельном треде с копией сохранённой истории.",
+            };
+          }
+        } else {
+          th = await request("thread/start", common);
+        }
+        if (opts.signal.aborted) return;
         threadId = String((th.thread as Json | undefined)?.id ?? threadId ?? "");
         threadReady = true;
         if (threadId) {
@@ -352,8 +436,20 @@ export class CodexAppServerBackend implements AgentBackend {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         const stderr = stderrChunks.join("");
-        hardKill(child);
+        if (!(await stopCodex(child))) {
+          yield { kind: "error", message: "Не удалось завершить процесс Codex после ошибки подключения." };
+          yield { kind: "result", ok: false, durationMs: Date.now() - startedAt };
+          return;
+        }
         if (opts.signal.aborted) return;
+        if (forkRecovery) {
+          yield {
+            kind: "error",
+            message: `Codex: не удалось продолжить в отдельном треде с сохранённой историей: ${message}`,
+          };
+          yield { kind: "result", ok: false, durationMs: Date.now() - startedAt };
+          return;
+        }
         if (opts.resumeSessionId && WRITER_CONFLICT_RE.test(message + stderr)) {
           yield {
             kind: "error",
@@ -412,11 +508,9 @@ export class CodexAppServerBackend implements AgentBackend {
       opts.signal.removeEventListener("abort", onAbort);
       if (opts.steer) opts.steer.handler = undefined;
       rl.close();
-      if (child.exitCode === null) hardKill(child);
-      if (threadId) {
-        const key = threadId;
-        if (child.exitCode !== null) untrackCodex(key, child);
-        else child.once("exit", () => untrackCodex(key, child));
+      // Не отпускаем ход, пока собственный app-server ещё удерживает writer.
+      if (!(await stopCodex(child))) {
+        throw new Error("Codex не завершился после TERM/KILL; тред пока занят предыдущим процессом.");
       }
     }
   }

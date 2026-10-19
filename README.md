@@ -75,6 +75,8 @@ Claude Max) и **GPT (Codex CLI**, аккаунт ChatGPT) — с проекта
 
 ```bash
 npm install
+npm test                 # регрессионные тесты Codex без запуска реального агента
+npm run typecheck        # проверка TypeScript
 npm run build            # esbuild: dist/extension.js + dist/webview.js
 npx vsce package --allow-missing-repository
 ```
@@ -84,6 +86,16 @@ npx vsce package --allow-missing-repository
 ## Архитектура
 
 `src/extension.ts` → `src/ChatViewProvider.ts` (протокол `src/shared/protocol.ts`,
-журнал `src/journal.ts`) → бэкенды `src/agents/{claudeBackend,codexBackend}.ts`
+журнал `src/journal.ts`) → бэкенды `src/agents/{claudeBackend,codexAppServerBackend}.ts`
 за единым интерфейсом `AgentBackend`; UI — React в `webview/`.
+Codex работает через `app-server`, с резервным запуском через `codexBackend.ts`.
+События субагентов отделены от основного хода: завершение субагента не
+останавливает основной ответ и не переводит весь чат в состояние «готово».
+Если сохранённый тред Codex открыт другим клиентом, расширение автоматически
+продолжает работу в отдельной ветке с копией его сохранённой истории. Исходный
+чат остаётся открытым; завершать ChatGPT или другие процессы Codex не требуется.
+Восстановление выполняется до отправки задачи и сохраняет текущие настройки
+модели и песочницы. Собственные процессы расширения учитываются с запуска;
+следующий ход ждёт подтверждённого завершения предыдущего процесса.
+Ветвление использует `thread/fork` из [официального протокола Codex](https://learn.chatgpt.com/docs/app-server).
 Спецификация и замысел — `ai-dev-environment.md`.

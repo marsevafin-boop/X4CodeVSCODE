@@ -11,53 +11,132 @@ import type { AgentBackend, AgentEvent, StartOptions } from "./types";
  * расширения), следующий resume падает с «already has an active writer».
  */
 const liveByThread = new Map<string, ChildProcess>();
+// До thread/start процесс уже может держать ресурсы: учитываем его со spawn.
+const liveProcesses = new Set<ChildProcess>();
+const processExitListeners = new WeakMap<ChildProcess, () => void>();
+const stopping = new WeakMap<ChildProcess, Promise<boolean>>();
+
+function hasExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode != null;
+}
 
 function killGroup(child: ChildProcess, signal: NodeJS.Signals) {
-  if (child.exitCode !== null || child.pid === undefined) return;
+  if (hasExited(child) || child.pid === undefined) return;
   try {
-    // detached → своя группа процессов; отрицательный pid бьёт всю группу
-    // (вместе с codex-code-mode-host). На Windows групп нет — обычный kill.
+    // Только собственная detached-группа, созданная нашим spawn.
     if (process.platform !== "win32") process.kill(-child.pid, signal);
     else child.kill(signal);
   } catch {
     try {
       child.kill(signal);
     } catch {
-      // уже мёртв
+      // stopCodex всё равно проверит фактическое завершение, а не факт kill.
     }
   }
 }
 
-/** SIGTERM, через 3 с — SIGKILL: Codex может игнорировать SIGTERM. */
+interface StopTimeouts {
+  termTimeoutMs?: number;
+  killTimeoutMs?: number;
+}
+
+/** Подписываемся до kill, чтобы не пропустить быстрый exit. */
+function signalAndWait(child: ChildProcess, signal: NodeJS.Signals, timeoutMs: number): Promise<boolean> {
+  if (hasExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = (exited: boolean) => {
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      child.removeListener("close", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(hasExited(child)), timeoutMs);
+    child.once("exit", onExit);
+    child.once("close", onExit);
+    killGroup(child, signal);
+    if (hasExited(child)) finish(true);
+  });
+}
+
+/** TERM → ограниченное ожидание → KILL → ожидание настоящего exit. */
+export function stopCodex(child: ChildProcess, timeouts: StopTimeouts = {}): Promise<boolean> {
+  const pending = stopping.get(child);
+  if (pending) return pending;
+  const stopped = (async () => {
+    const exited = await signalAndWait(child, "SIGTERM", timeouts.termTimeoutMs ?? 3000) ||
+      await signalAndWait(child, "SIGKILL", timeouts.killTimeoutMs ?? 1000);
+    if (exited) untrackCodexProcess(child);
+    return exited;
+  })();
+  stopping.set(child, stopped);
+  void stopped.finally(() => {
+    if (stopping.get(child) === stopped) stopping.delete(child);
+  });
+  return stopped;
+}
+
+/** Совместимый callback для abort: завершение проверяет общий stopCodex. */
 export function hardKill(child: ChildProcess) {
-  killGroup(child, "SIGTERM");
-  setTimeout(() => killGroup(child, "SIGKILL"), 3000).unref();
+  void stopCodex(child);
 }
 
-/** При выгрузке расширения — добить всех детей, иначе они переживут хост. */
+/** При выгрузке расширения добиваем только созданные нами процессы. */
 export function killAllCodex() {
-  for (const child of liveByThread.values()) killGroup(child, "SIGKILL");
-  liveByThread.clear();
+  for (const child of liveProcesses) killGroup(child, "SIGKILL");
 }
 
-/** Реестр живых процессов по треду — общий для exec- и app-server-бэкендов. */
+/** Учитываем процесс сразу после spawn, до получения id треда. */
+export function trackCodexProcess(child: ChildProcess) {
+  if (hasExited(child) || liveProcesses.has(child)) return;
+  liveProcesses.add(child);
+  const onExit = () => untrackCodexProcess(child);
+  processExitListeners.set(child, onExit);
+  child.once("exit", onExit);
+  child.once("close", onExit);
+}
+
+/** Вызывать только после подтверждённого exit/close. */
+export function untrackCodexProcess(child: ChildProcess) {
+  liveProcesses.delete(child);
+  const listener = processExitListeners.get(child);
+  if (listener) {
+    child.removeListener("exit", listener);
+    child.removeListener("close", listener);
+    processExitListeners.delete(child);
+  }
+  for (const [key, owner] of liveByThread) {
+    if (owner === child) liveByThread.delete(key);
+  }
+}
+
+/** Реестр собственных процессов по треду, общий для обоих бэкендов. */
 export function trackCodex(key: string, child: ChildProcess) {
-  liveByThread.set(key, child);
+  trackCodexProcess(child);
+  if (!hasExited(child)) liveByThread.set(key, child);
 }
 
 export function untrackCodex(key: string, child: ChildProcess) {
   if (liveByThread.get(key) === child) liveByThread.delete(key);
 }
 
-/** Добить свой зависший процесс этого треда перед resume; true — был и убит. */
+/** true: своего writer больше нет; false: завершение не подтверждено. */
+export async function stopStaleCodex(key: string, timeouts?: StopTimeouts): Promise<boolean> {
+  const stale = liveByThread.get(key);
+  if (!stale) return true;
+  return (await stopCodex(stale, timeouts)) && !liveByThread.has(key);
+}
+
+/** Старый sync API: сигнал не означает, что writer уже освободился. */
 export function killStaleCodex(key: string): boolean {
   const stale = liveByThread.get(key);
-  if (stale && stale.exitCode === null) {
-    killGroup(stale, "SIGKILL");
-    liveByThread.delete(key);
-    return true;
+  if (!stale) return false;
+  if (hasExited(stale)) {
+    untrackCodexProcess(stale);
+    return false;
   }
-  return false;
+  killGroup(stale, "SIGKILL");
+  return true;
 }
 
 export const WRITER_CONFLICT_RE = /already has an active writer|thread-store conflict/i;
@@ -256,19 +335,16 @@ export class CodexBackend implements AgentBackend {
           "-", // промпт из stdin
         ];
 
-    // Свой же процесс этого треда ещё жив (завис после прошлого хода) —
-    // добиваем до resume, иначе thread-store conflict.
-    if (opts.resumeSessionId) {
-      const stale = liveByThread.get(opts.resumeSessionId);
-      if (stale && stale.exitCode === null) {
-        killGroup(stale, "SIGKILL");
-        liveByThread.delete(opts.resumeSessionId);
-        yield {
-          kind: "notice",
-          text: "⚠️ Предыдущий процесс Codex этого треда ещё висел — завершён перед новым ходом.",
-        };
-        await new Promise((r) => setTimeout(r, 1000));
-      }
+    if (opts.signal.aborted) return;
+    const previousStopped = !opts.resumeSessionId || await stopStaleCodex(opts.resumeSessionId);
+    if (opts.signal.aborted) return;
+    if (!previousStopped) {
+      yield {
+        kind: "error",
+        message: "Не удалось завершить предыдущий процесс Codex этого треда. Повторный запуск остановлен.",
+      };
+      yield { kind: "result", ok: false, durationMs: 0 };
+      return;
     }
 
     const child = spawn("codex", args, {
@@ -279,12 +355,17 @@ export class CodexBackend implements AgentBackend {
       detached: process.platform !== "win32",
       windowsHide: true,
     });
-    if (opts.resumeSessionId) liveByThread.set(opts.resumeSessionId, child);
+    trackCodexProcess(child);
+    const closed = new Promise<number>((resolve) => {
+      child.once("close", (code) => resolve(code ?? 0));
+    });
+    if (opts.resumeSessionId) trackCodex(opts.resumeSessionId, child);
     child.stdin.write(prompt);
     child.stdin.end();
 
     const kill = () => hardKill(child);
     opts.signal.addEventListener("abort", kill, { once: true });
+    if (opts.signal.aborted) kill();
 
     const stderrChunks: string[] = [];
     child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk.toString()));
@@ -292,6 +373,7 @@ export class CodexBackend implements AgentBackend {
     const startedAt = Date.now();
     const seenItems = new Set<string>();
     let finished = false;
+    let executionStarted = false;
     let threadId: string | null = opts.resumeSessionId ?? null;
     const rolloutCache: { file?: string } = {};
     let lastContextReadAt = 0;
@@ -310,11 +392,17 @@ export class CodexBackend implements AgentBackend {
           continue; // не-JSON строки (баннеры) пропускаем
         }
 
+        // После первого действия повторять промпт небезопасно даже при
+        // позднем stderr с writer conflict: агент уже мог изменить проект.
+        if (ev.type === "turn.started" || (typeof ev.type === "string" && ev.type.startsWith("item."))) {
+          executionStarted = true;
+        }
+
         switch (ev.type) {
           case "thread.started": {
             if (typeof ev.thread_id === "string") {
               threadId = ev.thread_id;
-              liveByThread.set(threadId, child);
+              trackCodex(threadId, child);
               yield { kind: "session", sessionId: ev.thread_id };
             }
             const model = cfg.model || codexDefaultModel();
@@ -429,13 +517,12 @@ export class CodexBackend implements AgentBackend {
         }
       }
 
-      const exitCode: number = await new Promise((resolve) =>
-        child.on("close", (code) => resolve(code ?? 0)),
-      );
+      const exitCode = await closed;
       if (!finished && !opts.signal.aborted) {
         const stderr = stderrChunks.join("").trim();
-        if (opts.resumeSessionId && WRITER_CONFLICT_RE.test(stderr)) {
-          // Тред держит другой процесс codex — хост найдёт его и предложит завершить.
+        if (opts.resumeSessionId && !executionStarted && WRITER_CONFLICT_RE.test(stderr)) {
+          // Только конфликт открытия resume допускает восстановление без
+          // риска повторного выполнения уже начавшейся задачи.
           yield {
             kind: "error",
             message:
@@ -456,16 +543,9 @@ export class CodexBackend implements AgentBackend {
       }
     } finally {
       opts.signal.removeEventListener("abort", kill);
-      // Процесс не должен пережить ход (штатный выход, обрыв цикла, ошибка):
-      // иначе он держит flock треда, и следующий resume упрётся в конфликт.
-      if (child.exitCode === null) hardKill(child);
-      const key = threadId ?? opts.resumeSessionId;
-      if (key && liveByThread.get(key) === child) {
-        if (child.exitCode !== null) liveByThread.delete(key);
-        else
-          child.once("exit", () => {
-            if (liveByThread.get(key) === child) liveByThread.delete(key);
-          });
+      // Следующий resume разрешён только после фактического exit/close.
+      if (!(await stopCodex(child))) {
+        throw new Error("Codex не завершился после TERM/KILL; тред пока занят предыдущим процессом.");
       }
     }
   }
