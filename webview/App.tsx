@@ -18,6 +18,8 @@ import type {
   WebviewToHost,
 } from "../src/shared/protocol";
 
+import { projectKey } from "../src/shared/projectIdentity";
+
 import {
   beginServerTest, finishServerTest, idleServerTest, reconcileServerTest, serverTestFingerprint,
   type ServerTestDraft, type ServerTestState,
@@ -225,7 +227,7 @@ export function App() {
   const [serverTest, setServerTest] = useState<ServerTestState>(idleServerTest);
   const serverTestRef = useRef(serverTest);
   const serverDraft: ServerTestDraft | null = settingsOpen && form?.project ? {
-    projectPath: form.project.path,
+    projectPath: projectKey(form.project),
     host: form.project.serverHost ?? "",
     user: form.project.serverUser,
     password: newPassword,
@@ -287,7 +289,7 @@ export function App() {
   const models = modelsBy[activePath] ?? NO_MODELS;
   const queue = queueBy[activePath] ?? [];
   const sessionId = sessions[agent];
-  const activeProject = projects.find((p) => p.path === activePath);
+  const activeProject = projects.find((p) => projectKey(p) === activePath);
   const elapsed = busy && busyStartBy[activePath]
     ? Math.max(0, Math.floor((clock - busyStartBy[activePath]) / 1000))
     : 0;
@@ -461,7 +463,7 @@ export function App() {
           setActivePath(msg.activePath);
           // Чистим состояние удалённых проектов, чтобы их ленты/очереди
           // не жили вечно и не пересоздавали записи на хосте.
-          const known = new Set(msg.projects.map((x) => x.path));
+          const known = new Set(msg.projects.map(projectKey));
           const prune = <T,>(rec: Record<string, T>): Record<string, T> => {
             const out: Record<string, T> = {};
             for (const [k, v] of Object.entries(rec)) if (known.has(k)) out[k] = v;
@@ -890,9 +892,9 @@ export function App() {
                 <h3>🗂 Все проекты</h3>
                 {projects.length === 0 && <div className="empty">Проектов пока нет.</div>}
                 {projects.map((p) => (
-                  <div key={p.path} className="proj-row">
+                  <div key={projectKey(p)} className="proj-row">
                     <span className="proj-name" title={p.path}>
-                      {p.path === activePath ? "● " : "📁 "}
+                      {projectKey(p) === activePath ? "● " : "📁 "}
                       {p.name}
                     </span>
                     <span className="proj-path">{p.path}</span>
@@ -900,7 +902,7 @@ export function App() {
                       className="finish-btn delete-btn"
                       hidden={REMOTE}
                       title="Удалить проект: убрать из списка или удалить вместе с папкой (в Корзину)"
-                      onClick={() => vscode.postMessage({ type: "deleteProject", path: p.path })}
+                      onClick={() => vscode.postMessage({ type: "deleteProject", path: projectKey(p) })}
                     >
                       🗑
                     </button>
@@ -920,6 +922,13 @@ export function App() {
               {form.project && (
                 <section>
                   <h3>📁 Проект «{form.project.name}»</h3>
+                  <div className="set-hint">Папка: {form.project.path}</div>
+                  {projects.some((p) => projectKey(p) !== projectKey(form.project!) && p.path === form.project!.path) && (
+                    <div className="set-hint">
+                      Эту папку используют несколько проектов. Настройки и чаты раздельные,
+                      файлы и ветка git общие.
+                    </div>
+                  )}
                   <label className="set-row">
                     <span>Название</span>
                     <input
@@ -1066,7 +1075,7 @@ export function App() {
                       hidden={REMOTE}
                       title="Убрать проект из списка или удалить вместе с папкой (папка уедет в Корзину)"
                       onClick={() =>
-                        vscode.postMessage({ type: "deleteProject", path: form.project!.path })
+                        vscode.postMessage({ type: "deleteProject", path: projectKey(form.project!) })
                       }
                     >
                       🗑 Удалить проект…
@@ -1424,8 +1433,8 @@ export function App() {
         >
           {projects.length === 0 && <option value="">нет проектов</option>}
           {projects.map((p) => (
-            <option key={p.path} value={p.path}>
-              {attentionBy[p.path] ? "⚠️ " : busyBy[p.path] ? "⏳ " : "📁 "}
+            <option key={projectKey(p)} value={projectKey(p)}>
+              {attentionBy[projectKey(p)] ? "⚠️ " : busyBy[projectKey(p)] ? "⏳ " : "📁 "}
               {p.name}
             </option>
           ))}

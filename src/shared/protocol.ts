@@ -8,7 +8,10 @@ export type AgentId = "claude" | "codex";
 
 /** Проект: папка, репозиторий, сервер (раздел 1 ai-dev-environment.md). */
 export interface ProjectInfo {
+  /** Stable profile identity; absent on legacy projects keyed by their folder. */
+  id?: string;
   name: string;
+  /** Real working directory; several profiles may use the same folder. */
   path: string;
   githubRepo?: string;
   /** Основная рабочая ветка git. */
@@ -46,7 +49,8 @@ export type WebviewToHost =
       text: string;
       agent: AgentId;
       attachments?: Attachment[];
-      /** Проект, в котором выполнять ход (пусто — активный). Нужен очереди
+      /** Логический ключ проекта (id либо путь старой записи; пусто — активный).
+       * Нужен очереди
        *  фонового проекта, чтобы не стрелять в активный. */
       path?: string;
     }
@@ -84,6 +88,7 @@ export type WebviewToHost =
   | { type: "applyConfigJson"; json: string }
   | {
       type: "testServer";
+      /** Logical profile key, despite the legacy field name. */
       projectPath: string;
       requestId: string;
       host: string;
@@ -124,7 +129,8 @@ export type WebviewToHost =
 
 /**
  * extension → webview.
- * `path` — проект-адресат события: ходы разных проектов идут параллельно,
+ * `path` — логический ключ проекта (id либо путь старого проекта), не cwd.
+ * Ходы разных проектов идут параллельно,
  * и webview маршрутизирует события в ленту/статусы своего проекта.
  * Пустой path трактуется как «активный проект».
  */

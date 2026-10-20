@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as nodePath from "node:path";
@@ -18,6 +19,7 @@ import { CodexAppServerBackend } from "./agents/codexAppServerBackend";
 import { CodexWriterRecoveryBackend } from "./agents/codexWriterRecovery";
 import { buildFinishPrompt, readJournalContext } from "./journal";
 import { buildServerEnvironment, testServerConnection } from "./serverConnection";
+import { isProjectId, projectKey } from "./shared/projectIdentity";
 import * as QRCode from "qrcode";
 import {
   RemoteServer,
@@ -57,6 +59,19 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string,
   );
+}
+
+function expandProjectPath(path: string): string {
+  return path.replace(/^~(?=\/|$)/, os.homedir());
+}
+
+function configuredProjectKey(project: ProjectInfo): string {
+  return projectKey({ ...project, path: expandProjectPath(project.path) });
+}
+
+/** Symlink aliases share the same writer/Git exclusion boundary. */
+function physicalDirectory(path: string): string {
+  try { return fs.realpathSync(path); } catch { return nodePath.resolve(path); }
 }
 /** Модель Claude из supportedModels SDK (кэш в globalState). */
 interface ClaudeModelInfo {
@@ -195,6 +210,7 @@ function normalizeProjects(raw: unknown[]): ProjectInfo[] {
         ? p.serverPort
         : undefined;
     out.push({
+      ...(isProjectId(p.id) ? { id: p.id } : {}),
       name: typeof p.name === "string" && p.name ? p.name : nodePath.basename(p.path),
       path: p.path,
       ...(typeof p.githubRepo === "string" && p.githubRepo ? { githubRepo: p.githubRepo } : {}),
@@ -268,8 +284,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private steers = new Map<string, SteerChannel>();
   /** Тексты, докинутые в текущий ход, — для общего лога беседы. */
   private steerTexts = new Map<string, string[]>();
-  /** Запущенные ходы по проектам: путь → контроллер. Разные проекты — параллельно. */
+  /** Запущенные ходы: логический ключ профиля → контроллер. */
   private runs = new Map<string, AbortController>();
+  /** Logical profiles may share files; only one turn may write that directory. */
+  private directoryRuns = new Map<string, AbortController>();
   /** Сообщения для транспорта без живого канала; вопросы привязаны к сессии. */
   private deferred = new Map<string, DeferredTurn[]>();
   /** Сервер мобильного доступа (третья поверхность рядом с сайдбаром и панелью). */
@@ -289,7 +307,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** После изменения реестра: остановить ходы проектов, которых больше нет. */
   private abortOrphanRuns() {
-    const known = new Set(this.getProjects().map((p) => p.path));
+    const known = new Set(this.getProjects().map(projectKey));
     for (const [path, controller] of [...this.runs]) {
       if (!known.has(path)) {
         controller.abort();
@@ -327,13 +345,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const configured = cfg.get<ProjectInfo[]>("projects", []) ?? [];
     const projects: ProjectInfo[] = [];
     const seen = new Set<string>();
+    const configuredFolders = new Set<string>();
 
     for (const p of configured) {
       if (!p || typeof p.path !== "string" || !p.path) continue;
-      const path = p.path.replace(/^~(?=\/|$)/, os.homedir());
-      if (seen.has(path)) continue;
-      seen.add(path);
+      const path = expandProjectPath(p.path);
+      const identity = configuredProjectKey(p);
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      configuredFolders.add(physicalDirectory(path));
       projects.push({
+        ...(isProjectId(p.id) ? { id: p.id } : {}),
         name: p.name || nodePath.basename(path),
         path,
         githubRepo: p.githubRepo,
@@ -350,7 +372,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const hidden = new Set(this.context.globalState.get<string[]>(HIDDEN_PROJECTS_KEY, []));
     for (const folder of vscode.workspace.workspaceFolders ?? []) {
       const path = folder.uri.fsPath;
-      if (!seen.has(path) && !hidden.has(path)) {
+      if (!configuredFolders.has(physicalDirectory(path)) && !seen.has(path) && !hidden.has(path)) {
         seen.add(path);
         projects.push({ name: folder.name, path });
       }
@@ -378,17 +400,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const toItems = (): Item[] => {
       const active = this.getActiveProject();
       const items: Item[] = this.getProjects().map((p) => ({
-        label: (p.path === active?.path ? "$(circle-filled) " : "$(folder) ") + p.name,
+        label: (projectKey(p) === (active ? projectKey(active) : undefined) ? "$(circle-filled) " : "$(folder) ") + p.name,
         description: p.path,
         detail:
           [
             p.githubRepo,
             p.serverHost && `сервер: ${p.serverHost}`,
-            this.runs.has(p.path) && "⏳ идёт ход",
+            this.runs.has(projectKey(p)) && "⏳ идёт ход",
           ]
             .filter(Boolean)
             .join(" · ") || undefined,
-        path: p.path,
+        path: projectKey(p),
         buttons: [{ iconPath: new vscode.ThemeIcon("trash"), tooltip: "Удалить проект…" }],
       }));
       items.push({ label: "$(add) Добавить проект…", add: true });
@@ -438,7 +460,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       void vscode.window.showWarningMessage("Нет проектов — удалять нечего.");
       return;
     }
-    await this.deleteProject(active.path);
+    await this.deleteProject(projectKey(active));
   }
 
   /**
@@ -453,7 +475,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const cfg = vscode.workspace.getConfiguration("agentHub");
-    const record = this.getActiveRecord(project.path);
+    const record = this.getActiveRecord(projectKey(project));
     const agentName = agent === "claude" ? "Claude" : "GPT (Codex)";
     const sessionId = record?.agentIds[agent] ?? null;
     const journalDir = cfg.get<string>("journalDir", "docs/journal");
@@ -541,7 +563,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private getActiveProject(): ProjectInfo | null {
     const projects = this.getProjects();
     const saved = this.getActivePathRaw();
-    return projects.find((p) => p.path === saved) ?? projects[0] ?? null;
+    return projects.find((p) => projectKey(p) === saved) ?? projects[0] ?? null;
+  }
+
+  private getActiveProjectKey(): string | undefined {
+    const project = this.getActiveProject();
+    return project ? projectKey(project) : undefined;
   }
 
   /** Ключ пароля сервера в SecretStorage (системный Keychain). */
@@ -579,17 +606,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
     if (!picked?.[0]) return;
     const path = picked[0].fsPath;
+    const projects = this.getProjects();
     // Явно добавленная папка workspace больше не считается скрытой.
     await this.setProjectHidden(path, false);
 
     const cfg = vscode.workspace.getConfiguration("agentHub");
     const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
-    const existing = list.findIndex((p) => p.path === path);
-    if (existing < 0) {
-      list.push({ name: nodePath.basename(path), path });
-      await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
+    // Preserve an implicit workspace row under its legacy path key before a
+    // configured profile hides the automatic workspace fallback.
+    for (const existing of projects) {
+      if (physicalDirectory(existing.path) === physicalDirectory(path) &&
+          !list.some((p) => configuredProjectKey(p) === projectKey(existing))) {
+        list.push(existing);
+      }
     }
-    await this.setActivePath(path);
+    const names = new Set(projects.map((p) => p.name));
+    const baseName = nodePath.basename(path);
+    let name = baseName;
+    for (let suffix = 2; names.has(name); suffix++) name = `${baseName} (${suffix})`;
+    const fresh: ProjectInfo = { id: `project-${randomUUID()}`, name, path };
+    list.push(fresh);
+    await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
+    await this.setActivePath(projectKey(fresh));
     this.postFullState();
     await this.postSettings();
     // Открываем экран настроек панели: название, GitHub, ветка, сервер,
@@ -597,7 +635,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: "openSettingsScreen" });
     this.post({
       type: "info",
-      text: `Проект «${nodePath.basename(path)}» добавлен и выбран. Заполните детали в настройках (⚙) и нажмите «Сохранить».`,
+      text: `Проект «${name}» добавлен и выбран. Заполните детали в настройках (⚙) и нажмите «Сохранить».`,
     });
   }
 
@@ -607,10 +645,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * пароль и история сессий вычищаются).
    */
   async deleteProject(path: string) {
-    const project = this.getProjects().find((p) => p.path === path);
+    const project = this.getProjects().find((p) => projectKey(p) === path);
     if (!project) return;
     const isWorkspaceFolder = (vscode.workspace.workspaceFolders ?? []).some(
-      (f) => f.uri.fsPath === path,
+      (f) => physicalDirectory(f.uri.fsPath) === physicalDirectory(project.path),
     );
 
     const LIST_ONLY = "Убрать из списка";
@@ -620,13 +658,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       {
         modal: true,
         detail:
-          `${path}\n\n«${LIST_ONLY}» — файлы не трогаем, историю сессий сохраняем.\n` +
+          `${project.path}\n\n«${LIST_ONLY}» — файлы не трогаем, историю сессий сохраняем.\n` +
           `«${WITH_FOLDER}» — папка отправится в Корзину, история и пароль будут удалены.`,
       },
       LIST_ONLY,
       WITH_FOLDER,
     );
     if (!choice) return;
+
+    if (choice === WITH_FOLDER && this.getProjects().some((p) =>
+      projectKey(p) !== path && physicalDirectory(p.path) === physicalDirectory(project.path))) {
+      void vscode.window.showErrorMessage("Эту папку использует другой профиль проекта. Можно убрать выбранный профиль из списка.");
+      return;
+    }
 
     if (choice === WITH_FOLDER && isWorkspaceFolder) {
       void vscode.window.showErrorMessage(
@@ -638,10 +682,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (choice === WITH_FOLDER) {
       const confirm = await vscode.window.showWarningMessage(
         `Точно удалить папку с диска?`,
-        { modal: true, detail: `${path}\n\nПапка будет отправлена в Корзину (восстановимо).` },
+        { modal: true, detail: `${project.path}\n\nПапка будет отправлена в Корзину (восстановимо).` },
         "Да, удалить папку",
       );
       if (confirm !== "Да, удалить папку") return;
+      if (this.getProjects().some((p) => projectKey(p) !== path &&
+          physicalDirectory(p.path) === physicalDirectory(project.path))) {
+        void vscode.window.showErrorMessage("Эту папку теперь использует другой профиль проекта. Удаление отменено.");
+        return;
+      }
     }
 
     // Останавливаем ход проекта и снимаем зависшие подтверждения.
@@ -651,7 +700,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Из реестра — в любом случае.
     const cfg = vscode.workspace.getConfiguration("agentHub");
     const list = (cfg.get<ProjectInfo[]>("projects", []) ?? []).filter(
-      (p) => p.path?.replace(/^~(?=\/|$)/, os.homedir()) !== path,
+      (p) => configuredProjectKey(p) !== path,
     );
     await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
     if (this.getActivePathRaw() === path) await this.setActivePath(undefined);
@@ -659,7 +708,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this.context.globalState.update(ACTIVE_PROJECT_KEY, undefined);
     }
     // Папка workspace иначе вернётся в список автоматически — помечаем скрытой.
-    if (isWorkspaceFolder) await this.setProjectHidden(path, true);
+    if (isWorkspaceFolder) {
+      for (const folder of vscode.workspace.workspaceFolders ?? []) {
+        if (physicalDirectory(folder.uri.fsPath) === physicalDirectory(project.path)) {
+          await this.setProjectHidden(folder.uri.fsPath, true);
+        }
+      }
+    }
 
     if (choice === WITH_FOLDER) {
       // Пароль, доступы и историю сессий вычищаем вместе с папкой.
@@ -669,7 +724,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       delete all[path];
       await this.context.globalState.update(STORE_KEY, all);
       try {
-        await vscode.workspace.fs.delete(vscode.Uri.file(path), {
+        // Registry/secrets writes above yield: another profile may have been
+        // created since confirmation. Keep its shared files intact.
+        if (this.getProjects().some((p) => projectKey(p) !== path &&
+            physicalDirectory(p.path) === physicalDirectory(project.path))) {
+          this.abortOrphanRuns();
+          this.postFullState();
+          await this.postSettings();
+          this.post({ type: "info", text: "Выбранный профиль удалён из списка; папка сохранена, потому что её использует другой профиль." });
+          return;
+        }
+        await vscode.workspace.fs.delete(vscode.Uri.file(project.path), {
           recursive: true,
           useTrash: true,
         });
@@ -745,7 +810,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const cfg = vscode.workspace.getConfiguration("agentHub");
     const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
     const idx = list.findIndex(
-      (p) => p.path?.replace(/^~(?=\/|$)/, os.homedir()) === active.path,
+      (p) => configuredProjectKey(p) === projectKey(active),
     );
 
     if (pick.action === "protocol") {
@@ -770,7 +835,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (pick.action === "delete") {
-      await this.deleteProject(active.path);
+      await this.deleteProject(projectKey(active));
       return;
     }
 
@@ -814,15 +879,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         type: "serverTestResult", projectPath: msg.projectPath,
         requestId: msg.requestId, ok, message,
       });
-    const project = this.getProjects().find((p) => p.path === msg.projectPath);
+    const project = this.getProjects().find((p) => projectKey(p) === msg.projectPath);
     if (!project) {
       report(false, "Проект удалён или недоступен. Откройте настройки проекта заново.");
       return;
     }
     const savedPassword = msg.password === undefined
-      ? await this.context.secrets.get(this.passwordKey(project.path))
+      ? await this.context.secrets.get(this.passwordKey(projectKey(project)))
       : msg.password;
-    const env = buildServerEnvironment(await this.getSecretEnv(project.path), savedPassword);
+    const env = buildServerEnvironment(await this.getSecretEnv(projectKey(project)), savedPassword);
     const result = await testServerConnection({
       host: msg.host, user: msg.user, protocol: msg.protocol, port: msg.port,
     }, env.AGENT_HUB_SERVER_PASSWORD);
@@ -861,7 +926,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * с нескольких устройств). Fast-forward, при расхождении — rebase с
    * автостэшем; конфликт не решаем — предупреждаем и работаем на текущей.
    */
-  private async autoPull(cwd: string) {
+  private async autoPull(cwd: string, eventKey = cwd) {
     const cfg = vscode.workspace.getConfiguration("agentHub");
     if (!cfg.get<boolean>("autoPull", true)) return;
 
@@ -870,7 +935,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const remotes = await this.execGit(cwd, ["remote"]);
     if (remotes.code !== 0 || !remotes.out.trim()) return;
 
-    this.postScoped(cwd, { type: "activity", label: "Проверяю обновления в origin…" });
+    this.postScoped(eventKey, { type: "activity", label: "Проверяю обновления в origin…" });
     const fetched = await this.execGit(cwd, ["fetch", "--quiet"], 30000);
     if (fetched.code !== 0) return; // офлайн/нет доступа — работаем с тем, что есть
 
@@ -899,7 +964,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const aheadRes = await this.execGit(cwd, ["rev-list", "--count", `${upstream}..HEAD`]);
     const ahead = aheadRes.code === 0 ? parseInt(aheadRes.out.trim(), 10) || 0 : 0;
 
-    this.postScoped(cwd, { type: "activity", label: `Подтягиваю новые коммиты (${behind})…` });
+    this.postScoped(eventKey, { type: "activity", label: `Подтягиваю новые коммиты (${behind})…` });
     let ok: boolean;
     if (ahead === 0) {
       const merge = await this.execGit(
@@ -916,12 +981,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     if (ok) {
       const sha = await this.execGit(cwd, ["rev-parse", "--short", "HEAD"]);
-      this.postScoped(cwd, {
+      this.postScoped(eventKey, {
         type: "info",
         text: `Подтянуты обновления из ${upstream}: коммитов — ${behind}. Теперь HEAD ${sha.out.trim()}.`,
       });
     } else {
-      this.postScoped(cwd, {
+      this.postScoped(eventKey, {
         type: "info",
         text:
           `⚠️ В ${upstream} есть новые коммиты (${behind}), но обновиться автоматически не удалось ` +
@@ -935,7 +1000,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * commit с заголовком из промпта (+ опциональный push). Claude и Codex
    * проходят через одну точку — runTurn, поэтому покрыты оба.
    */
-  private async autoCommit(cwd: string, agent: AgentId, prompt: string) {
+  private async autoCommit(cwd: string, agent: AgentId, prompt: string, eventKey = cwd) {
     const cfg = vscode.workspace.getConfiguration("agentHub");
     if (!cfg.get<boolean>("autoCommit", true)) return;
     const short = (s: string) => {
@@ -969,10 +1034,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (status.code !== 0 || !status.out.trim()) return;
     const changed = status.out.trim().split("\n").length;
 
-    this.postScoped(cwd, { type: "activity", label: "Коммичу изменения…" });
+    this.postScoped(eventKey, { type: "activity", label: "Коммичу изменения…" });
     const add = await this.execGit(cwd, ["add", "-A"]);
     if (add.code !== 0) {
-      this.postScoped(cwd, { type: "info", text: `Автокоммит: git add не удался — ${short(add.err)}` });
+      this.postScoped(eventKey, { type: "info", text: `Автокоммит: git add не удался — ${short(add.err)}` });
       return;
     }
 
@@ -988,25 +1053,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ]);
     }
     if (commit.code !== 0) {
-      this.postScoped(cwd, {
+      this.postScoped(eventKey, {
         type: "info",
         text: `Автокоммит не удался: ${short(commit.err || commit.out)}`,
       });
       return;
     }
     const sha = await this.execGit(cwd, ["rev-parse", "--short", "HEAD"]);
-    this.postScoped(cwd, {
+    this.postScoped(eventKey, {
       type: "info",
       text: `Автокоммит ${sha.out.trim()}: файлов в изменениях — ${changed}.`,
     });
 
     if (!cfg.get<boolean>("autoPush", false)) return;
-    this.postScoped(cwd, { type: "activity", label: "Пушу в origin…" });
+    this.postScoped(eventKey, { type: "activity", label: "Пушу в origin…" });
     let push = await this.execGit(cwd, ["push"], 60000);
     if (push.code !== 0 && /no upstream|set-upstream/i.test(push.err)) {
       push = await this.execGit(cwd, ["push", "-u", "origin", "HEAD"], 60000);
     }
-    this.postScoped(cwd, {
+    this.postScoped(eventKey, {
       type: "info",
       text: push.code === 0 ? "Изменения запушены в origin." : `Пуш не удался: ${short(push.err)}`,
     });
@@ -1203,8 +1268,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let updated = 0;
     if (incoming.length > 0) {
       const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
+      const existingProjects = this.getProjects();
       for (const p of incoming) {
-        const idx = list.findIndex((e) => e.path === p.path);
+        for (const existing of existingProjects) {
+          if (physicalDirectory(existing.path) === physicalDirectory(expandProjectPath(p.path)) &&
+              !list.some((entry) => configuredProjectKey(entry) === projectKey(existing))) {
+            list.push(existing);
+          }
+        }
+        const idx = list.findIndex((e) => configuredProjectKey(e) === configuredProjectKey(p));
         if (idx >= 0) {
           list[idx] = p;
           updated++;
@@ -1240,7 +1312,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const pick = await vscode.window.showQuickPick(
-      projects.map((p) => ({ label: p.name, description: p.serverHost ?? p.path, path: p.path })),
+      projects.map((p) => ({ label: p.name, description: p.serverHost ?? p.path, path: projectKey(p) })),
       { placeHolder: "Проект, для которого задать пароль сервера", ignoreFocusOut: true },
     );
     if (!pick) return;
@@ -1273,9 +1345,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       void vscode.window.showWarningMessage("Сначала добавьте проект.");
       return;
     }
-    const key = this.secretEnvKey(project.path);
+    const key = this.secretEnvKey(projectKey(project));
     for (;;) {
-      const env = await this.getSecretEnv(project.path);
+      const env = await this.getSecretEnv(projectKey(project));
       type Item = vscode.QuickPickItem & { name?: string; add?: boolean };
       const items: Item[] = Object.keys(env)
         .sort()
@@ -1390,8 +1462,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       projects.map((p) => ({
         label: p.name,
         description: p.serverHost ?? p.path,
-        picked: p.path === (sourcePath ?? this.getActiveProject()?.path),
-        path: p.path,
+        picked: projectKey(p) === (sourcePath ?? this.getActiveProjectKey()),
+        path: projectKey(p),
       })),
       {
         canPickMany: true,
@@ -1402,6 +1474,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!picked || picked.length === 0) return;
 
     for (const p of picked) {
+      // Picker rows carry the logical key in their path field.
       const env = await this.getSecretEnv(p.path);
       Object.assign(env, pairs);
       await this.context.secrets.store(this.secretEnvKey(p.path), JSON.stringify(env));
@@ -1431,8 +1504,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const proto = p.serverProtocol ?? "ssh";
       const target = p.serverUser ? `${p.serverUser}@${p.serverHost}` : p.serverHost;
       const env = serverEnv ?? buildServerEnvironment(
-        await this.getSecretEnv(p.path),
-        await this.context.secrets.get(this.passwordKey(p.path)),
+        await this.getSecretEnv(projectKey(p)),
+        await this.context.secrets.get(this.passwordKey(projectKey(p))),
       );
       const hasPassword = Boolean(env.AGENT_HUB_SERVER_PASSWORD);
       const passwordNote =
@@ -1473,7 +1546,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     if (p.server) lines.push(`Заметки о сервере: ${p.server}`);
-    const envNames = Object.keys(await this.getSecretEnv(p.path)).sort();
+    const envNames = Object.keys(await this.getSecretEnv(projectKey(p))).sort();
     if (envNames.length > 0) {
       lines.push(
         `Доступы проекта заданы в переменных окружения: ${envNames.join(", ")}. ` +
@@ -1584,31 +1657,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private postFullState() {
     const projects = this.getProjects();
     const active = this.getActiveProject();
-    this.post({ type: "projects", projects, activePath: active?.path ?? "" });
+    this.post({ type: "projects", projects, activePath: active ? projectKey(active) : "" });
     if (active) {
-      const rec = this.getActiveRecord(active.path);
-      this.post({ type: "transcript", path: active.path, items: rec?.items ?? [] });
+      const rec = this.getActiveRecord(projectKey(active));
+      this.post({ type: "transcript", path: projectKey(active), items: rec?.items ?? [] });
       // Скоуп обязателен: burst идёт до ре-рендера webview, и фолбэк на
       // activeRef разложил бы состояние под старым проектом (баг из ревью).
-      this.postScoped(active.path, {
+      this.postScoped(projectKey(active), {
         type: "sessionInfo",
         sessionId: rec?.agentIds.claude ?? null,
         agent: "claude",
       });
-      this.postScoped(active.path, {
+      this.postScoped(projectKey(active), {
         type: "sessionInfo",
         sessionId: rec?.agentIds.codex ?? null,
         agent: "codex",
       });
       for (const a of ["claude", "codex"] as const) {
         const ctx = rec?.context?.[a];
-        this.postScoped(active.path, {
+        this.postScoped(projectKey(active), {
           type: "contextUsage",
           agent: a,
           used: ctx?.used ?? 0,
           max: ctx?.max ?? 0,
         });
-        this.postScoped(active.path, {
+        this.postScoped(projectKey(active), {
           type: "modelInfo",
           agent: a,
           model: rec?.models?.[a] ?? "",
@@ -1660,8 +1733,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const cfg = vscode.workspace.getConfiguration("agentHub");
     const project = this.getActiveProject();
     const hasPassword = project ? Boolean(buildServerEnvironment(
-      await this.getSecretEnv(project.path),
-      await this.context.secrets.get(this.passwordKey(project.path)),
+      await this.getSecretEnv(projectKey(project)),
+      await this.context.secrets.get(this.passwordKey(projectKey(project))),
     ).AGENT_HUB_SERVER_PASSWORD) : false;
     return {
       claude: {
@@ -1688,7 +1761,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       autoScrollMode: cfg.get<string>("autoScrollMode", "perProject"),
       project,
       projectHasPassword: hasPassword,
-      secretEnvNames: project ? Object.keys(await this.getSecretEnv(project.path)).sort() : [],
+      secretEnvNames: project ? Object.keys(await this.getSecretEnv(projectKey(project))).sort() : [],
     };
   }
 
@@ -1725,7 +1798,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (s.project) {
       const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
       const idx = list.findIndex(
-        (p) => p.path?.replace(/^~(?=\/|$)/, os.homedir()) === s.project!.path,
+        (p) => configuredProjectKey(p) === configuredProjectKey(s.project!),
       );
       const entry: ProjectInfo = {
         ...s.project,
@@ -1737,10 +1810,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       if (s.newPassword !== undefined) {
         if (s.newPassword) {
-          await this.context.secrets.store(this.passwordKey(s.project.path), s.newPassword);
+          await this.context.secrets.store(this.passwordKey(configuredProjectKey(s.project)), s.newPassword);
         } else {
           // Preserve the explicit removal across turns instead of reviving an env alias.
-          await this.context.secrets.store(this.passwordKey(s.project.path), "");
+          await this.context.secrets.store(this.passwordKey(configuredProjectKey(s.project)), "");
         }
       }
     }
@@ -1898,7 +1971,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await section.update("model", value, vscode.ConfigurationTarget.Global);
       // Базовая изменилась — текущий чат следует ей, свой выбор снимаем.
       if (project) {
-        await this.mutateActiveRecord(project.path, (r) => {
+        await this.mutateActiveRecord(projectKey(project), (r) => {
           if (r.modelOverrides) delete r.modelOverrides[agent];
         });
       }
@@ -1910,7 +1983,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
     } else {
       if (!project) return;
-      await this.mutateActiveRecord(project.path, (r) => {
+      await this.mutateActiveRecord(projectKey(project), (r) => {
         const o = (r.modelOverrides ??= {});
         if (value) o[agent] = value;
         else delete o[agent];
@@ -2200,7 +2273,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     if (!nodePath.isAbsolute(p)) {
-      const base = projectPath || this.getActiveProject()?.path;
+      const base = projectPath
+        ? this.getProjects().find((project) => projectKey(project) === projectPath)?.path ??
+          (!isProjectId(projectPath) ? projectPath : undefined)
+        : this.getActiveProject()?.path;
       if (!base) return;
       p = nodePath.join(base, p);
     }
@@ -2253,28 +2329,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   async applySession(id: string) {
     const project = this.getActiveProject();
     if (!project) return;
-    if (this.runs.has(project.path)) {
+    if (this.runs.has(projectKey(project))) {
       this.post({ type: "error", message: "В этом проекте идёт ход — дождитесь завершения." });
       return;
     }
-    const store = this.getProjectStore(project.path);
+    const store = this.getProjectStore(projectKey(project));
     if (!store.sessions.some((s) => s.id === id)) return;
     store.activeId = id;
     this.pruneEmptySessions(store);
-    await this.saveProjectStore(project.path, store);
+    await this.saveProjectStore(projectKey(project), store);
     this.postFullState();
   }
 
   async showSessions(remote?: RemoteClient) {
     const project = this.getActiveProject();
     if (!project) return;
-    if (this.runs.has(project.path)) {
+    if (this.runs.has(projectKey(project))) {
       this.post({ type: "error", message: "В этом проекте идёт ход — дождитесь завершения." });
       return;
     }
-    const store = this.getProjectStore(project.path);
+    const store = this.getProjectStore(projectKey(project));
     this.pruneEmptySessions(store);
-    await this.saveProjectStore(project.path, store);
+    await this.saveProjectStore(projectKey(project), store);
     if (store.sessions.length === 0) {
       this.post({ type: "info", text: "История сессий этого проекта пуста." });
       return;
@@ -2344,7 +2420,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const latest = [...store.sessions].sort((a, b) => b.updatedAt - a.updatedAt)[0];
         store.activeId = latest?.id ?? null;
       }
-      await this.saveProjectStore(project.path, store);
+      await this.saveProjectStore(projectKey(project), store);
       this.postFullState();
       if (store.sessions.length === 0) {
         qp.hide();
@@ -2359,7 +2435,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         store.activeId = picked.sessionId;
         // Уходя с пустой сессии — не оставляем её в истории.
         this.pruneEmptySessions(store);
-        await this.saveProjectStore(project.path, store);
+        await this.saveProjectStore(projectKey(project), store);
         this.postFullState();
       }
       qp.hide();
@@ -2374,12 +2450,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   newSession() {
     const active = this.getActiveProject();
     if (active) {
-      this.runs.get(active.path)?.abort();
-      this.denyAllPending(active.path);
+      this.runs.get(projectKey(active))?.abort();
+      this.denyAllPending(projectKey(active));
     }
     let keptPrevious = false;
     if (active) {
-      const store = this.getProjectStore(active.path);
+      const store = this.getProjectStore(projectKey(active));
       const current = store.sessions.find((s) => s.id === store.activeId);
       if (current && !hasUserContent(current.items)) {
         // Пустую активную не сохраняем в историю — обнуляем и переиспользуем.
@@ -2405,11 +2481,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       store.sessions = [...store.sessions]
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, MAX_SESSIONS_PER_PROJECT);
-      void this.saveProjectStore(active.path, store);
+      void this.saveProjectStore(projectKey(active), store);
     }
     this.postFullState();
     if (active) {
-      this.postScoped(active.path, {
+      this.postScoped(projectKey(active), {
         type: "info",
         text: keptPrevious
           ? "Новая сессия. Прошлая сохранена в истории (🕘)."
@@ -2503,12 +2579,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.postFullState();
         break;
       case "stop": {
-        const requested = msg.path ?? this.getActiveProject()?.path;
+        const requested = msg.path ?? this.getActiveProjectKey();
         // Ищем, что останавливать: запрошенный проект → единственный запуск.
         const target =
           requested && this.runs.has(requested)
             ? requested
-            : this.runs.size === 1
+            : !requested && this.runs.size === 1
               ? [...this.runs.keys()][0]
               : undefined;
         if (target) {
@@ -2541,14 +2617,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], msg.path, true);
         break;
       case "steer": {
-        const target = msg.path ?? this.getActiveProject()?.path;
+        const target = msg.path ?? this.getActiveProjectKey();
         const channel = target ? this.steers.get(target) : undefined;
         if (!target || !this.runs.has(target) || !channel?.handler) {
           // Ход уже закончился или агент не принимает сообщения на лету — обычная отправка.
           await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], msg.path, true);
           break;
         }
-        const files = await this.relocateAttachments(target, msg.attachments ?? []);
+        const project = this.getProjects().find((p) => projectKey(p) === target);
+        if (!project) break;
+        const files = await this.relocateAttachments(project.path, msg.attachments ?? [], target);
         const text = files.length > 0 ? `${buildAttachmentsBlock(files)}\n\n${msg.text}` : msg.text;
         this.postScoped(target, {
           type: "userMessage",
@@ -2587,7 +2665,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.post({
             type: "attachmentAdded",
             files: picked.map((u) => ({ name: nodePath.basename(u.fsPath), path: u.fsPath })),
-            path: msg.path ?? this.getActiveProject()?.path,
+            path: msg.path ?? this.getActiveProjectKey(),
           });
         }
         break;
@@ -2698,9 +2776,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async saveAttachment(name: string, dataBase64: string, projectPath?: string) {
     // Проект — тот, чья лента прислала файл: «активный» хоста мог отличаться
     // (переключение, другое окно), и вложение уезжало в чужую папку.
-    const project =
-      (projectPath ? this.getProjects().find((p) => p.path === projectPath) : null) ??
-      this.getActiveProject();
+    const project = projectPath
+      ? this.getProjects().find((p) => projectKey(p) === projectPath)
+      : this.getActiveProject();
     if (!project) {
       this.post({ type: "error", message: "Нет активного проекта — некуда сохранить вложение." });
       return;
@@ -2710,12 +2788,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await fs.promises.mkdir(dir, { recursive: true });
       const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       const safeName = name.replace(/[^\wа-яА-ЯёЁ.\-]+/g, "_") || "file";
-      const filePath = nodePath.join(dir, `${stamp}-${safeName}`);
+      const filePath = nodePath.join(dir, `${stamp}-${randomUUID()}-${safeName}`);
       await fs.promises.writeFile(filePath, Buffer.from(dataBase64, "base64"));
       this.post({
         type: "attachmentAdded",
         files: [{ name: nodePath.basename(filePath), path: filePath }],
-        path: project.path,
+        path: projectKey(project),
       });
     } catch (err) {
       this.post({
@@ -2736,12 +2814,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Вложения из .agent-hub/attachments другого проекта — скопировать в текущий. */
-  private async relocateAttachments(cwd: string, attachments: Attachment[]): Promise<Attachment[]> {
+  private async relocateAttachments(cwd: string, attachments: Attachment[], eventKey = cwd): Promise<Attachment[]> {
     if (attachments.length === 0) return attachments;
     const marker = `${nodePath.sep}.agent-hub${nodePath.sep}attachments${nodePath.sep}`;
     const others = this.getProjects()
       .map((p) => p.path)
-      .filter((p) => p !== cwd);
+      .filter((p) => physicalDirectory(p) !== physicalDirectory(cwd));
     const out: Attachment[] = [];
     for (const a of attachments) {
       const foreign =
@@ -2755,10 +2833,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       try {
         const dir = nodePath.join(cwd, ".agent-hub", "attachments");
         await fs.promises.mkdir(dir, { recursive: true });
-        const dest = nodePath.join(dir, nodePath.basename(a.path));
+        const dest = nodePath.join(dir, `${randomUUID()}-${nodePath.basename(a.path)}`);
         await fs.promises.copyFile(a.path, dest);
         out.push({ name: a.name, path: dest });
-        this.postScoped(cwd, {
+        this.postScoped(eventKey, {
           type: "info",
           text: `Вложение «${a.name}» лежало в папке другого проекта — скопировано в этот проект.`,
         });
@@ -2770,7 +2848,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private isQuestionOriginCurrent(cwd: string, agent: AgentId, origin: QuestionOrigin): boolean {
-    if (!this.getProjects().some((project) => project.path === cwd)) return false;
+    if (!this.getProjects().some((project) => projectKey(project) === cwd)) return false;
     const current = this.getActiveRecord(cwd);
     return !!current && current.id === origin.recordId && current.createdAt === origin.createdAt &&
       current.agentIds[agent] === origin.sessionId;
@@ -3000,7 +3078,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     expectedQuestionOrigin?: QuestionOrigin,
   ) {
     const project = targetPath
-      ? (this.getProjects().find((p) => p.path === targetPath) ?? null)
+      ? (this.getProjects().find((p) => projectKey(p) === targetPath) ?? null)
       : this.getActiveProject();
     if (!project) {
       this.post({
@@ -3011,7 +3089,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
       return;
     }
-    const cwd = project.path;
+    const cwd = projectKey(project);
+    const workingDir = project.path;
     if (expectedQuestionOrigin && !this.isQuestionOriginCurrent(cwd, agent, expectedQuestionOrigin)) {
       this.reportExpiredQuestion(cwd);
       return;
@@ -3023,23 +3102,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
       return;
     }
-    if (!fs.existsSync(cwd)) {
-      this.postScoped(cwd, { type: "error", message: `Папка проекта не найдена: ${cwd}` });
+    if (!fs.existsSync(workingDir)) {
+      this.postScoped(cwd, { type: "error", message: `Папка проекта не найдена: ${workingDir}` });
       return;
     }
+
+    const directory = physicalDirectory(workingDir);
+    const directoryRuns = (this.directoryRuns ??= new Map());
+    if (directoryRuns.has(directory)) {
+      this.postScoped(cwd, { type: "error", message: "В этой рабочей папке уже идёт ход другого профиля. Дождитесь его завершения или остановите тот ход." });
+      return;
+    }
+    const controller = new AbortController();
+    directoryRuns.set(directory, controller);
+    this.runs.set(cwd, controller);
+    const releaseDirectory = () => {
+      if (directoryRuns.get(directory) === controller) directoryRuns.delete(directory);
+    };
+    try {
 
     // Изоляция проектов: вложение из папки ДРУГОГО проекта (старый дефект —
     // сохранялось в «активный» проект хоста) копируем сюда, чтобы агент не
     // ходил в чужую папку и не узнавал о другом проекте.
-    attachments = await this.relocateAttachments(cwd, attachments);
-    if (expectedQuestionOrigin && (this.runs.has(cwd) ||
-      !this.isQuestionOriginCurrent(cwd, agent, expectedQuestionOrigin))) {
-      this.reportExpiredQuestion(cwd);
+    attachments = await this.relocateAttachments(workingDir, attachments, cwd);
+    if (controller.signal.aborted || this.runs.get(cwd) !== controller ||
+        directoryRuns.get(directory) !== controller ||
+        (expectedQuestionOrigin && !this.isQuestionOriginCurrent(cwd, agent, expectedQuestionOrigin))) {
+      if (expectedQuestionOrigin) this.reportExpiredQuestion(cwd);
       return;
     }
 
-    const controller = new AbortController();
-    this.runs.set(cwd, controller);
     const discardStaleQuestion = () => {
       if (!expectedQuestionOrigin || (!controller.signal.aborted &&
         this.runs.get(cwd) === controller &&
@@ -3064,7 +3156,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     // Перед изменениями — актуальная версия: подтягиваем новые коммиты,
     // чтобы агент (и журнал сессий) работали поверх свежего кода.
-    await this.autoPull(cwd);
+    await this.autoPull(workingDir, cwd);
     if (discardStaleQuestion()) return;
 
     // Slash-команды: Claude Code исполняет их сам, но промпт обязан НАЧИНАТЬСЯ
@@ -3113,8 +3205,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     // Один снимок секретов для карточки и процесса, включая resumed-сессии.
     const serverEnv = buildServerEnvironment(
-      await this.getSecretEnv(project.path),
-      await this.context.secrets.get(this.passwordKey(project.path)),
+      await this.getSecretEnv(projectKey(project)),
+      await this.context.secrets.get(this.passwordKey(projectKey(project))),
     );
     if (discardStaleQuestion()) return;
     const projectCard = isSlashCommand ? "" : await this.buildProjectCard(project, serverEnv);
@@ -3124,7 +3216,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const cfg = vscode.workspace.getConfiguration("agentHub");
       const parts: string[] = [projectCard];
       const journalContext = await readJournalContext(
-        cwd,
+        workingDir,
         cfg.get<string>("journalDir", "docs/journal"),
         cfg.get<number>("journalContextEntries", 3),
       );
@@ -3198,7 +3290,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const steer: SteerChannel = {};
       this.steers.set(cwd, steer);
       const events = backend.start(fullPrompt, {
-        cwd,
+        cwd: workingDir,
         resumeSessionId: sessions[agent] ?? undefined,
         signal: controller.signal,
         steer,
@@ -3366,7 +3458,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       // Ошибка подключения/восстановления не должна коммитить посторонние правки.
       if (turnSucceeded && !controller.signal.aborted) {
-        await this.autoCommit(cwd, agent, prompt);
+        await this.autoCommit(workingDir, agent, prompt, cwd);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -3376,7 +3468,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.postScoped(cwd, { type: "info", text: "Остановлено." });
       }
     } finally {
-      this.runs.delete(cwd);
       this.steers.delete(cwd);
       const steered = [...(this.steerTexts.get(cwd) ?? []), ...questionAnswers];
       this.steerTexts.delete(cwd);
@@ -3403,6 +3494,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         r.chatSeen = seen;
       });
       await turnLogDone;
+      if (this.runs.get(cwd) === controller) this.runs.delete(cwd);
       // Отложенный ход (ответ на вопрос Codex) — без промежуточного busy:false,
       // иначе очередь webview стартует параллельно и упрётся в «агент работает».
       for (;;) {
@@ -3413,8 +3505,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       if (!nextDeferred) this.postScoped(cwd, { type: "busy", value: false });
     }
+    releaseDirectory();
     if (nextDeferred) {
       await this.runTurn(nextDeferred.prompt, nextDeferred.agent, [], cwd, true, nextDeferred.questionOrigin);
+    }
+    } finally {
+      releaseDirectory();
+      if (this.runs.get(cwd) === controller) {
+        this.runs.delete(cwd);
+        this.postScoped(cwd, { type: "busy", value: false });
+      }
     }
   }
 
@@ -3426,7 +3526,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async finishSession(agent: AgentId) {
     const project = this.getActiveProject();
     if (!project) return;
-    if (this.runs.has(project.path)) {
+    if (this.runs.has(projectKey(project)) || this.directoryRuns?.has(physicalDirectory(project.path))) {
       this.post({ type: "error", message: "В этом проекте агент ещё работает. Дождитесь ответа или нажмите «Стоп»." });
       return;
     }
@@ -3437,14 +3537,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: "info", text: "Записываю итоги сессии в журнал…" });
     await this.runTurn(buildFinishPrompt(dir), agent);
 
-    await this.mutateActiveRecord(project.path, (r) => {
+    await this.mutateActiveRecord(projectKey(project), (r) => {
       r.agentIds = { claude: null, codex: null };
     });
     // Пользователь мог переключиться на другой проект за время хода —
     // адресуем завершение проекту, где писались итоги.
-    this.postScoped(project.path, { type: "sessionInfo", sessionId: null, agent: "claude" });
-    this.postScoped(project.path, { type: "sessionInfo", sessionId: null, agent: "codex" });
-    this.postScoped(project.path, {
+    this.postScoped(projectKey(project), { type: "sessionInfo", sessionId: null, agent: "claude" });
+    this.postScoped(projectKey(project), { type: "sessionInfo", sessionId: null, agent: "codex" });
+    this.postScoped(projectKey(project), {
       type: "info",
       text: "Итоги записаны. Следующее сообщение начнёт новую сессию с контекстом из журнала.",
     });
@@ -3508,8 +3608,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Карточка ждёт в ФОНОВОМ проекте — иначе пользователь её не увидит. */
   private notifyBackgroundPermission(cwd: string, what: string) {
-    if (this.getActiveProject()?.path === cwd) return;
-    const name = this.getProjects().find((p) => p.path === cwd)?.name ?? nodePath.basename(cwd);
+    if (this.getActiveProjectKey() === cwd) return;
+    const name = this.getProjects().find((p) => projectKey(p) === cwd)?.name ?? nodePath.basename(cwd);
     void vscode.window
       .showWarningMessage(`Agent Hub — проект «${name}»: ${what}`, "Открыть проект")
       .then(async (choice) => {

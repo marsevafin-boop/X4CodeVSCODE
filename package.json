@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.52",
+  "version": "0.0.53",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -179,6 +179,11 @@
               "server": {
                 "type": "string",
                 "description": "Заметки о сервере: логи, способ деплоя и т.п. Пароль здесь не хранить — используйте команду «Agent Hub: Задать пароль сервера проекта»"
+              },
+              "id": {
+                "type": "string",
+                "pattern": "^project-[a-zA-Z0-9][a-zA-Z0-9_-]{0,119}$",
+                "description": "Стабильный идентификатор проекта. Создаётся автоматически; позволяет нескольким проектам использовать одну папку."
               }
             },
             "required": [
