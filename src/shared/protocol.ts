@@ -84,6 +84,8 @@ export type WebviewToHost =
   | { type: "applyConfigJson"; json: string }
   | {
       type: "testServer";
+      projectPath: string;
+      requestId: string;
       host: string;
       user?: string;
       password?: string;
@@ -187,7 +189,7 @@ export type HostToWebview =
       path?: string;
     }
   | { type: "attachmentAdded"; files: Attachment[]; path?: string }
-  | { type: "serverTestResult"; ok: boolean; message: string }
+  | { type: "serverTestResult"; projectPath: string; requestId: string; ok: boolean; message: string }
   | { type: "configJson"; json: string }
   | { type: "configJsonResult"; ok: boolean; message: string }
   | { type: "openSettingsScreen" };

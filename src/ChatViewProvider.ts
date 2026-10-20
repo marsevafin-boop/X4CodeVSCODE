@@ -17,6 +17,7 @@ import { CodexBackend, codexDefaultModel, killAllCodex } from "./agents/codexBac
 import { CodexAppServerBackend } from "./agents/codexAppServerBackend";
 import { CodexWriterRecoveryBackend } from "./agents/codexWriterRecovery";
 import { buildFinishPrompt, readJournalContext } from "./journal";
+import { buildServerEnvironment, testServerConnection } from "./serverConnection";
 import * as QRCode from "qrcode";
 import {
   RemoteServer,
@@ -238,6 +239,18 @@ function formatInputPreview(input: unknown): string {
   return json.length > 1500 ? json.slice(0, 1500) + "\n…" : json;
 }
 
+interface QuestionOrigin {
+  recordId: string;
+  createdAt: number;
+  sessionId: string | null;
+}
+
+interface DeferredTurn {
+  prompt: string;
+  agent: AgentId;
+  questionOrigin?: QuestionOrigin;
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewId = "agentHub.chat";
 
@@ -257,8 +270,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private steerTexts = new Map<string, string[]>();
   /** Запущенные ходы по проектам: путь → контроллер. Разные проекты — параллельно. */
   private runs = new Map<string, AbortController>();
-  /** Отложенные ходы: ответ на вопрос Codex уходит после текущего хода. */
-  private deferred = new Map<string, { prompt: string; agent: AgentId }[]>();
+  /** Сообщения для транспорта без живого канала; вопросы привязаны к сессии. */
+  private deferred = new Map<string, DeferredTurn[]>();
   /** Сервер мобильного доступа (третья поверхность рядом с сайдбаром и панелью). */
   private remote: RemoteServer | null = null;
   /** Включён на эту сессию, когда настройку сохранить нельзя (окно не перезагружено). */
@@ -266,7 +279,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Ожидающие решения запросы canUseTool: requestId → {проект, resolve}. */
   private pendingPermissions = new Map<
     string,
-    { path: string; resolve: (result: { allow: boolean; answer?: string }) => void }
+    { path: string; resolve: (result: { allow: boolean; answer?: string }) => void | Promise<void> }
   >();
 
   /** Сообщение с меткой проекта — webview маршрутизирует в свою ленту. */
@@ -794,198 +807,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // ---------- Проверка соединения с сервером ----------
 
-  /**
-   * Проверка соединения по выбранному протоколу.
-   * SSH/SFTP: сначала ключи (BatchMode), затем пароль через sshpass (env SSHPASS).
-   * FTP: curl, логин/пароль уходят через конфиг на stdin (-K -), не в argv.
-   */
-  private async testServer(
-    host: string,
-    user?: string,
-    formPassword?: string,
-    protocol: "ssh" | "sftp" | "ftp" = "ssh",
-    port?: number,
-  ) {
-    const target = user ? `${user}@${host}` : host;
-    const shortErr = (s: string) => {
-      const line = s.trim().split("\n").filter(Boolean).pop() ?? "неизвестная ошибка";
-      return line.length > 220 ? line.slice(0, 220) + "…" : line;
-    };
+  /** Проверяется черновик указанного проекта, без изменения сохранённых настроек. */
+  private async testServer(msg: Extract<WebviewToHost, { type: "testServer" }>) {
     const report = (ok: boolean, message: string) =>
-      this.post({ type: "serverTestResult", ok, message });
-
-    const spawnRun = (
-      cmd: string,
-      args: string[],
-      opts?: { stdin?: string; env?: NodeJS.ProcessEnv },
-    ): Promise<{ code: number; out: string; err: string; timedOut: boolean }> =>
-      new Promise((resolve) => {
-        const child = spawn(cmd, args, { env: opts?.env ?? process.env });
-        let out = "";
-        let err = "";
-        let timedOut = false;
-        const timer = setTimeout(() => {
-          timedOut = true;
-          child.kill("SIGKILL");
-        }, 15000);
-        child.stdout.on("data", (d: Buffer) => (out += d.toString()));
-        child.stderr.on("data", (d: Buffer) => (err += d.toString()));
-        child.on("error", (e: Error) => {
-          clearTimeout(timer);
-          resolve({ code: 127, out, err: String(e), timedOut });
-        });
-        child.on("close", (code: number | null) => {
-          clearTimeout(timer);
-          resolve({ code: code ?? 1, out, err, timedOut });
-        });
-        if (opts?.stdin !== undefined) child.stdin.write(opts.stdin);
-        child.stdin.end();
+      this.post({
+        type: "serverTestResult", projectPath: msg.projectPath,
+        requestId: msg.requestId, ok, message,
       });
-
-    const project = this.getActiveProject();
-    const password =
-      formPassword ||
-      (project ? await this.context.secrets.get(this.passwordKey(project.path)) : undefined);
-
-    // ---------- FTP ----------
-    if (protocol === "ftp") {
-      const hostPort = `${host}:${port ?? 21}`;
-      const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-      const config = [
-        `url = "ftp://${hostPort}/"`,
-        `user = "${esc(user ?? "anonymous")}:${esc(password ?? "")}"`,
-        "list-only",
-        "connect-timeout = 8",
-        "silent",
-        "show-error",
-      ].join("\n");
-      const r = await spawnRun("curl", ["--max-time", "15", "-K", "-"], { stdin: config });
-      if (r.code === 0) {
-        const entries = r.out.split("\n").filter(Boolean).length;
-        report(true, `FTP ${hostPort} — соединение и логин OK (в корне записей: ${entries})`);
-      } else if (r.timedOut || r.code === 28) {
-        report(false, `FTP ${hostPort} — таймаут: хост недоступен или порт закрыт.`);
-      } else if (r.code === 67) {
-        report(false, `FTP ${hostPort} — сервер отверг логин/пароль.`);
-      } else if (r.code === 6 || r.code === 7) {
-        report(false, `FTP ${hostPort} — хост не найден или соединение отклонено.`);
-      } else {
-        report(false, `FTP ${hostPort} — ошибка: ${shortErr(r.err)}`);
-      }
+    const project = this.getProjects().find((p) => p.path === msg.projectPath);
+    if (!project) {
+      report(false, "Проект удалён или недоступен. Откройте настройки проекта заново.");
       return;
     }
-
-    // ---------- SSH / SFTP ----------
-    const isSftp = protocol === "sftp";
-    const portArgs = port ? (isSftp ? ["-P", String(port)] : ["-p", String(port)]) : [];
-    const commonOpts = [
-      "-o", "ConnectTimeout=8",
-      "-o", "StrictHostKeyChecking=accept-new",
-    ];
-    // Пробник ДОЛЖЕН быть переносимым: «&&» не понимает Windows PowerShell
-    // (шелл OpenSSH на Windows-серверах) — парсер падает с InvalidEndOfLine,
-    // маркер не печатается, и рабочий пароль выглядел как отказ. Поэтому
-    // маркер — одной командой (echo есть в sh, cmd и PowerShell), а ОС
-    // узнаём отдельным вызовом уже после успеха.
-    const probe = "echo AGENT_HUB_OK";
-
-    // ОС сервера: uname на Linux/BSD/macOS; на Windows его нет — распознаём по ошибке.
-    const osProbe = async (
-      run: (probeCmd: string) => Promise<{ code: number; out: string; err: string; timedOut: boolean }>,
-    ): Promise<string | undefined> => {
-      try {
-        const r = await run("uname -sr");
-        const line = r.out.split("\n").map((l) => l.trim()).filter(Boolean)[0];
-        if (r.code === 0 && line) return line;
-        if (/not recognized|CommandNotFoundException|не является внутренней/i.test(r.err + r.out)) {
-          return "Windows-сервер";
-        }
-      } catch {
-        // информация об ОС не критична
-      }
-      return undefined;
-    };
-
-    // 1) Ключи / алиас из ~/.ssh/config.
-    const key = isSftp
-      ? await spawnRun("sftp", ["-o", "BatchMode=yes", ...commonOpts, ...portArgs, "-b", "/dev/null", target])
-      : await spawnRun("ssh", ["-o", "BatchMode=yes", ...commonOpts, ...portArgs, target, probe]);
-    const keyOk = isSftp ? key.code === 0 : key.out.includes("AGENT_HUB_OK");
-    if (keyOk) {
-      const os = isSftp
-        ? undefined
-        : await osProbe((p) =>
-            spawnRun("ssh", ["-o", "BatchMode=yes", ...commonOpts, ...portArgs, target, p]),
-          );
-      report(true, `${protocol.toUpperCase()} ${target} — доступ по SSH-ключу${os ? ` · ${os}` : ""}`);
-      return;
-    }
-    if (key.timedOut) {
-      report(false, `${target} — таймаут соединения (8 с): хост недоступен или порт закрыт.`);
-      return;
-    }
-
-    // 2) Пароль через sshpass.
-    if (!password) {
-      report(false, `${target} — по ключу не подключилось: ${shortErr(key.err)}`);
-      return;
-    }
-    const which = await spawnRun("which", ["sshpass"]);
-    if (which.code !== 0) {
-      report(
-        false,
-        `${target} — ключи не сработали, а для проверки по паролю нужен sshpass ` +
-          `(brew install esolitos/ipa/sshpass). Надёжнее настроить SSH-ключи: ssh-copy-id ${target}`,
-      );
-      return;
-    }
-
-    const env = { ...process.env, SSHPASS: password };
-    const pw = isSftp
-      ? await spawnRun(
-          "sshpass",
-          ["-e", "sftp", "-o", "BatchMode=no", ...commonOpts, ...portArgs, "-b", "-", target],
-          { stdin: "bye\n", env },
-        )
-      : await spawnRun(
-          "sshpass",
-          [
-            "-e", "ssh",
-            ...commonOpts,
-            "-o", "PreferredAuthentications=password,keyboard-interactive",
-            ...portArgs,
-            target,
-            probe,
-          ],
-          { env },
-        );
-    const pwOk = isSftp ? pw.code === 0 : pw.out.includes("AGENT_HUB_OK");
-    if (pwOk) {
-      const os = isSftp
-        ? undefined
-        : await osProbe((p) =>
-            spawnRun(
-              "sshpass",
-              [
-                "-e", "ssh",
-                ...commonOpts,
-                "-o", "PreferredAuthentications=password,keyboard-interactive",
-                ...portArgs,
-                target,
-                p,
-              ],
-              { env },
-            ),
-          );
-      report(true, `${protocol.toUpperCase()} ${target} — доступ по паролю${os ? ` · ${os}` : ""}`);
-      return;
-    }
-    report(
-      false,
-      pw.timedOut
-        ? `${target} — таймаут при проверке по паролю.`
-        : `${target} — не подключилось по паролю: ${shortErr(pw.err)}`,
-    );
+    const savedPassword = msg.password === undefined
+      ? await this.context.secrets.get(this.passwordKey(project.path))
+      : msg.password;
+    const env = buildServerEnvironment(await this.getSecretEnv(project.path), savedPassword);
+    const result = await testServerConnection({
+      host: msg.host, user: msg.user, protocol: msg.protocol, port: msg.port,
+    }, env.AGENT_HUB_SERVER_PASSWORD);
+    report(result.ok, result.message);
   }
 
   // ---------- Автокоммит изменений агента ----------
@@ -1415,7 +1256,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this.context.secrets.store(this.passwordKey(pick.path), password);
       void vscode.window.showInformationMessage("Пароль сохранён в защищённом хранилище.");
     } else {
-      await this.context.secrets.delete(this.passwordKey(pick.path));
+      // Empty override also suppresses older password aliases in project env.
+      await this.context.secrets.store(this.passwordKey(pick.path), "");
       void vscode.window.showInformationMessage("Сохранённый пароль удалён.");
     }
   }
@@ -1576,8 +1418,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /** Карточка проекта для контекста новой сессии. */
-  private async buildProjectCard(p: ProjectInfo): Promise<string> {
+  /** Актуальные настройки проекта; значения секретов в контекст не попадают. */
+  private async buildProjectCard(p: ProjectInfo, serverEnv?: Record<string, string>): Promise<string> {
     const lines = [`Ты работаешь над проектом «${p.name}».`, `Рабочая папка: ${p.path}`];
     if (p.githubRepo) lines.push(`GitHub-репозиторий проекта: ${p.githubRepo}`);
     if (p.branch) {
@@ -1588,10 +1430,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (p.serverHost) {
       const proto = p.serverProtocol ?? "ssh";
       const target = p.serverUser ? `${p.serverUser}@${p.serverHost}` : p.serverHost;
-      const hasPassword = Boolean(await this.context.secrets.get(this.passwordKey(p.path)));
+      const env = serverEnv ?? buildServerEnvironment(
+        await this.getSecretEnv(p.path),
+        await this.context.secrets.get(this.passwordKey(p.path)),
+      );
+      const hasPassword = Boolean(env.AGENT_HUB_SERVER_PASSWORD);
       const passwordNote =
-        "Пароль доступен в переменных окружения AGENT_HUB_SERVER_PASSWORD и LFTP_PASSWORD — " +
-        "в текст диалога его никогда не выводи; sshpass -e и lftp --env-password берут его из окружения сами.";
+        "Текущий пароль передан в SSHPASS, AGENT_HUB_SERVER_PASSWORD и LFTP_PASSWORD. " +
+        "sshpass -e читает SSHPASS; lftp --env-password читает LFTP_PASSWORD. " +
+        "Не выводи значения в диалог, логи, файлы или аргументы команд. " +
+        "Используй окружение текущего процесса, не копируй пароль из старых сообщений или shell-настроек.";
 
       if (proto === "ssh") {
         const portFlag = p.serverPort ? ` -p ${p.serverPort}` : "";
@@ -1618,9 +1466,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         lines.push(`Сервер проекта: FTP ${hostPort}, логин ${p.serverUser ?? "anonymous"}.`);
         lines.push(
           (hasPassword ? `${passwordNote} ` : "") +
-            `Работай через curl: скачать — curl --user '${p.serverUser ?? "anonymous"}:'"$AGENT_HUB_SERVER_PASSWORD" ftp://${hostPort}/путь -o файл; ` +
-            `залить — curl -T файл --user '${p.serverUser ?? "anonymous"}:'"$AGENT_HUB_SERVER_PASSWORD" ftp://${hostPort}/папка/; ` +
-            `листинг — тот же curl без -o/-T. Либо lftp --env-password -u ${p.serverUser ?? "anonymous"} ftp://${hostPort}.`,
+            `Подключение: lftp --env-password -u ${p.serverUser ?? "anonymous"} ftp://${hostPort}. ` +
+            `Для curl передавай логин и пароль через экранированный конфиг на stdin (-K -), ` +
+            `не подставляй пароль в аргументы команд.`,
         );
       }
     }
@@ -1811,9 +1659,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async buildSettingsSnapshot(): Promise<import("./shared/protocol").SettingsSnapshot> {
     const cfg = vscode.workspace.getConfiguration("agentHub");
     const project = this.getActiveProject();
-    const hasPassword = project
-      ? (await this.context.secrets.get(this.passwordKey(project.path))) !== undefined
-      : false;
+    const hasPassword = project ? Boolean(buildServerEnvironment(
+      await this.getSecretEnv(project.path),
+      await this.context.secrets.get(this.passwordKey(project.path)),
+    ).AGENT_HUB_SERVER_PASSWORD) : false;
     return {
       claude: {
         model: cfg.get<string>("claude.model", ""),
@@ -1890,7 +1739,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (s.newPassword) {
           await this.context.secrets.store(this.passwordKey(s.project.path), s.newPassword);
         } else {
-          await this.context.secrets.delete(this.passwordKey(s.project.path));
+          // Preserve the explicit removal across turns instead of reviving an env alias.
+          await this.context.secrets.store(this.passwordKey(s.project.path), "");
         }
       }
     }
@@ -2787,7 +2637,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.exportSettings();
         break;
       case "testServer":
-        await this.testServer(msg.host, msg.user, msg.password, msg.protocol, msg.port);
+        await this.testServer(msg);
         break;
       case "importSettings":
         await this.importSettings();
@@ -2832,7 +2682,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const pending = this.pendingPermissions.get(msg.requestId);
         if (pending) {
           this.pendingPermissions.delete(msg.requestId);
-          pending.resolve({ allow: msg.allow, answer: msg.answer });
+          await pending.resolve({ allow: msg.allow, answer: msg.answer });
         }
         break;
       }
@@ -2919,15 +2769,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return out;
   }
 
+  private isQuestionOriginCurrent(cwd: string, agent: AgentId, origin: QuestionOrigin): boolean {
+    if (!this.getProjects().some((project) => project.path === cwd)) return false;
+    const current = this.getActiveRecord(cwd);
+    return !!current && current.id === origin.recordId && current.createdAt === origin.createdAt &&
+      current.agentIds[agent] === origin.sessionId;
+  }
+
+  private reportExpiredQuestion(cwd: string) {
+    this.postScoped(cwd, {
+      type: "info",
+      text: "Ответ относится к прежней сессии или удалённому проекту и устарел. Он не отправлен; задайте сообщение в нужной сессии заново.",
+    });
+  }
+
   /** Ход после завершения текущего (или сразу, если проект свободен). */
-  private deferTurn(cwd: string, agent: AgentId, prompt: string) {
+  private deferTurn(cwd: string, agent: AgentId, prompt: string, questionOrigin?: QuestionOrigin) {
+    if (questionOrigin && !this.isQuestionOriginCurrent(cwd, agent, questionOrigin)) {
+      this.reportExpiredQuestion(cwd);
+      return false;
+    }
     if (this.runs.has(cwd)) {
       const list = this.deferred.get(cwd) ?? [];
-      list.push({ prompt, agent });
+      list.push({ prompt, agent, questionOrigin });
       this.deferred.set(cwd, list);
-      return;
+      return true;
     }
-    void this.runTurn(prompt, agent, [], cwd, true);
+    void this.runTurn(prompt, agent, [], cwd, true, questionOrigin);
+    return true;
   }
 
   // ---------- Мобильный доступ (удалённый клиент) ----------
@@ -3128,6 +2997,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     attachments: Attachment[] = [],
     targetPath?: string,
     echoUser = false,
+    expectedQuestionOrigin?: QuestionOrigin,
   ) {
     const project = targetPath
       ? (this.getProjects().find((p) => p.path === targetPath) ?? null)
@@ -3142,6 +3012,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const cwd = project.path;
+    if (expectedQuestionOrigin && !this.isQuestionOriginCurrent(cwd, agent, expectedQuestionOrigin)) {
+      this.reportExpiredQuestion(cwd);
+      return;
+    }
     if (this.runs.has(cwd)) {
       this.postScoped(cwd, {
         type: "error",
@@ -3158,10 +3032,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // сохранялось в «активный» проект хоста) копируем сюда, чтобы агент не
     // ходил в чужую папку и не узнавал о другом проекте.
     attachments = await this.relocateAttachments(cwd, attachments);
+    if (expectedQuestionOrigin && (this.runs.has(cwd) ||
+      !this.isQuestionOriginCurrent(cwd, agent, expectedQuestionOrigin))) {
+      this.reportExpiredQuestion(cwd);
+      return;
+    }
 
     const controller = new AbortController();
     this.runs.set(cwd, controller);
-    if (echoUser) {
+    const discardStaleQuestion = () => {
+      if (!expectedQuestionOrigin || (!controller.signal.aborted &&
+        this.runs.get(cwd) === controller &&
+        this.isQuestionOriginCurrent(cwd, agent, expectedQuestionOrigin))) return false;
+      if (this.runs.get(cwd) === controller) {
+        this.runs.delete(cwd);
+        this.postScoped(cwd, { type: "busy", value: false });
+      }
+      this.reportExpiredQuestion(cwd);
+      return true;
+    };
+    if (echoUser && !expectedQuestionOrigin) {
       // Пузырь пользователя рассылает хост — обе поверхности видят одно и то же.
       this.postScoped(cwd, {
         type: "userMessage",
@@ -3175,6 +3065,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Перед изменениями — актуальная версия: подтягиваем новые коммиты,
     // чтобы агент (и журнал сессий) работали поверх свежего кода.
     await this.autoPull(cwd);
+    if (discardStaleQuestion()) return;
 
     // Slash-команды: Claude Code исполняет их сам, но промпт обязан НАЧИНАТЬСЯ
     // с «/» — никаких префиксов. Codex exec команды не понимает — кастомный
@@ -3203,6 +3094,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     // Новая сессия — карточка проекта + контекст из журнала (общая память).
     const record = await this.ensureActiveRecord(cwd);
+    if (discardStaleQuestion()) return;
     const sessions = record.agentIds;
 
     // Контекст между агентами: лента чата общая, а CLI-сессии раздельные.
@@ -3219,15 +3111,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
+    // Один снимок секретов для карточки и процесса, включая resumed-сессии.
+    const serverEnv = buildServerEnvironment(
+      await this.getSecretEnv(project.path),
+      await this.context.secrets.get(this.passwordKey(project.path)),
+    );
+    if (discardStaleQuestion()) return;
+    const projectCard = isSlashCommand ? "" : await this.buildProjectCard(project, serverEnv);
+    if (discardStaleQuestion()) return;
     let fullPrompt = promptWithAttachments;
     if (!sessions[agent] && !isSlashCommand) {
       const cfg = vscode.workspace.getConfiguration("agentHub");
-      const parts: string[] = [await this.buildProjectCard(project)];
+      const parts: string[] = [projectCard];
       const journalContext = await readJournalContext(
         cwd,
         cfg.get<string>("journalDir", "docs/journal"),
         cfg.get<number>("journalContextEntries", 3),
       );
+      if (discardStaleQuestion()) return;
       if (journalContext) {
         parts.push(journalContext);
         this.postScoped(cwd, { type: "info", text: "В контекст добавлены записи журнала сессий." });
@@ -3239,28 +3140,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       fullPrompt = `${crossContext.block}\n\nНовое сообщение пользователя:\n${promptWithAttachments}`;
     }
 
-    // Пароль сервера и доступы — только через окружение, никогда в тексте диалога.
-    const serverPassword = await this.context.secrets.get(this.passwordKey(project.path));
-    const secretEnv = await this.getSecretEnv(project.path);
+    if (sessions[agent] && !isSlashCommand) {
+      fullPrompt = `Актуальные настройки проекта для этого хода (заменяют прежние):\n${projectCard}\n\n${fullPrompt}`;
+    }
 
     // Копим ответ агента для общего лога беседы (Claude — дельтами,
     // Codex и slash-вывод — целыми сообщениями).
     let answerBuf = "";
     let delivered = false;
     let turnSucceeded = false;
-    let nextDeferred: { prompt: string; agent: AgentId } | undefined;
+    let nextDeferred: DeferredTurn | undefined;
+    let currentSessionId = sessions[agent];
+    const questionAnswers: string[] = [];
+    let turnLogDone: Promise<void> | null = null;
 
     // Мутации привязаны к записи хода: пока ход шёл, «Новая сессия» могла
     // переключить активную запись или переиспользовать эту же (тот же id,
     // но новый createdAt) — данные хода в чужую/очищенную запись не пишем.
     const recordGen = record.createdAt;
+    let questionPreparation = !!expectedQuestionOrigin;
     const mutateTurnRecord = (fn: (rec: SessionRecord) => void) =>
       this.mutateRecord(cwd, record.id, (r) => {
         if (r.createdAt !== recordGen) return;
+        if (questionPreparation && expectedQuestionOrigin && (controller.signal.aborted ||
+          this.runs.get(cwd) !== controller ||
+          !this.isQuestionOriginCurrent(cwd, agent, expectedQuestionOrigin))) return;
         fn(r);
       });
 
     // Точный промпт хода — для просмотрщика контекста («🧠 что видит агент»).
+    if (discardStaleQuestion()) return;
     await mutateTurnRecord((r) => {
       r.lastPrompts = {
         ...r.lastPrompts,
@@ -3271,7 +3180,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       };
     });
 
+    if (discardStaleQuestion()) return;
     try {
+      if (echoUser && expectedQuestionOrigin) {
+        this.postScoped(cwd, {
+          type: "userMessage", text: prompt,
+          attachments: attachments.length ? attachments.map((a) => a.name) : undefined,
+        });
+      }
+      questionPreparation = false;
       const backend =
         agent === "codex" &&
         vscode.workspace.getConfiguration("agentHub.codex").get<string>("transport", "appServer") ===
@@ -3287,12 +3204,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         steer,
         refreshModels: agent === "claude" && this.claudeModelsStale(),
         cliPath: agent === "claude" ? this.resolveClaudeCli() : undefined,
-        extraEnv: {
-          ...secretEnv,
-          ...(serverPassword
-            ? { AGENT_HUB_SERVER_PASSWORD: serverPassword, LFTP_PASSWORD: serverPassword }
-            : {}),
-        },
+        extraEnv: serverEnv,
         config: this.buildAgentConfig(agent, record.modelOverrides?.[agent]),
         attachments: attachments.map((a) => ({ path: a.path, isImage: isImagePath(a.path) })),
         confirmTool: (toolName, input) => this.confirmTool(toolName, input, cwd),
@@ -3305,6 +3217,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       for await (const ev of events) {
         switch (ev.kind) {
           case "session":
+            currentSessionId = ev.sessionId;
             delivered = true;
             await mutateTurnRecord((r) => {
               r.agentIds[agent] = ev.sessionId;
@@ -3328,11 +3241,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             await this.context.globalState.update(CLAUDE_MODELS_AT_KEY, Date.now());
             break;
           case "question": {
-            // Codex спросил через request_user_input, но в exec-режиме ответа не
-            // ждёт: показываем карточку с вариантами, ответ уйдёт следующим ходом.
+            // Это асинхронный вопрос из agentMessage, не ожидающий RPC ответа.
+            // Настоящие request_user_input проходят только через confirmTool.
             delivered = true;
+            const origin: QuestionOrigin = {
+              recordId: record.id, createdAt: recordGen, sessionId: currentSessionId,
+            };
+            const questionNonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
             for (const [i, q] of ev.questions.entries()) {
-              const requestId = `codexq-${ev.id || Date.now()}-${i}`;
+              const requestId = `codexq-${ev.id || "question"}-${questionNonce}-${i}`;
               this.postScoped(cwd, {
                 type: "permissionRequest",
                 requestId,
@@ -3344,20 +3261,61 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               });
               this.pendingPermissions.set(requestId, {
                 path: cwd,
-                resolve: (res) => {
-                  if (!res.answer) return;
-                  this.deferTurn(
-                    cwd,
-                    agent,
-                    `Ответ на твой вопрос «${q.title.slice(0, 160)}»: ${res.answer}`,
-                  );
+                resolve: async (res) => {
+                  if (!res.answer?.trim()) return;
+                  if (!this.isQuestionOriginCurrent(cwd, agent, origin)) {
+                    this.reportExpiredQuestion(cwd);
+                    return;
+                  }
+                  const text = `Ответ на твой вопрос «${q.title.slice(0, 160)}»: ${res.answer}`;
+                  const handler = this.runs.get(cwd) === controller &&
+                    !controller.signal.aborted && this.steers.get(cwd) === steer ? steer.handler : undefined;
+                  if (!handler) {
+                    if (this.deferTurn(cwd, agent, text, origin)) {
+                      this.postScoped(cwd, { type: "info", text: "Живой канал исходного хода недоступен. Ответ отправится отдельным ходом в этой же сессии." });
+                    }
+                    return;
+                  }
+                  try {
+                    await handler(text, "next");
+                  } catch (err) {
+                    const message = err instanceof Error ? err.message : String(err);
+                    if (!this.isQuestionOriginCurrent(cwd, agent, origin)) return;
+                    // Только явный отказ до отправки допускает повторный ход.
+                    // Неизвестная ошибка связи могла произойти уже после приёма.
+                    if (/^ход уже заверш[её]н$/i.test(message) && !controller.signal.aborted) {
+                      if (this.deferTurn(cwd, agent, text, origin)) {
+                        this.postScoped(cwd, { type: "info", text: "Исходный ход уже завершён. Ответ отправится отдельным ходом в этой же сессии." });
+                      }
+                    } else {
+                      this.postScoped(cwd, {
+                        type: "info",
+                        text: "Доставка ответа не подтверждена. Автоматический повтор отключён, чтобы не отправить ответ дважды. При необходимости уточните у агента вручную.",
+                      });
+                    }
+                    return;
+                  }
+                  if (this.isQuestionOriginCurrent(cwd, agent, origin)) {
+                    this.postScoped(cwd, { type: "userMessage", text });
+                    this.postScoped(cwd, { type: "info", text: "Ответ передан агенту в текущий ход." });
+                  }
+                  if (turnLogDone) {
+                    // ACK мог прийти после финального лога и начала нового хода.
+                    // Пишем только в исходную запись, не в общий steerTexts map.
+                    await turnLogDone;
+                    await mutateTurnRecord((r) => {
+                      (r.chatLog ??= []).push({ agent, role: "user", text: clipLog(text) });
+                    });
+                  } else {
+                    questionAnswers.push(text);
+                  }
                 },
               });
               answerBuf = answerBuf ? `${answerBuf}\n\n${q.title}` : q.title;
             }
             this.postScoped(cwd, {
               type: "info",
-              text: "Codex задал вопрос и продолжает работу, не дожидаясь ответа: выбранный вариант уйдёт ему следующим сообщением.",
+              text: "Агент задал вопрос и продолжает работу. Ответ будет передан в текущий ход, если транспорт принимает сообщения на лету; иначе — следующим ходом.",
             });
             this.revealUi();
             this.notifyBackgroundPermission(cwd, "Codex задаёт вопрос");
@@ -3420,7 +3378,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } finally {
       this.runs.delete(cwd);
       this.steers.delete(cwd);
-      const steered = this.steerTexts.get(cwd) ?? [];
+      const steered = [...(this.steerTexts.get(cwd) ?? []), ...questionAnswers];
       this.steerTexts.delete(cwd);
       // Общий лог беседы — зеркало видимой ленты: из него другой агент получит
       // контекст. Отметку «видел до сих пор» двигаем, только если промпт реально
@@ -3428,7 +3386,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const answer = answerBuf.trim();
       // Вложения — частью записи: другой агент должен видеть пути файлов.
       const logUserText = attachBlock ? `${prompt}\n\n${attachBlock}` : prompt;
-      await mutateTurnRecord((r) => {
+      turnLogDone = mutateTurnRecord((r) => {
         const log = (r.chatLog ??= []);
         if (echoUser) log.push({ agent, role: "user", text: clipLog(logUserText) });
         for (const t of steered) log.push({ agent, role: "user", text: clipLog(t) });
@@ -3444,13 +3402,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         r.chatSeen = seen;
       });
+      await turnLogDone;
       // Отложенный ход (ответ на вопрос Codex) — без промежуточного busy:false,
       // иначе очередь webview стартует параллельно и упрётся в «агент работает».
-      nextDeferred = this.deferred.get(cwd)?.shift();
+      for (;;) {
+        nextDeferred = this.deferred.get(cwd)?.shift();
+        if (!nextDeferred?.questionOrigin ||
+          this.isQuestionOriginCurrent(cwd, nextDeferred.agent, nextDeferred.questionOrigin)) break;
+        this.reportExpiredQuestion(cwd);
+      }
       if (!nextDeferred) this.postScoped(cwd, { type: "busy", value: false });
     }
     if (nextDeferred) {
-      await this.runTurn(nextDeferred.prompt, nextDeferred.agent, [], cwd, true);
+      await this.runTurn(nextDeferred.prompt, nextDeferred.agent, [], cwd, true, nextDeferred.questionOrigin);
     }
   }
 

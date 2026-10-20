@@ -18,6 +18,11 @@ import type {
   WebviewToHost,
 } from "../src/shared/protocol";
 
+import {
+  beginServerTest, finishServerTest, idleServerTest, reconcileServerTest, serverTestFingerprint,
+  type ServerTestDraft, type ServerTestState,
+} from "./serverTestState";
+
 declare function acquireVsCodeApi(): { postMessage(msg: WebviewToHost): void };
 const vscode = acquireVsCodeApi();
 /** Мобильный клиент (страница из remoteServer): без нативных диалогов VS Code. */
@@ -217,10 +222,28 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [form, setForm] = useState<SettingsSnapshot | null>(null);
   const [newPassword, setNewPassword] = useState<string | undefined>(undefined);
-  const [serverTest, setServerTest] = useState<{
-    status: "idle" | "pending" | "ok" | "fail";
-    message: string;
-  }>({ status: "idle", message: "" });
+  const [serverTest, setServerTest] = useState<ServerTestState>(idleServerTest);
+  const serverTestRef = useRef(serverTest);
+  const serverDraft: ServerTestDraft | null = settingsOpen && form?.project ? {
+    projectPath: form.project.path,
+    host: form.project.serverHost ?? "",
+    user: form.project.serverUser,
+    password: newPassword,
+    protocol: form.project.serverProtocol ?? "ssh",
+    port: form.project.serverPort,
+  } : null;
+  const serverDraftRef = useRef(serverDraft);
+  serverDraftRef.current = serverDraft;
+  const updateServerTest = useCallback((state: ServerTestState) => {
+    serverTestRef.current = state;
+    setServerTest(state);
+  }, []);
+  const clearServerTest = useCallback(() => updateServerTest(idleServerTest()), [updateServerTest]);
+  const serverDraftKey = serverTestFingerprint(serverDraft);
+  const visibleServerTest = reconcileServerTest(serverTest, serverDraft);
+  useEffect(() => {
+    updateServerTest(reconcileServerTest(serverTestRef.current, serverDraftRef.current));
+  }, [serverDraftKey, updateServerTest]);
   const [configJson, setConfigJson] = useState("");
   const [configResult, setConfigResult] = useState<{ ok: boolean; message: string } | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -434,6 +457,7 @@ export function App() {
           break;
         case "projects": {
           setProjects(msg.projects);
+          if (msg.activePath !== activeRef.current) clearServerTest();
           setActivePath(msg.activePath);
           // Чистим состояние удалённых проектов, чтобы их ленты/очереди
           // не жили вечно и не пересоздавали записи на хосте.
@@ -515,10 +539,10 @@ export function App() {
         case "settings":
           setForm(msg.settings);
           setNewPassword(undefined);
-          setServerTest({ status: "idle", message: "" });
+          clearServerTest();
           break;
         case "serverTestResult":
-          setServerTest({ status: msg.ok ? "ok" : "fail", message: msg.message });
+          updateServerTest(finishServerTest(serverTestRef.current, msg, serverDraftRef.current));
           break;
         case "configJson":
           setConfigJson(msg.json);
@@ -624,7 +648,7 @@ export function App() {
     window.addEventListener("message", onMessage);
     vscode.postMessage({ type: "ready" });
     return () => window.removeEventListener("message", onMessage);
-  }, [appendDelta, finalizeStreaming, mutateItems, dispatchSend]);
+  }, [appendDelta, finalizeStreaming, mutateItems, dispatchSend, clearServerTest, updateServerTest]);
 
   // Ленты сохраняются на хосте; шлём ТОЛЬКО изменившиеся (по ссылке) —
   // иначе фоновый стрим мог бы перезаписать только что переключённую сессию
@@ -803,6 +827,7 @@ export function App() {
       vscode.postMessage({ type: "manageProjects" });
       return;
     }
+    clearServerTest();
     setActivePath(value);
     vscode.postMessage({ type: "selectProject", path: value });
   };
@@ -829,6 +854,19 @@ export function App() {
       return copy;
     });
 
+  const upServer = (fn: (f: SettingsSnapshot) => void) => {
+    clearServerTest();
+    up(fn);
+  };
+  const changePassword = (value: string | undefined) => {
+    clearServerTest();
+    setNewPassword(value);
+  };
+  const closeSettings = () => {
+    clearServerTest();
+    setSettingsOpen(false);
+  };
+
   const num = (v: string, fallback: number) => {
     const n = parseInt(v, 10);
     return Number.isFinite(n) && n >= 0 ? n : fallback;
@@ -838,7 +876,7 @@ export function App() {
     return (
       <div className="app">
         <header className="topbar">
-          <button className="finish-btn" onClick={() => setSettingsOpen(false)}>
+          <button className="finish-btn" onClick={closeSettings}>
             ← Назад
           </button>
           <span className="session">Настройки Agent Hub</span>
@@ -910,7 +948,7 @@ export function App() {
                     <input
                       value={form.project.serverHost ?? ""}
                       placeholder="1.2.3.4 или SSH-алиас"
-                      onChange={(e) => up((f) => (f.project!.serverHost = e.target.value || undefined))}
+                      onChange={(e) => upServer((f) => (f.project!.serverHost = e.target.value || undefined))}
                     />
                   </label>
                   <label className="set-row">
@@ -918,7 +956,7 @@ export function App() {
                     <select
                       value={form.project.serverProtocol ?? "ssh"}
                       onChange={(e) =>
-                        up((f) => {
+                        upServer((f) => {
                           const v = e.target.value as "ssh" | "sftp" | "ftp";
                           f.project!.serverProtocol = v === "ssh" ? undefined : v;
                         })
@@ -936,7 +974,7 @@ export function App() {
                       value={form.project.serverPort ?? ""}
                       placeholder={form.project.serverProtocol === "ftp" ? "21" : "22"}
                       onChange={(e) =>
-                        up((f) => {
+                        upServer((f) => {
                           const n = parseInt(e.target.value, 10);
                           f.project!.serverPort =
                             Number.isFinite(n) && n >= 1 && n <= 65535 ? n : undefined;
@@ -949,7 +987,7 @@ export function App() {
                     <input
                       value={form.project.serverUser ?? ""}
                       placeholder="deploy"
-                      onChange={(e) => up((f) => (f.project!.serverUser = e.target.value || undefined))}
+                      onChange={(e) => upServer((f) => (f.project!.serverUser = e.target.value || undefined))}
                     />
                   </label>
                   <label className="set-row">
@@ -964,11 +1002,11 @@ export function App() {
                             ? "задан · пусто — не менять"
                             : "не задан"
                       }
-                      onChange={(e) => setNewPassword(e.target.value || undefined)}
+                      onChange={(e) => changePassword(e.target.value || undefined)}
                     />
                   </label>
                   {form.projectHasPassword && newPassword !== "" && (
-                    <button className="finish-btn set-inline" onClick={() => setNewPassword("")}>
+                    <button className="finish-btn set-inline" onClick={() => changePassword("")}>
                       Удалить сохранённый пароль
                     </button>
                   )}
@@ -999,27 +1037,27 @@ export function App() {
                   <div className="set-actions" style={{ paddingBottom: 0 }}>
                     <button
                       className="finish-btn"
-                      disabled={!form.project.serverHost || serverTest.status === "pending"}
-                      title="Пробуем подключение по выбранному протоколу"
+                      disabled={!form.project.serverHost || visibleServerTest.status === "pending"}
+                      title="Проверить текущие поля формы без сохранения настроек"
                       onClick={() => {
-                        setServerTest({ status: "pending", message: "" });
-                        vscode.postMessage({
-                          type: "testServer",
-                          host: form.project!.serverHost!,
-                          user: form.project!.serverUser,
-                          password: newPassword || undefined,
-                          protocol: form.project!.serverProtocol ?? "ssh",
-                          port: form.project!.serverPort,
-                        });
+                        if (!serverDraft) return;
+                        const requestId = globalThis.crypto?.randomUUID?.() ??
+                          `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+                        updateServerTest(beginServerTest(serverDraft, requestId));
+                        vscode.postMessage({ type: "testServer", ...serverDraft, requestId });
                       }}
                     >
-                      {serverTest.status === "pending" ? "⏳ Проверяю…" : "🔌 Проверить соединение"}
+                      {visibleServerTest.status === "pending" ? "⏳ Проверяю…" : "🔌 Проверить поля формы"}
                     </button>
                   </div>
-                  {serverTest.status === "ok" && <div className="test-ok">✓ {serverTest.message}</div>}
-                  {serverTest.status === "fail" && (
+                  <div className="set-hint">
+                    Проверяются текущие поля формы. Чтобы агент использовал эти настройки,
+                    нажмите «Сохранить».
+                  </div>
+                  {visibleServerTest.status === "ok" && <div className="test-ok">✓ {visibleServerTest.message}</div>}
+                  {visibleServerTest.status === "fail" && (
                     <div className="danger-hint" style={{ paddingLeft: 0 }}>
-                      ✗ {serverTest.message}
+                      ✗ {visibleServerTest.message}
                     </div>
                   )}
                   <div className="set-actions" style={{ paddingBottom: 0 }}>
@@ -1347,12 +1385,12 @@ export function App() {
                   onClick={() => {
                     vscode.postMessage({ type: "saveSettings", settings: { ...form, newPassword } });
                     setAutoScrollMode(form.autoScrollMode);
-                    setSettingsOpen(false);
+                    closeSettings();
                   }}
                 >
                   Сохранить
                 </button>
-                <button className="finish-btn" onClick={() => setSettingsOpen(false)}>
+                <button className="finish-btn" onClick={closeSettings}>
                   Отмена
                 </button>
               </div>
