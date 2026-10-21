@@ -14,6 +14,69 @@ export function buildServerEnvironment(secretEnv: Record<string, string>, passwo
   return { ...secretEnv, AGENT_HUB_SERVER_PASSWORD: selected, SSHPASS: selected, LFTP_PASSWORD: selected };
 }
 
+function validateConnection(connection: ServerConnection) {
+  if (!connection || typeof connection.host !== "string" || !connection.host || connection.host.length > 253) {
+    throw new Error("Некорректный хост сервера.");
+  }
+  const bracketed = connection.host.startsWith("[") && connection.host.endsWith("]");
+  const host = bracketed ? connection.host.slice(1, -1) : connection.host;
+  const ipv6 = isIP(host) === 6;
+  if ((bracketed && !ipv6) || (!ipv6 && !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host))) {
+    throw new Error("Некорректный хост сервера: укажите адрес или SSH-алиас без опций и пути.");
+  }
+  const user = connection.user;
+  if (user !== undefined && (typeof user !== "string" || (user !== "" && !/^[a-zA-Z0-9_][a-zA-Z0-9_.@\\-]*\$?$/.test(user)))) {
+    throw new Error("Некорректный логин сервера.");
+  }
+  const port = connection.port;
+  if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+    throw new Error("Некорректный порт сервера: число от 1 до 65535.");
+  }
+  const protocol = connection.protocol ?? "ssh";
+  if (protocol !== "ssh" && protocol !== "sftp" && protocol !== "ftp") throw new Error("Неизвестный протокол сервера.");
+  return { host, user, port, protocol, ipv6 };
+}
+
+/** Public connection parameters only: passwords are supplied to the process via env. */
+export function buildSshCommand(
+  connection: ServerConnection,
+  authentication: "password" | "key",
+  remoteCommand?: string,
+): { command: string; args: string[]; target: string } {
+  const { host, user, port, protocol, ipv6 } = validateConnection(connection);
+  if (protocol === "ftp") throw new Error("Эта команда поддерживает только SSH и SFTP.");
+  const isSftp = protocol === "sftp";
+  const targetHost = ipv6 && isSftp ? `[${host}]` : host;
+  const target = user ? `${user}@${targetHost}` : targetHost;
+  const withPassword = authentication === "password";
+  const auth = withPassword
+    ? ["BatchMode=no", "PreferredAuthentications=password,keyboard-interactive", "PubkeyAuthentication=no", "PasswordAuthentication=yes", "KbdInteractiveAuthentication=yes", "NumberOfPasswordPrompts=1"]
+    : ["BatchMode=yes", "PreferredAuthentications=publickey", "PasswordAuthentication=no", "KbdInteractiveAuthentication=no"];
+  const options = [
+    ...auth, "ConnectTimeout=8", "StrictHostKeyChecking=accept-new",
+    "ControlMaster=no", "ControlPath=none",
+  ].flatMap((option) => ["-o", option]);
+  // An absent port must retain Port from the user's SSH config/alias.
+  const portArgs = port !== undefined ? [isSftp ? "-P" : "-p", String(port)] : [];
+  const args = [...options, ...portArgs, ...(isSftp ? ["-b", "-"] : []), target,
+    ...(!isSftp && remoteCommand !== undefined ? [remoteCommand] : [])];
+  const binary = isSftp ? "sftp" : "ssh";
+  return withPassword
+    ? { command: "sshpass", args: ["-e", binary, ...args], target }
+    : { command: binary, args, target };
+}
+
+/** POSIX shell example for agent instructions; connection targets are always quoted. */
+export function formatSshCommand(
+  connection: ServerConnection,
+  authentication: "password" | "key",
+  remoteCommand?: string,
+): string {
+  const { command, args, target } = buildSshCommand(connection, authentication, remoteCommand);
+  const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  return [command, ...args.map((arg) => arg !== target && /^[a-zA-Z0-9_./:=,+-]+$/.test(arg) ? arg : quote(arg))].join(" ");
+}
+
 type ProbeResult = { code: number; out: string; err: string; timedOut: boolean; unavailable: boolean };
 
 function runProbe(command: string, args: string[], password?: string, stdin = ""): Promise<ProbeResult> {
@@ -57,25 +120,10 @@ export async function testServerConnection(
   password: string | undefined,
 ): Promise<{ ok: boolean; message: string }> {
   const fail = (message: string) => ({ ok: false, message });
-  if (!connection || typeof connection.host !== "string" || !connection.host || connection.host.length > 253) {
-    return fail("Некорректный хост сервера.");
-  }
-  const bracketed = connection.host.startsWith("[") && connection.host.endsWith("]");
-  const host = bracketed ? connection.host.slice(1, -1) : connection.host;
-  const ipv6 = isIP(host) === 6;
-  if ((bracketed && !ipv6) || (!ipv6 && !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host))) {
-    return fail("Некорректный хост сервера: укажите адрес или SSH-алиас без опций и пути.");
-  }
-  const user = connection.user;
-  if (user !== undefined && (typeof user !== "string" || (user !== "" && !/^[a-zA-Z0-9_][a-zA-Z0-9_.@\\-]*\$?$/.test(user)))) {
-    return fail("Некорректный логин сервера.");
-  }
-  const port = connection.port;
-  if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) {
-    return fail("Некорректный порт сервера: число от 1 до 65535.");
-  }
-  const protocol = connection.protocol ?? "ssh";
-  if (protocol !== "ssh" && protocol !== "sftp" && protocol !== "ftp") return fail("Неизвестный протокол сервера.");
+  let validated: ReturnType<typeof validateConnection>;
+  try { validated = validateConnection(connection); }
+  catch (error) { return fail(error instanceof Error ? error.message : "Некорректные настройки сервера."); }
+  const { host, user, port, protocol, ipv6 } = validated;
   if (password !== undefined && (typeof password !== "string" || password.includes("\0"))) return fail("Некорректный пароль сервера.");
 
   if (protocol === "ftp") {
@@ -97,22 +145,10 @@ export async function testServerConnection(
   }
 
   const isSftp = protocol === "sftp";
-  const targetHost = ipv6 && isSftp ? `[${host}]` : host;
-  const target = user ? `${user}@${targetHost}` : targetHost;
   const withPassword = Boolean(password);
-  const auth = withPassword
-    ? ["BatchMode=no", "PreferredAuthentications=password,keyboard-interactive", "PubkeyAuthentication=no", "PasswordAuthentication=yes", "KbdInteractiveAuthentication=yes", "NumberOfPasswordPrompts=1"]
-    : ["BatchMode=yes", "PreferredAuthentications=publickey", "PasswordAuthentication=no", "KbdInteractiveAuthentication=no"];
-  const options = [
-    ...auth, "ConnectTimeout=8", "StrictHostKeyChecking=accept-new",
-    "ControlMaster=no", "ControlPath=none",
-  ].flatMap((option) => ["-o", option]);
-  const portArgs = port !== undefined ? [isSftp ? "-P" : "-p", String(port)] : [];
-  const args = [...options, ...portArgs, ...(isSftp ? ["-b", "-"] : []), target, ...(isSftp ? [] : ["echo AGENT_HUB_OK"])];
+  const { command, args, target } = buildSshCommand(connection, withPassword ? "password" : "key", isSftp ? undefined : "echo AGENT_HUB_OK");
   const binary = isSftp ? "sftp" : "ssh";
-  const result = withPassword
-    ? await runProbe("sshpass", ["-e", binary, ...args], password, isSftp ? "bye\n" : "")
-    : await runProbe(binary, args, undefined, isSftp ? "bye\n" : "");
+  const result = await runProbe(command, args, withPassword ? password : undefined, isSftp ? "bye\n" : "");
   if (result.timedOut) return fail(`${target} — таймаут соединения: хост недоступен или порт закрыт.`);
   if (result.unavailable) return fail(withPassword ? "Для проверки по паролю нужны sshpass и SSH-клиент." : `Для проверки нужен ${binary}.`);
   const marker = result.out.split(/\r?\n/).some((line) => line.trim() === "AGENT_HUB_OK");

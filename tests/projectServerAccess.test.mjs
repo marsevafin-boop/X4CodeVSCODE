@@ -91,6 +91,61 @@ test("project card names SSHPASS and avoids implying a different env is read by 
   assert.equal(card.includes("password-b"), false);
 });
 
+for (const protocol of ["ssh", "sftp"]) {
+  for (const port of [undefined, 2222]) {
+    for (const password of ["fixture-command-password", ""]) {
+      test(`${protocol} card and built-in check share ${password ? "password" : "key"} options with ${port ?? "configured"} port`, async () => {
+        const p = provider();
+        const project = { ...b, serverProtocol: protocol, serverPort: port, serverUser: "DOMAIN\\service$" };
+        p.getProjects = () => [project];
+        const card = await p.buildProjectCard(project, { SSHPASS: password, AGENT_HUB_SERVER_PASSWORD: password, LFTP_PASSWORD: password });
+        await p.testServer(request({ protocol, port, user: project.serverUser, password }));
+        const attempt = harness.spawns[0];
+        assert.ok(attempt);
+        const command = card.split("\n").find((line) => line.startsWith("Подключение: "))?.slice("Подключение: ".length);
+        assert.ok(command, "card must contain the shared command example");
+        const actualOptions = [...command.matchAll(/-o (?:'([^']+)'|([^\s]+))/g)].map((m) => m[1] ?? m[2]);
+        const expectedOptions = attempt.args.flatMap((arg, index) => arg === "-o" ? [attempt.args[index + 1]] : []);
+        assert.deepEqual(actualOptions, expectedOptions);
+        const portFlag = protocol === "ssh" ? "-p" : "-P";
+        if (port !== undefined) {
+          assert.ok(command.includes(`${portFlag} ${port}`));
+          assert.equal(attempt.args[attempt.args.indexOf(portFlag) + 1], String(port));
+        } else {
+          assert.equal(command.includes(`${portFlag} `), false);
+          assert.equal(attempt.args.includes(portFlag), false);
+        }
+        assert.ok(command.includes("'DOMAIN\\service$@b.example'"), "Windows user target must be shell quoted");
+        assert.equal(card.includes("fixture-command-password"), false);
+        if (password) {
+          assert.ok(command.startsWith(`sshpass -e ${protocol} `));
+          assert.match(card, /встроенн.*проверк/iu);
+        } else {
+          assert.ok(command.startsWith(`${protocol} `));
+          assert.match(card, /пароль.*не задан/iu);
+          assert.match(card, /друг.*проект/iu);
+          assert.match(card, /SSHPASS.*пуст/iu);
+        }
+        if (protocol === "ssh") {
+          assert.ok(command.endsWith("'<команда>'"));
+          assert.equal(card.includes("AGENT_HUB_OK"), false);
+        } else {
+          assert.ok(command.includes("-b -"));
+          assert.match(card, /stdin/iu);
+        }
+      });
+    }
+  }
+}
+
+test("invalid SSH connection data cannot become a command example in the project card", async () => {
+  const p = provider();
+  const card = await p.buildProjectCard({ ...b, serverHost: "-oProxyCommand=fixture" });
+  assert.equal(card.includes("Подключение:"), false);
+  assert.match(card, /некорректн.*настройк/iu);
+  assert.equal(card.includes("ProxyCommand"), false);
+});
+
 test("FTP project instructions keep password out of command arguments", async () => {
   const p = provider(); const card = await p.buildProjectCard({ ...b, serverProtocol: "ftp" });
   assert.match(card, /lftp --env-password/);

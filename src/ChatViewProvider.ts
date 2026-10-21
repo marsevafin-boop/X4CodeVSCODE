@@ -18,7 +18,7 @@ import { CodexBackend, codexDefaultModel, killAllCodex } from "./agents/codexBac
 import { CodexAppServerBackend } from "./agents/codexAppServerBackend";
 import { CodexWriterRecoveryBackend } from "./agents/codexWriterRecovery";
 import { buildFinishPrompt, readJournalContext } from "./journal";
-import { buildServerEnvironment, testServerConnection } from "./serverConnection";
+import { buildServerEnvironment, formatSshCommand, testServerConnection } from "./serverConnection";
 import { isProjectId, projectKey } from "./shared/projectIdentity";
 import * as QRCode from "qrcode";
 import {
@@ -1514,26 +1514,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         "Не выводи значения в диалог, логи, файлы или аргументы команд. " +
         "Используй окружение текущего процесса, не копируй пароль из старых сообщений или shell-настроек.";
 
-      if (proto === "ssh") {
-        const portFlag = p.serverPort ? ` -p ${p.serverPort}` : "";
-        lines.push(`Сервер проекта: ${target}${p.serverPort ? `, порт ${p.serverPort}` : ""} (доступ по SSH).`);
-        if (hasPassword) {
-          lines.push(
-            `${passwordNote} Для ssh с паролем: sshpass -e ssh${portFlag} ${target} '<команда>'. ` +
-              `Если sshpass недоступен — предложи установить его или настроить SSH-ключи.`,
+      if (proto === "ssh" || proto === "sftp") {
+        try {
+          const command = formatSshCommand(
+            { host: p.serverHost, user: p.serverUser, protocol: proto, port: p.serverPort },
+            hasPassword ? "password" : "key",
+            proto === "ssh" ? "<команда>" : undefined,
           );
+          lines.push(
+            `Сервер проекта: ${proto.toUpperCase()} ${target}${p.serverPort ? `, порт ${p.serverPort}` : ""}.`,
+            hasPassword
+              ? passwordNote
+              : "В этом профиле пароль сервера не задан: SSHPASS, AGENT_HUB_SERVER_PASSWORD и LFTP_PASSWORD пусты. Используй SSH-ключи; не заимствуй пароль из другого проекта, старого диалога или shell-настроек.",
+            "Параметры команды совпадают со встроенной проверкой сервера. Сохраняй указанные параметры авторизации при проверке доступа.",
+            `Подключение: ${command}`,
+          );
+          if (proto === "sftp") {
+            lines.push("SFTP: батч-команды передавай через stdin (-b -). Shell-доступа может не быть — работай передачей файлов.");
+          }
+        } catch {
+          lines.push("Некорректные настройки SSH/SFTP: команда подключения не сформирована. Проверьте хост, логин и порт.");
         }
-      } else if (proto === "sftp") {
-        const portFlag = p.serverPort ? ` -P ${p.serverPort}` : "";
-        lines.push(
-          `Сервер проекта: SFTP ${target}${p.serverPort ? `, порт ${p.serverPort}` : ""}. ` +
-            `Shell-доступа может не быть — работай передачей файлов.`,
-        );
-        lines.push(
-          (hasPassword ? `${passwordNote} ` : "") +
-            `Подключение: sshpass -e sftp${portFlag} ${target} (батч-команды через -b) ` +
-            `или lftp --env-password -u ${p.serverUser ?? "user"} sftp://${p.serverHost}${p.serverPort ? `:${p.serverPort}` : ""}.`,
-        );
       } else {
         const hostPort = `${p.serverHost}${p.serverPort ? `:${p.serverPort}` : ""}`;
         lines.push(`Сервер проекта: FTP ${hostPort}, логин ${p.serverUser ?? "anonymous"}.`);

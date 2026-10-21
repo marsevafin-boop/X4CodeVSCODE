@@ -41,7 +41,7 @@ await build({
     }));
   } }],
 });
-const { testServerConnection, buildServerEnvironment } = await import(pathToFileURL(outfile).href);
+const { testServerConnection, buildServerEnvironment, buildSshCommand, formatSshCommand } = await import(pathToFileURL(outfile).href);
 const base = { host: "server.example", user: "deploy" };
 const fakePassword = "fixture-only-P@ss'\"\\word";
 function fixture(respond = (call) => finish(call, 0, "AGENT_HUB_OK\r\n")) {
@@ -53,6 +53,37 @@ function finish(call, code, out = "", err = "") {
   call.child.stderr.write(err);
   call.child.emit("close", code);
 }
+
+test("the shared builder exactly supplies SSH and SFTP probe arguments", async () => {
+  for (const protocol of ["ssh", "sftp"]) {
+    for (const port of [undefined, 2222]) {
+      for (const authentication of ["password", "key"]) {
+        const connection = { ...base, protocol, port };
+        const h = fixture();
+        const built = buildSshCommand(connection, authentication, protocol === "ssh" ? "echo AGENT_HUB_OK" : undefined);
+        await testServerConnection(connection, authentication === "password" ? fakePassword : undefined);
+        assert.equal(h.calls[0].command, built.command);
+        assert.deepEqual(h.calls[0].args, built.args);
+        assert.equal(Object.values(built).includes(fakePassword), false);
+      }
+    }
+  }
+});
+
+test("the formatter shell quotes Windows users and does not overwrite an SSH alias port", () => {
+  const command = formatSshCommand({ host: "my_ssh-alias", user: "DOMAIN\\service$" }, "password", "<команда>");
+  assert.ok(command.includes("'DOMAIN\\service$@my_ssh-alias'"));
+  assert.ok(command.endsWith("'<команда>'"));
+  assert.equal(command.includes("-p "), false);
+  assert.equal(command.includes("SSHPASS="), false);
+});
+
+test("the command builder rejects invalid connection data before formatting", () => {
+  for (const connection of [{ host: "-oProxyCommand=bad" }, { ...base, user: "bad user" }, { ...base, port: 0 }, { ...base, protocol: "ftp" }]) {
+    assert.throws(() => buildSshCommand(connection, "password"));
+    assert.throws(() => formatSshCommand(connection, "password"));
+  }
+});
 
 test("saved SSH password is checked directly through env, without key-first success", async () => {
   const h = fixture();
