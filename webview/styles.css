@@ -1231,3 +1231,71 @@ body.resizing-composer {
     grid-auto-rows: minmax(430px, auto);
   }
 }
+
+.proj-order {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 2px;
+}
+
+.proj-order .finish-btn {
+  padding: 3px 5px;
+}
+
+.project-drag-handle {
+  cursor: grab;
+}
+
+.project-drag-handle:active {
+  cursor: grabbing;
+}
+
+.proj-row.dragging {
+  opacity: 0.45;
+}
+
+.archive-project-details {
+  display: flex;
+  flex: 1 1 200px;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 6px 0;
+}
+
+.archive-path,
+.archive-origin {
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+}
+
+.archive-origin {
+  opacity: 0.65;
+}
+
+.multi-chat-grid[hidden] {
+  display: none;
+}
+
+.archived-chat-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  height: 100%;
+  padding: 20px;
+  text-align: center;
+}
+
+.archived-chat-placeholder > span {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  opacity: 0.7;
+  font-size: 0.85em;
+}
+
+.proj-order[hidden],
+.proj-actions[hidden] {
+  display: none;
+}

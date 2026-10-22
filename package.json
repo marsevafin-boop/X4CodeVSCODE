@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.57",
+  "version": "0.0.58",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -85,6 +85,11 @@
       {
         "command": "agentHub.importSettings",
         "title": "Agent Hub: Импорт настроек из JSON"
+      },
+      {
+        "command": "agentHub.showArchive",
+        "title": "Agent Hub: Архив проектов — восстановить",
+        "icon": "$(archive)"
       }
     ],
     "menus": {
@@ -184,6 +189,24 @@
                 "type": "string",
                 "pattern": "^project-[a-zA-Z0-9][a-zA-Z0-9_-]{0,119}$",
                 "description": "Стабильный идентификатор проекта. Создаётся автоматически; позволяет нескольким проектам использовать одну папку."
+              },
+              "archive": {
+                "type": "object",
+                "description": "Архив проекта: фактическая папка в Archive и дата переноса. Основной path сохраняет адрес восстановления.",
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "description": "Полный путь к папке в Archive"
+                  },
+                  "archivedAt": {
+                    "type": "number",
+                    "description": "Время архивирования в миллисекундах Unix"
+                  }
+                },
+                "required": [
+                  "path",
+                  "archivedAt"
+                ]
               }
             },
             "required": [

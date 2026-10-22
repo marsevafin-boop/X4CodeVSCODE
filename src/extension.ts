@@ -22,6 +22,7 @@ export function activate(context: vscode.ExtensionContext) {
       provider.deleteActiveProject(),
     ),
     vscode.commands.registerCommand("agentHub.manageProjects", () => provider.manageProjects()),
+    vscode.commands.registerCommand("agentHub.showArchive", () => provider.showArchive()),
     vscode.commands.registerCommand("agentHub.manageSecretEnv", () => provider.manageSecretEnv()),
     vscode.commands.registerCommand("agentHub.remoteAccess", () => provider.showRemoteAccess()),
     vscode.commands.registerCommand("agentHub.showContext", async () => {

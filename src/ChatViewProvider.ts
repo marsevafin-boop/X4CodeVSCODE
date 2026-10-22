@@ -20,6 +20,8 @@ import { CodexWriterRecoveryBackend } from "./agents/codexWriterRecovery";
 import { buildFinishPrompt, readJournalContext } from "./journal";
 import { buildServerEnvironment, formatSshCommand, testServerConnection } from "./serverConnection";
 import { isProjectId, projectKey } from "./shared/projectIdentity";
+import { directoriesOverlap, executeProjectMove, normalizeProjectArchive, pathEntryExists, planProjectMove, type ProjectMovePlan } from "./projectArchive";
+import { applyActiveProjectOrder, moveInProjectOrder, reconcileProjectOrder } from "./shared/projectOrder";
 import * as QRCode from "qrcode";
 import {
   RemoteServer,
@@ -34,6 +36,9 @@ const LEGACY_SESSIONS_KEY = "agentHub.sessions";
 const LEGACY_TRANSCRIPTS_KEY = "agentHub.transcripts";
 const STORE_KEY = "agentHub.sessionStore";
 const MULTI_CHATS_KEY = "agentHub.multiChats";
+const PROJECT_ORDER_KEY = "agentHub.projectOrder";
+const PROJECT_MOVE_KEY = "agentHub.pendingProjectMove";
+interface PendingProjectMove { plan: ProjectMovePlan; keys: string[]; nextProjects: ProjectInfo[]; }
 const MULTI_PREFERRED_AGENT_KEY = "agentHub.multiPreferredAgent";
 const ACTIVE_PROJECT_KEY = "agentHub.activeProject";
 const CLAUDE_COMMANDS_KEY = "agentHub.claudeCommands";
@@ -46,6 +51,11 @@ const REMOTE_TOKEN_KEY = "agentHub.remoteToken";
 const VSCODE_ONLY_ACTIONS = new Set<string>([
   "addProject",
   "deleteProject",
+  "archiveProject",
+  "restoreProject",
+  "showArchive",
+  "moveProject",
+  "reorderProjects",
   "manageProjects",
   "manageSecretEnv",
   "showContext",
@@ -75,7 +85,16 @@ function configuredProjectKey(project: ProjectInfo): string {
 
 /** Symlink aliases share the same writer/Git exclusion boundary. */
 function physicalDirectory(path: string): string {
-  try { return fs.realpathSync(path); } catch { return nodePath.resolve(path); }
+  let current = nodePath.resolve(path);
+  const missing: string[] = [];
+  while (true) {
+    try { return nodePath.join(fs.realpathSync(current), ...missing); } catch {
+      const parent = nodePath.dirname(current);
+      if (parent === current) return nodePath.resolve(path);
+      missing.unshift(nodePath.basename(current));
+      current = parent;
+    }
+  }
 }
 /** Модель Claude из supportedModels SDK (кэш в globalState). */
 interface ClaudeModelInfo {
@@ -230,6 +249,7 @@ function normalizeProjects(raw: unknown[]): ProjectInfo[] {
       ...(isProjectId(p.id) ? { id: p.id } : {}),
       name: typeof p.name === "string" && p.name ? p.name : nodePath.basename(p.path),
       path: p.path,
+      ...(normalizeProjectArchive(expandProjectPath(p.path), p.archive) ? { archive: normalizeProjectArchive(expandProjectPath(p.path), p.archive) } : {}),
       ...(typeof p.githubRepo === "string" && p.githubRepo ? { githubRepo: p.githubRepo } : {}),
       ...(typeof p.branch === "string" && p.branch ? { branch: p.branch } : {}),
       ...(typeof p.serverHost === "string" && p.serverHost ? { serverHost: p.serverHost } : {}),
@@ -314,6 +334,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Shared cwd runs are permitted; overlap disables unsafe pull/auto-Git. */
   private directoryRuns = new Map<string, DirectoryRunGroup>();
   private sessionWriters = new Map<string, AbortController>();
+  /** Long copies run outside the mutation queue, but their directories cannot be moved. */
+  private folderCopyReservations = new Set<string>();
   /** Сообщения для транспорта без живого канала; вопросы привязаны к сессии. */
   private deferred = new Map<string, DeferredTurn[]>();
   /** Сервер мобильного доступа (третья поверхность рядом с сайдбаром и панелью). */
@@ -346,6 +368,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   constructor(private readonly context: vscode.ExtensionContext) {
+    void this.serializeMultiMutation(() => this.recoverPendingProjectMove());
     void this.syncRemoteServer();
     context.subscriptions.push(
       vscode.workspace.onDidChangeConfiguration((e) => {
@@ -368,8 +391,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // ---------- Проекты ----------
 
-  /** Реестр: настройки agentHub.projects + папки открытого workspace. */
-  private getProjects(): ProjectInfo[] {
+  /** Complete registry including archives; stable keys and original paths never change. */
+  private getAllProjects(): ProjectInfo[] {
     const cfg = vscode.workspace.getConfiguration("agentHub");
     const configured = cfg.get<ProjectInfo[]>("projects", []) ?? [];
     const projects: ProjectInfo[] = [];
@@ -383,10 +406,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (seen.has(identity)) continue;
       seen.add(identity);
       configuredFolders.add(physicalDirectory(path));
+      const archive = normalizeProjectArchive(path, p.archive);
+      if (archive) configuredFolders.add(physicalDirectory(archive.path));
       projects.push({
         ...(isProjectId(p.id) ? { id: p.id } : {}),
         name: p.name || nodePath.basename(path),
         path,
+        ...(archive ? { archive } : {}),
         githubRepo: p.githubRepo,
         branch: p.branch,
         serverHost: p.serverHost,
@@ -406,7 +432,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         projects.push({ name: folder.name, path });
       }
     }
-    return projects;
+    const order = reconcileProjectOrder(projects.map(projectKey), this.context.globalState.get<string[]>(PROJECT_ORDER_KEY, []));
+    const byKey = new Map(projects.map((project) => [projectKey(project), project]));
+    return order.map((key) => byKey.get(key)!);
+  }
+
+  private getProjects(): ProjectInfo[] {
+    return this.getAllProjects().filter((project) => !project.archive);
+  }
+
+  private getArchivedProjects(): ProjectInfo[] {
+    return this.getAllProjects().filter((project) => !!project.archive);
   }
 
   private async setProjectHidden(path: string, hidden: boolean) {
@@ -421,10 +457,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    */
   async manageProjects(chatId?: string) {
     if (chatId && !this.findChatSlot(chatId)) return;
-    type Item = vscode.QuickPickItem & { path?: string; add?: boolean };
+    type Item = vscode.QuickPickItem & { path?: string; add?: boolean; archiveList?: boolean };
+    const archiveButton = { iconPath: new vscode.ThemeIcon("archive"), tooltip: "Архивировать проект вместе с папкой…" };
+    const deleteButton = { iconPath: new vscode.ThemeIcon("trash"), tooltip: "Удалить проект…" };
     const qp = vscode.window.createQuickPick<Item>();
     qp.title = "Проекты Agent Hub";
-    qp.placeholder = "Выберите проект, чтобы переключиться (корзинка у строки — удалить)";
+    qp.placeholder = "Выберите проект; кнопки у строки — архивировать или удалить";
     qp.ignoreFocusOut = true;
 
     const toItems = (): Item[] => {
@@ -444,9 +482,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             .filter(Boolean)
             .join(" · ") || undefined,
         path: projectKey(p),
-        buttons: [{ iconPath: new vscode.ThemeIcon("trash"), tooltip: "Удалить проект…" }],
+        buttons: [archiveButton, deleteButton],
       }));
       items.push({ label: "$(add) Добавить проект…", add: true });
+      items.push({ label: `$(archive) Архив проектов (${this.getArchivedProjects().length})…`, archiveList: true });
       return items;
     };
     qp.items = toItems();
@@ -458,7 +497,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (!e.item.path) return;
       deleting = true;
       try {
-        await this.deleteProject(e.item.path);
+        if (e.button === archiveButton) await this.archiveProject(e.item.path);
+        else if (e.button === deleteButton) await this.deleteProject(e.item.path);
       } finally {
         deleting = false;
       }
@@ -470,6 +510,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const picked = qp.selectedItems[0];
       qp.hide();
       if (!picked) return;
+      if (picked.archiveList) {
+        await this.showArchive();
+        return;
+      }
       if (picked.add) {
         await this.addProject();
         return;
@@ -478,8 +522,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (chatId) {
           await this.serializeMultiMutation(() => this.selectMultiChatProject(chatId, picked.path!));
         } else {
-          await this.setActivePath(picked.path);
-          this.postFullState();
+          await this.serializeMultiMutation(async () => {
+            if (!this.getProjects().some((entry) => projectKey(entry) === picked.path)) return;
+            await this.setActivePath(picked.path);
+            this.postFullState();
+          });
         }
       }
     });
@@ -647,7 +694,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       openLabel: "Выбрать папку проекта",
     });
     if (!picked?.[0]) return;
-    const path = picked[0].fsPath;
+    try {
+      await this.serializeMultiMutation(() => this.addPickedProject(picked[0].fsPath));
+    } catch (error) {
+      void vscode.window.showErrorMessage(`Не удалось добавить проект: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async addPickedProject(path: string) {
+    if (this.getArchivedProjects().some((entry) => physicalDirectory(entry.path) === physicalDirectory(path) ||
+        directoriesOverlap(entry.archive!.path, physicalDirectory(path)))) {
+      throw new Error("Эта папка находится в архиве. Сначала восстановите проект из архива.");
+    }
+    if (!fs.existsSync(path) || !fs.statSync(path).isDirectory()) throw new Error("Выбранная папка больше недоступна. Откройте выбор папки заново.");
     const projects = this.getProjects();
     // Явно добавленная папка workspace больше не считается скрытой.
     await this.setProjectHidden(path, false);
@@ -690,84 +749,300 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       `Создать ${mode} «${source.name}»?`,
       { modal: true, detail: copyFolder
         ? `Будет рекурсивно скопирована вся папка в соседнюю «${nodePath.basename(source.path)} (копия)». Пароль SSH и переменные окружения проекта также будут скопированы в отдельные записи хранилища.`
-        : `Новая запись будет использовать ту же папку, но получит собственную историю и отдельные копии пароля SSH и переменных окружения.` },
+        : "Новая запись будет использовать ту же папку, но получит собственную историю и отдельные копии пароля SSH и переменных окружения." },
       "Создать копию",
     );
     if (confirmed !== "Создать копию") return;
 
     let targetPath = source.path;
-    let targetName: string;
-    if (copyFolder) {
-      if (!fs.existsSync(source.path) || !fs.statSync(source.path).isDirectory()) {
-        void vscode.window.showErrorMessage("Не удалось скопировать проект: исходная папка недоступна.");
-        return;
-      }
-      const parent = nodePath.dirname(source.path);
-      const basename = nodePath.basename(source.path);
-      for (let suffix = 1; ; suffix++) {
-        const candidateName = suffix === 1 ? `${basename} (копия)` : `${basename} (копия ${suffix})`;
-        const candidate = nodePath.join(parent, candidateName);
-        if (!fs.existsSync(candidate)) {
-          targetName = candidateName;
-          targetPath = candidate;
-          break;
-        }
-      }
-    } else {
-      const names = new Set(this.getProjects().map((entry) => entry.name));
-      const baseName = `${source.name} (копия)`;
-      targetName = baseName;
-      for (let suffix = 2; names.has(targetName); suffix++) targetName = `${baseName} ${suffix}`;
-    }
-
     let copiedFolder = false;
     let targetKey: string | undefined;
     let profilePersisted = false;
+    let reserved: string[] = [];
     try {
+      const prepared = await this.serializeMultiMutation(async () => {
+        const current = this.getProjects().find((entry) => projectKey(entry) === path);
+        if (!current || current.path !== source.path) throw new Error("Исходный проект удалён, архивирован или перемещён. Повторите создание копии.");
+        if (this.context.globalState.get(PROJECT_MOVE_KEY)) throw new Error("Сначала завершите восстановление незавершённого перемещения проекта.");
+        if (!fs.existsSync(current.path) || !fs.statSync(current.path).isDirectory()) throw new Error("Исходная папка недоступна.");
+        if (copyFolder) {
+          const parent = nodePath.dirname(current.path);
+          const base = nodePath.basename(current.path);
+          const reservations = this.folderCopyReservations ??= new Set();
+          for (let suffix = 1; ; suffix++) {
+            const candidate = nodePath.join(parent, suffix === 1 ? `${base} (копия)` : `${base} (копия ${suffix})`);
+            if (!await pathEntryExists(candidate) && !reservations.has(physicalDirectory(candidate))) { targetPath = candidate; break; }
+          }
+          const candidates = [physicalDirectory(current.path), physicalDirectory(targetPath)];
+          // Release only reservations acquired by this copy, never another copy's source.
+          if (candidates.some((directory) => reservations.has(directory))) throw new Error("Эта папка уже копируется. Дождитесь завершения копирования.");
+          for (const directory of candidates) reservations.add(directory);
+          reserved = candidates;
+        }
+        return current;
+      });
       if (copyFolder) {
-        await fs.promises.cp(source.path, targetPath, { recursive: true, force: false, errorOnExist: true });
+        await fs.promises.cp(prepared.path, targetPath, { recursive: true, force: false, errorOnExist: true });
         copiedFolder = true;
       }
-      const profile: ProjectInfo = {
-        ...source,
-        id: `project-${randomUUID()}`,
-        name: copyFolder
-          ? (() => {
-              const names = new Set(this.getProjects().map((entry) => entry.name));
-              const base = `${source.name} (копия)`;
-              let candidate = base;
-              for (let suffix = 2; names.has(candidate); suffix++) candidate = `${base} ${suffix}`;
-              return candidate;
-            })()
-          : targetName!,
-        path: targetPath,
-      };
-      targetKey = projectKey(profile);
-      const password = await this.context.secrets.get(this.passwordKey(path));
-      const env = await this.context.secrets.get(this.secretEnvKey(path));
-      if (password !== undefined) await this.context.secrets.store(this.passwordKey(targetKey), password);
-      if (env !== undefined) await this.context.secrets.store(this.secretEnvKey(targetKey), env);
-      const cfg = vscode.workspace.getConfiguration("agentHub");
-      const configured = [...(cfg.get<ProjectInfo[]>("projects", []) ?? []), profile];
-      await cfg.update("projects", configured, vscode.ConfigurationTarget.Global);
-      profilePersisted = true;
-      await this.setActivePath(targetKey);
-      this.postFullState();
-      await this.postSettings();
-      this.post({ type: "info", text: `Копия проекта «${profile.name}» создана и выбрана.` });
+      await this.serializeMultiMutation(async () => {
+        const current = this.getProjects().find((entry) => projectKey(entry) === path);
+        if (!current || current.path !== prepared.path) throw new Error("Исходный проект изменился во время копирования. Копия не добавлена.");
+        const names = new Set(this.getAllProjects().map((entry) => entry.name));
+        const baseName = `${current.name} (копия)`;
+        let name = baseName;
+        for (let suffix = 2; names.has(name); suffix++) name = `${baseName} ${suffix}`;
+        const profile: ProjectInfo = { ...current, id: `project-${randomUUID()}`, name, path: targetPath };
+        targetKey = projectKey(profile);
+        const password = await this.context.secrets.get(this.passwordKey(path));
+        const env = await this.context.secrets.get(this.secretEnvKey(path));
+        if (password !== undefined) await this.context.secrets.store(this.passwordKey(targetKey), password);
+        if (env !== undefined) await this.context.secrets.store(this.secretEnvKey(targetKey), env);
+        const cfg = vscode.workspace.getConfiguration("agentHub");
+        const configured = [...(cfg.get<ProjectInfo[]>("projects", []) ?? []), profile];
+        await cfg.update("projects", configured, vscode.ConfigurationTarget.Global);
+        profilePersisted = true;
+        await this.setActivePath(targetKey);
+        this.postFullState();
+        await this.postSettings();
+        this.post({ type: "info", text: `Копия проекта «${profile.name}» создана и выбрана.` });
+      });
     } catch (err) {
       if (!profilePersisted) {
         if (targetKey) {
           try { await this.context.secrets.delete(this.passwordKey(targetKey)); } catch { /* best-effort cleanup */ }
           try { await this.context.secrets.delete(this.secretEnvKey(targetKey)); } catch { /* best-effort cleanup */ }
         }
-        if (copiedFolder) {
-          await fs.promises.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
+        if (copiedFolder) await fs.promises.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
+      }
+      void vscode.window.showErrorMessage(`Не удалось создать копию проекта: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      for (const directory of reserved) this.folderCopyReservations?.delete(directory);
+    }
+  }
+
+  /** Ordering changes broadcast registry rows without replaying chat transcripts. */
+  private postProjectRegistry() {
+    const projects = this.getProjects();
+    const archivedProjects = this.getArchivedProjects();
+    const active = this.getActiveProject();
+    this.post({ type: "projects", projects, archivedProjects, activePath: active ? projectKey(active) : "" });
+    this.postMultiBoardState();
+    for (const slot of this.getChatSlots()) {
+      this.postScoped(slot.projectPath, { type: "projects", projects, archivedProjects, activePath: slot.projectPath }, slot.chatId);
+    }
+  }
+
+  private async moveProject(path: string, direction: "up" | "down") {
+    const all = this.getAllProjects();
+    const activeKeys = this.getProjects().map(projectKey);
+    if (!activeKeys.includes(path) || (direction !== "up" && direction !== "down")) return;
+    const active = this.getActiveProject();
+    const next = moveInProjectOrder(all.map(projectKey), activeKeys, path, direction);
+    if (active) await this.setActivePath(projectKey(active));
+    await this.context.globalState.update(PROJECT_ORDER_KEY, next);
+    this.postProjectRegistry();
+  }
+
+  private async reorderProjects(paths: string[]) {
+    const allKeys = this.getAllProjects().map(projectKey);
+    const next = applyActiveProjectOrder(allKeys, this.getProjects().map(projectKey), paths);
+    if (!next) return;
+    const active = this.getActiveProject();
+    if (active) await this.setActivePath(projectKey(active));
+    await this.context.globalState.update(PROJECT_ORDER_KEY, next);
+    this.postProjectRegistry();
+  }
+
+  /** Original paths/keys stay stable so archived history and Keychain entries are preserved. */
+  async archiveProject(path: string) {
+    await this.changeProjectArchive(path, false);
+  }
+
+  async restoreProject(path: string) {
+    await this.changeProjectArchive(path, true);
+  }
+
+  async showArchive() {
+    const archived = this.getArchivedProjects();
+    if (!archived.length) {
+      void vscode.window.showInformationMessage("Архив проектов пуст.");
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(archived.map((project) => ({
+      label: project.name,
+      description: project.archive!.path,
+      detail: `Восстановить в ${project.path}`,
+      key: projectKey(project),
+    })), { title: "Архив проектов Agent Hub", placeHolder: "Выберите проект для восстановления" });
+    if (picked) await this.restoreProject(picked.key);
+  }
+
+  private archiveGroup(project: ProjectInfo): ProjectInfo[] {
+    const physical = physicalDirectory(project.archive?.path ?? project.path);
+    return this.getAllProjects().filter((entry) =>
+      physicalDirectory(entry.archive?.path ?? entry.path) === physical);
+  }
+
+  private assertArchiveMoveAllowed(project: ProjectInfo, group: ProjectInfo[], destination?: string) {
+    const source = physicalDirectory(project.archive?.path ?? project.path);
+    const affected = destination ? [source, physicalDirectory(destination)] : [source];
+    const overlaps = (directory: string) => affected.some((path) => directoriesOverlap(path, physicalDirectory(directory)));
+    if (new Set(group.map((entry) => nodePath.resolve(entry.path))).size !== 1 ||
+        group.some((entry) => !!entry.archive !== !!project.archive)) {
+      throw new Error("Эта папка зарегистрирована через разные пути или символические ссылки. Приведите профили к одному обычному пути перед архивированием.");
+    }
+    for (const directory of this.folderCopyReservations ?? []) {
+      if (overlaps(directory)) throw new Error("Папка сейчас копируется. Дождитесь завершения копирования перед перемещением.");
+    }
+    const keys = new Set(group.map(projectKey));
+    for (const entry of this.getAllProjects()) {
+      if (!keys.has(projectKey(entry)) && overlaps(entry.archive?.path ?? entry.path)) {
+        throw new Error(`Папка пересекается с другим проектом «${entry.name}»: ${entry.path}. Сначала уберите вложенный проект из реестра.`);
+      }
+    }
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+      if (overlaps(folder.uri.fsPath)) {
+        throw new Error(`Папка открыта в текущем workspace (${folder.uri.fsPath}). Сначала закройте её (File → Remove Folder from Workspace), затем повторите операцию.`);
+      }
+    }
+    for (const [directory, running] of this.directoryRuns ?? []) {
+      if (running.controllers.size && overlaps(directory)) {
+        throw new Error("В этой папке или вложенном проекте сейчас работает агент. Дождитесь завершения всех ходов перед перемещением.");
+      }
+    }
+    for (const [runKey] of this.runs) {
+      const slot = this.findChatSlot(runKey);
+      const key = slot?.projectPath ?? runKey;
+      const running = this.getAllProjects().find((entry) => projectKey(entry) === key);
+      if (keys.has(key) || (running && overlaps(running.archive?.path ?? running.path))) {
+        throw new Error("В этой папке сейчас работает агент. Дождитесь завершения всех ходов перед перемещением.");
+      }
+    }
+  }
+
+  private async changeProjectArchive(key: string, restoring: boolean) {
+    try {
+      const project = this.getAllProjects().find((entry) => projectKey(entry) === key);
+      if (!project || !!project.archive !== restoring) return;
+      const group = this.archiveGroup(project);
+      this.assertArchiveMoveAllowed(project, group);
+      const preview = await planProjectMove(project.path, project.archive);
+      this.assertArchiveMoveAllowed(project, group, preview.destination);
+      const action = restoring ? "Восстановить" : "Архивировать";
+      const detail = `${preview.source}\n→ ${preview.destination}\n\n` +
+        (group.length > 1 ? "Одну папку используют несколько профилей. Будут перемещены все:\n" : "Профиль проекта:\n") +
+        group.map((entry) => `• ${entry.name} — ${entry.path}`).join("\n") +
+        "\n\nПапка перемещается целиком, включая .git и скрытые файлы. История чатов и доступы сохраняются." +
+        "\nПеред перемещением закройте эту папку в других окнах VS Code и завершите агентов, запущенных вне этого окна.";
+      // Do not hold the mutation queue while a user decides in the native modal.
+      const choice = await vscode.window.showWarningMessage(`${action} проект «${project.name}»?`, { modal: true, detail }, action);
+      if (choice !== action) return;
+      await this.serializeMultiMutation(async () => {
+        if (this.context.globalState.get<PendingProjectMove | undefined>(PROJECT_MOVE_KEY)) {
+          throw new Error("Не завершено предыдущее перемещение проекта. Перезапустите окно VS Code для восстановления состояния.");
+        }
+        const current = this.getAllProjects().find((entry) => projectKey(entry) === key);
+        if (!current || !!current.archive !== restoring) return;
+        const currentGroup = this.archiveGroup(current);
+        if (group.map(projectKey).sort().join("\n") !== currentGroup.map(projectKey).sort().join("\n")) {
+          throw new Error("Список профилей этой папки изменился. Повторите операцию, чтобы подтвердить актуальный список.");
+        }
+        this.assertArchiveMoveAllowed(current, currentGroup);
+        const plan = await planProjectMove(current.path, current.archive);
+        this.assertArchiveMoveAllowed(current, currentGroup, plan.destination);
+        if (plan.source !== preview.source || plan.destination !== preview.destination) {
+          throw new Error("Адрес перемещения изменился. Повторите операцию для подтверждения нового адреса.");
+        }
+        const cfg = vscode.workspace.getConfiguration("agentHub");
+        const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
+        const activeBeforeMove = this.getActiveProject();
+        const keys = new Set(currentGroup.map(projectKey));
+        // Materialize implicit workspace profiles as well; identities remain unchanged.
+        for (const entry of currentGroup) {
+          if (!list.some((item) => configuredProjectKey(item) === projectKey(entry))) list.push(entry);
+        }
+        const nextProjects = list.map((entry) => {
+          if (!keys.has(configuredProjectKey(entry))) return entry;
+          const { archive: _oldArchive, ...active } = entry;
+          return restoring ? active : { ...active, archive: { path: plan.archivePath, archivedAt: Date.now() } };
+        });
+        // Persist intent before touching files. On extension-host interruption it can be reconciled.
+        const pending: PendingProjectMove = { plan, keys: [...keys], nextProjects };
+        await this.context.globalState.update(PROJECT_MOVE_KEY, pending);
+        try {
+          await executeProjectMove(plan, {
+            rename: async (source, destination) => { await vscode.workspace.fs.rename(vscode.Uri.file(source), vscode.Uri.file(destination), { overwrite: false }); },
+            persist: async () => { await cfg.update("projects", nextProjects, vscode.ConfigurationTarget.Global); },
+          });
+        } catch (error) {
+          if (await pathEntryExists(plan.source) && !await pathEntryExists(plan.destination)) {
+            await this.context.globalState.update(PROJECT_MOVE_KEY, undefined);
+          }
+          throw error;
+        }
+        // A failure to clear intent is safe: recovery sees that registry/files agree.
+        await Promise.resolve(this.context.globalState.update(PROJECT_MOVE_KEY, undefined)).catch(() => undefined);
+        if (!restoring && activeBeforeMove && keys.has(projectKey(activeBeforeMove))) {
+          const nextActive = this.getProjects()[0];
+          await this.setActivePath(nextActive ? projectKey(nextActive) : "");
+        }
+        this.postFullState();
+        await this.postSettings();
+        this.post({ type: "info", text: restoring
+          ? `Проект «${current.name}» восстановлен: ${plan.destination}`
+          : `Проект «${current.name}» перемещён в архив: ${plan.destination}` });
+      });
+    } catch (error) {
+      void vscode.window.showErrorMessage(`Перемещение проекта не выполнено: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /** Finish a rename interrupted between filesystem and configuration persistence. */
+  private async recoverPendingProjectMove() {
+    const pending = this.context.globalState.get<PendingProjectMove | undefined>(PROJECT_MOVE_KEY);
+    if (!pending) return;
+    try {
+      const { plan, keys, nextProjects } = pending;
+      if (!plan || !Array.isArray(keys) || !Array.isArray(nextProjects) ||
+          !normalizeProjectArchive(plan.originalPath, { path: plan.archivePath, archivedAt: 0 }) ||
+          plan.source !== (plan.restoring ? plan.archivePath : plan.originalPath) ||
+          plan.destination !== (plan.restoring ? plan.originalPath : plan.archivePath)) {
+        throw new Error("Некорректная запись незавершённого перемещения; требуется ручная проверка настроек.");
+      }
+      const sourceExists = await pathEntryExists(plan.source);
+      const destinationExists = await pathEntryExists(plan.destination);
+      if (sourceExists && !destinationExists) {
+        await this.context.globalState.update(PROJECT_MOVE_KEY, undefined);
+        return;
+      }
+      if (sourceExists || !destinationExists) throw new Error("Оба адреса заняты либо папка отсутствует по обоим адресам.");
+      const moved = await fs.promises.lstat(plan.destination);
+      if (!moved.isDirectory() || moved.isSymbolicLink()) throw new Error("На конечном адресе находится не обычная папка.");
+      const cfg = vscode.workspace.getConfiguration("agentHub");
+      const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
+      for (const key of keys) {
+        const expected = nextProjects.find((entry) => configuredProjectKey(entry) === key);
+        if (!expected || nodePath.resolve(expandProjectPath(expected.path)) !== plan.originalPath ||
+            (plan.restoring ? !!expected.archive : normalizeProjectArchive(expected.path, expected.archive)?.path !== plan.archivePath)) {
+          throw new Error("В журнале отсутствует корректный профиль перемещённой папки.");
+        }
+        const index = list.findIndex((entry) => configuredProjectKey(entry) === key);
+        if (index < 0) list.push(expected);
+        else {
+          if (nodePath.resolve(expandProjectPath(list[index].path)) !== plan.originalPath) {
+            throw new Error(`Адрес профиля «${list[index].name}» изменён после перемещения. Верните путь ${plan.originalPath} в настройках и перезапустите окно VS Code.`);
+          }
+          const { archive: _oldArchive, ...entry } = list[index];
+          list[index] = expected.archive ? { ...entry, archive: expected.archive } : entry;
         }
       }
-      void vscode.window.showErrorMessage(
-        `Не удалось создать копию проекта: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
+      await this.context.globalState.update(PROJECT_MOVE_KEY, undefined);
+      this.postFullState();
+    } catch (error) {
+      const plan = pending.plan;
+      void vscode.window.showErrorMessage(`Не удалось завершить перемещение проекта. Исходный адрес: ${plan?.source}; конечный адрес: ${plan?.destination}. Файлы не удалялись. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -825,82 +1100,118 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    // Останавливаем legacy run and every multi-chat slot bound to this profile.
-    this.runs.get(path)?.abort();
-    const removedChatIds = this.getChatSlots().filter((slot) => slot.projectPath === path).map((slot) => slot.chatId);
-    for (const chatId of removedChatIds) {
-      this.runs.get(chatId)?.abort();
-      this.denyAllPending(path, chatId);
-    }
-    if (removedChatIds.length) {
-      const removed = new Set(removedChatIds);
-      await this.saveChatSlots(this.getChatSlots().filter((slot) => !removed.has(slot.chatId)));
-    }
-    this.denyAllPending(path);
+    await this.serializeMultiMutation(async () => {
+      const current = this.getProjects().find((entry) => projectKey(entry) === path);
+      if (!current || current.path !== project.path) return;
+      if (this.context.globalState.get(PROJECT_MOVE_KEY)) {
+        void vscode.window.showErrorMessage("Сначала завершите восстановление незавершённого перемещения проекта.");
+        return;
+      }
+      if (choice === WITH_FOLDER && ((vscode.workspace.workspaceFolders ?? []).some((folder) =>
+          physicalDirectory(folder.uri.fsPath) === physicalDirectory(current.path)) ||
+          [...(this.folderCopyReservations ?? [])].some((directory) => directoriesOverlap(directory, physicalDirectory(current.path))))) {
+        void vscode.window.showErrorMessage("Папка открыта в workspace или сейчас копируется. Закройте папку и дождитесь завершения копирования.");
+        return;
+      }
+      if (choice === WITH_FOLDER && this.getAllProjects().some((entry) => projectKey(entry) !== path &&
+          directoriesOverlap(physicalDirectory(current.path), physicalDirectory(entry.archive?.path ?? entry.path)))) {
+        void vscode.window.showErrorMessage("Папка используется другим или вложенным проектом. Удаление с диска отменено.");
+        return;
+      }
+      // Останавливаем legacy run and every multi-chat slot bound to this profile.
+      this.runs.get(path)?.abort();
+      const removedChatIds = this.getChatSlots().filter((slot) => slot.projectPath === path).map((slot) => slot.chatId);
+      for (const chatId of removedChatIds) {
+        this.runs.get(chatId)?.abort();
+        this.denyAllPending(path, chatId);
+      }
+      if (removedChatIds.length) {
+        const removed = new Set(removedChatIds);
+        await this.saveChatSlots(this.getChatSlots().filter((slot) => !removed.has(slot.chatId)));
+      }
+      this.denyAllPending(path);
 
-    // Из реестра — в любом случае.
-    const cfg = vscode.workspace.getConfiguration("agentHub");
-    const list = (cfg.get<ProjectInfo[]>("projects", []) ?? []).filter(
-      (p) => configuredProjectKey(p) !== path,
-    );
-    await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
-    if (this.getActivePathRaw() === path) await this.setActivePath(undefined);
-    if (this.context.globalState.get<string>(ACTIVE_PROJECT_KEY) === path) {
-      await this.context.globalState.update(ACTIVE_PROJECT_KEY, undefined);
-    }
-    // Папка workspace иначе вернётся в список автоматически — помечаем скрытой.
-    if (isWorkspaceFolder) {
-      for (const folder of vscode.workspace.workspaceFolders ?? []) {
-        if (physicalDirectory(folder.uri.fsPath) === physicalDirectory(project.path)) {
-          await this.setProjectHidden(folder.uri.fsPath, true);
+      // Из реестра — в любом случае.
+      const cfg = vscode.workspace.getConfiguration("agentHub");
+      const list = (cfg.get<ProjectInfo[]>("projects", []) ?? []).filter(
+        (p) => configuredProjectKey(p) !== path,
+      );
+      await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
+      if (this.getActivePathRaw() === path) await this.setActivePath(undefined);
+      if (this.context.globalState.get<string>(ACTIVE_PROJECT_KEY) === path) {
+        await this.context.globalState.update(ACTIVE_PROJECT_KEY, undefined);
+      }
+      // Папка workspace иначе вернётся в список автоматически — помечаем скрытой.
+      if (isWorkspaceFolder) {
+        for (const folder of vscode.workspace.workspaceFolders ?? []) {
+          if (physicalDirectory(folder.uri.fsPath) === physicalDirectory(project.path)) {
+            await this.setProjectHidden(folder.uri.fsPath, true);
+          }
         }
       }
-    }
 
-    if (choice === WITH_FOLDER) {
-      // Пароль, доступы и историю сессий вычищаем вместе с папкой.
-      await this.context.secrets.delete(this.passwordKey(path));
-      await this.context.secrets.delete(this.secretEnvKey(path));
-      const all = { ...this.getStoreAll() };
-      delete all[path];
-      await this.context.globalState.update(STORE_KEY, all);
-      try {
-        // Registry/secrets writes above yield: another profile may have been
-        // created since confirmation. Keep its shared files intact.
-        if (this.getProjects().some((p) => projectKey(p) !== path &&
-            physicalDirectory(p.path) === physicalDirectory(project.path))) {
+      if (choice === WITH_FOLDER) {
+        // Пароль, доступы и историю сессий вычищаем вместе с папкой.
+        await this.context.secrets.delete(this.passwordKey(path));
+        await this.context.secrets.delete(this.secretEnvKey(path));
+        const all = { ...this.getStoreAll() };
+        delete all[path];
+        await this.context.globalState.update(STORE_KEY, all);
+        try {
+          // Registry/secrets writes above yield: another profile may have been
+          // created since confirmation. Keep its shared files intact.
+          if (this.getProjects().some((p) => projectKey(p) !== path &&
+              physicalDirectory(p.path) === physicalDirectory(project.path))) {
+            this.abortOrphanRuns();
+            this.postFullState();
+            await this.postSettings();
+            this.post({ type: "info", text: "Выбранный профиль удалён из списка; папка сохранена, потому что её использует другой профиль." });
+            return;
+          }
+          await vscode.workspace.fs.delete(vscode.Uri.file(project.path), {
+            recursive: true,
+            useTrash: true,
+          });
+        } catch (err) {
+          void vscode.window.showErrorMessage(
+            `Проект убран из списка, но папку удалить не удалось: ${err instanceof Error ? err.message : err}`,
+          );
           this.abortOrphanRuns();
           this.postFullState();
           await this.postSettings();
-          this.post({ type: "info", text: "Выбранный профиль удалён из списка; папка сохранена, потому что её использует другой профиль." });
           return;
         }
-        await vscode.workspace.fs.delete(vscode.Uri.file(project.path), {
-          recursive: true,
-          useTrash: true,
-        });
-      } catch (err) {
-        void vscode.window.showErrorMessage(
-          `Проект убран из списка, но папку удалить не удалось: ${err instanceof Error ? err.message : err}`,
-        );
-        this.abortOrphanRuns();
-        this.postFullState();
-        await this.postSettings();
-        return;
       }
-    }
 
-    this.abortOrphanRuns();
-    this.postFullState();
-    await this.postSettings();
-    this.post({
-      type: "info",
-      text:
-        choice === WITH_FOLDER
-          ? `Проект «${project.name}» удалён, папка отправлена в Корзину.`
-          : isWorkspaceFolder
-            ? `Проект «${project.name}» убран из списка (папка остаётся открытой в workspace). Вернуть — «＋ Добавить проект…».`
-            : `Проект «${project.name}» убран из списка. Файлы и история сессий не тронуты.`,
+      this.abortOrphanRuns();
+      this.postFullState();
+      await this.postSettings();
+      this.post({
+        type: "info",
+        text:
+          choice === WITH_FOLDER
+            ? `Проект «${project.name}» удалён, папка отправлена в Корзину.`
+            : isWorkspaceFolder
+              ? `Проект «${project.name}» убран из списка (папка остаётся открытой в workspace). Вернуть — «＋ Добавить проект…».`
+              : `Проект «${project.name}» убран из списка. Файлы и история сессий не тронуты.`,
+      });
+    });
+  }
+
+  /** Native forms may remain open while another surface archives a project. */
+  private async updateRegisteredProject(key: string, update: (entry: ProjectInfo) => void): Promise<boolean> {
+    return this.serializeMultiMutation(async () => {
+      const current = this.getProjects().find((entry) => projectKey(entry) === key);
+      if (!current) return false;
+      const cfg = vscode.workspace.getConfiguration("agentHub");
+      const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
+      const idx = list.findIndex((entry) => configuredProjectKey(entry) === key);
+      const entry = { ...(idx >= 0 ? list[idx] : current) };
+      update(entry);
+      if (idx >= 0) list[idx] = entry;
+      else list.push(entry);
+      await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
+      return true;
     });
   }
 
@@ -948,12 +1259,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     if (!pick) return;
 
-    const cfg = vscode.workspace.getConfiguration("agentHub");
-    const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
-    const idx = list.findIndex(
-      (p) => configuredProjectKey(p) === projectKey(active),
-    );
-
     if (pick.action === "protocol") {
       const protoPick = await vscode.window.showQuickPick(
         [
@@ -964,12 +1269,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         { placeHolder: `Протокол сервера для «${active.name}»`, ignoreFocusOut: true },
       );
       if (!protoPick) return;
-      const entry: ProjectInfo = idx >= 0 ? { ...list[idx] } : { ...active };
-      if (protoPick.value === "ssh") delete entry.serverProtocol;
-      else entry.serverProtocol = protoPick.value;
-      if (idx >= 0) list[idx] = entry;
-      else list.push(entry);
-      await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
+      const updated = await this.updateRegisteredProject(projectKey(active), (entry) => {
+        if (protoPick.value === "ssh") delete entry.serverProtocol;
+        else entry.serverProtocol = protoPick.value;
+      });
+      if (!updated) return;
       this.postFullState();
       this.post({ type: "info", text: `Протокол сервера: ${protoPick.label}.` });
       return;
@@ -994,19 +1298,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (value === undefined) return;
 
     // Папки workspace, не записанные в реестр, при первом изменении попадают в него.
-    const entry: ProjectInfo = idx >= 0 ? { ...list[idx] } : { ...active };
-    if (value) {
-      (entry as unknown as Record<string, unknown>)[field.key] =
-        field.key === "serverPort" ? parseInt(value, 10) : value;
-    } else if (field.key === "name") {
-      entry.name = nodePath.basename(active.path);
-    } else {
-      delete (entry as unknown as Record<string, unknown>)[field.key];
-    }
-    if (idx >= 0) list[idx] = entry;
-    else list.push(entry);
-
-    await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
+    const updated = await this.updateRegisteredProject(projectKey(active), (entry) => {
+      if (value) {
+        (entry as unknown as Record<string, unknown>)[field.key] =
+          field.key === "serverPort" ? parseInt(value, 10) : value;
+      } else if (field.key === "name") {
+        entry.name = nodePath.basename(entry.path);
+      } else {
+        delete (entry as unknown as Record<string, unknown>)[field.key];
+      }
+    });
+    if (!updated) return;
     this.postFullState();
     this.post({ type: "info", text: `Проект обновлён: ${field.label.toLowerCase()}.` });
   }
@@ -1247,7 +1549,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       autoPull: cfg.get<boolean>("autoPull", true),
       autoScrollMode: cfg.get<string>("autoScrollMode", "perProject"),
       // Реестр + папки workspace — на другой машине всё станет реестром.
-      projects: this.getProjects(),
+      projects: this.getAllProjects(),
     };
   }
 
@@ -1288,11 +1590,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** A stale settings/export snapshot cannot change a completed filesystem move. */
+  private preserveProjectArchiveState(project: ProjectInfo): ProjectInfo {
+    const existing = this.getAllProjects();
+    const previous = existing.find((entry) => projectKey(entry) === configuredProjectKey(project)) ??
+      existing.find((entry) => physicalDirectory(entry.path) === physicalDirectory(expandProjectPath(project.path)));
+    if (!previous) return project;
+    const { archive: _incomingArchive, ...entry } = project;
+    return previous.archive ? { ...entry, path: previous.path, archive: previous.archive } : entry;
+  }
+
+  private preserveArchivedProjects(incoming: ProjectInfo[]): ProjectInfo[] {
+    const list = incoming.map((project) => this.preserveProjectArchiveState(project));
+    for (const project of this.getArchivedProjects()) {
+      if (!list.some((entry) => configuredProjectKey(entry) === projectKey(project))) list.push(project);
+    }
+    return list;
+  }
+
   /**
    * Применить конфиг, отредактированный прямо в настройках (JSON-редактор).
    * Настройки перезаписываются; список проектов ЗАМЕНЯЕТСЯ целиком.
    */
-  async applyConfigJson(json: string) {
+  async applyConfigJson(json: string, serialized = false): Promise<void> {
+    if (!serialized) return this.serializeMultiMutation(() => this.applyConfigJson(json, true));
     let parsed: unknown;
     try {
       parsed = JSON.parse(json);
@@ -1324,7 +1645,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     let projectsNote = "";
     if (Array.isArray(settings.projects)) {
-      const list = normalizeProjects(settings.projects);
+      const list = this.preserveArchivedProjects(normalizeProjects(settings.projects));
       await vscode.workspace
         .getConfiguration("agentHub")
         .update("projects", list, vscode.ConfigurationTarget.Global);
@@ -1382,6 +1703,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    await this.serializeMultiMutation(() => this.applyImportedSettings(parsed));
+  }
+
+  private async applyImportedSettings(parsed: unknown): Promise<void> {
     // Полный формат {settings: {...}}, старый {projects: [...]} или голый массив проектов.
     const root = parsed as {
       settings?: Record<string, unknown>;
@@ -1403,13 +1728,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           ? (root.projects as unknown[])
           : [];
 
-    const incoming = normalizeProjects(raw);
+    const incoming = this.preserveArchivedProjects(normalizeProjects(raw));
 
     let added = 0;
     let updated = 0;
     if (incoming.length > 0) {
       const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
-      const existingProjects = this.getProjects();
+      const existingProjects = this.getAllProjects();
       for (const p of incoming) {
         for (const existing of existingProjects) {
           if (physicalDirectory(existing.path) === physicalDirectory(expandProjectPath(p.path)) &&
@@ -1718,7 +2043,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private getChatSlots(): ChatSlot[] {
-    const projects = new Set(this.getProjects().map(projectKey));
+    const projects = new Set(this.getAllProjects().map(projectKey));
     this.chatSlots ??= this.context.globalState.get<unknown[]>(MULTI_CHATS_KEY, []).flatMap((value) => {
         if (!value || typeof value !== "object") return [];
         const slot = value as Partial<ChatSlot>;
@@ -1756,6 +2081,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.multiPanel.webview.postMessage({
       type: "multiState",
       projects: this.getProjects(),
+      archivedProjects: this.getArchivedProjects(),
       chats: this.getChatSlots().map((slot) => this.chatDescriptor(slot)),
     } satisfies HostToWebview);
   }
@@ -1766,10 +2092,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postMultiBoardState();
     this.postRuntimeSettings();
     const projects = this.getProjects();
-    for (const slot of this.getChatSlots().filter((entry) => !onlyChatId || entry.chatId === onlyChatId)) {
+    const archivedProjects = this.getArchivedProjects();
+    const activeKeys = new Set(projects.map(projectKey));
+    for (const slot of this.getChatSlots().filter((entry) => (!onlyChatId || entry.chatId === onlyChatId) && activeKeys.has(entry.projectPath))) {
       const record = this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId);
       if (!record) continue;
-      this.postScoped(slot.projectPath, { type: "projects", projects, activePath: slot.projectPath }, slot.chatId);
+      this.postScoped(slot.projectPath, { type: "projects", projects, archivedProjects, activePath: slot.projectPath }, slot.chatId);
       this.postScoped(slot.projectPath, { type: "transcript", path: slot.projectPath, items: record.items, recordId: record.id }, slot.chatId);
       this.postScoped(slot.projectPath, { type: "busy", value: this.runs.has(slot.chatId) }, slot.chatId);
       for (const agent of ["claude", "codex"] as const) {
@@ -2060,7 +2388,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private postFullState() {
     const projects = this.getProjects();
     const active = this.getActiveProject();
-    this.post({ type: "projects", projects, activePath: active ? projectKey(active) : "" });
+    this.post({ type: "projects", projects, archivedProjects: this.getArchivedProjects(), activePath: active ? projectKey(active) : "" });
     if (active) {
       const rec = this.getActiveRecord(projectKey(active));
       this.post({ type: "transcript", path: projectKey(active), items: rec?.items ?? [] });
@@ -2173,7 +2501,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private async applySettings(s: import("./shared/protocol").SettingsSave, chatId?: string) {
+  private async applySettings(s: import("./shared/protocol").SettingsSave, chatId?: string, serialized = false): Promise<void> {
+    if (!serialized) return this.serializeMultiMutation(() => this.applySettings(s, chatId, true));
     const slot = this.findChatSlot(chatId);
     if (chatId && (!slot || (s.project && configuredProjectKey(s.project) !== slot.projectPath))) return;
     const cfg = vscode.workspace.getConfiguration("agentHub");
@@ -2202,10 +2531,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const idx = list.findIndex(
         (p) => configuredProjectKey(p) === configuredProjectKey(s.project!),
       );
-      const entry: ProjectInfo = {
+      const entry = this.preserveProjectArchiveState({
         ...s.project,
         name: s.project.name || nodePath.basename(s.project.path),
-      };
+      });
       if (idx >= 0) list[idx] = entry;
       else list.push(entry);
       await cfg.update("projects", list, g);
@@ -3067,7 +3396,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     serialized = false,
   ): Promise<void> {
     if (!serialized && (
-      ["openMultiChat", "createChat", "removeChat", "selectChatProject", "selectChatSession", "selectChatAgent", "newSession", "saveTranscript"].includes(msg.type) ||
+      ["selectProject", "moveProject", "reorderProjects", "openMultiChat", "createChat", "removeChat", "selectChatProject", "selectChatSession", "selectChatAgent", "newSession", "saveTranscript"].includes(msg.type) ||
       (surface === "multi-panel" && (msg.type === "ready" || msg.type === "multiStateReady"))
     )) {
       return this.serializeMultiMutation(() => this.onMessage(msg, source, client, surface, true));
@@ -3229,6 +3558,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case "deleteProject":
         await this.deleteProject(msg.path);
+        break;
+      case "archiveProject":
+        await this.archiveProject(msg.path);
+        break;
+      case "restoreProject":
+        await this.restoreProject(msg.path);
+        break;
+      case "showArchive":
+        await this.showArchive();
+        break;
+      case "moveProject":
+        await this.moveProject(msg.path, msg.direction);
+        break;
+      case "reorderProjects":
+        await this.reorderProjects(msg.paths);
         break;
       case "manageProjects":
         await this.manageProjects(msg.chatId);
@@ -3654,6 +3998,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         turn = this.runTurn(prompt, agent, attachments, targetPath, echoUser, expectedQuestionOrigin, chatId, true);
       });
       await turn;
+      return;
+    }
+    if (this.context.globalState.get<PendingProjectMove | undefined>(PROJECT_MOVE_KEY)) {
+      const message: HostToWebview = { type: "error", message: "Не завершено перемещение папки проекта. Перезапустите окно VS Code для восстановления состояния перед запуском агента." };
+      const target = this.findChatSlot(chatId)?.projectPath ?? targetPath;
+      if (target) this.postScoped(target, message, chatId);
+      else if (chatId) this.multiPanel?.webview.postMessage({ ...message, chatId });
+      else this.post(message);
       return;
     }
     const slot = this.findChatSlot(chatId);

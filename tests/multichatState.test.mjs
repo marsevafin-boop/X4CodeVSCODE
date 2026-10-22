@@ -49,7 +49,7 @@ function setup() {
     get: (key, fallback) => data.has(key) ? data.get(key) : fallback,
     update: async (key, value) => { await h.beforeUpdate?.(key, value); h.writes.push(key); data.set(key, value); },
   } };
-  p.getProjects = () => projects; p.getActiveProject = () => projects[0];
+  p.getAllProjects = () => projects; p.getProjects = () => projects; p.getActiveProject = () => projects[0];
   p.runs = new Map(); p.pendingPermissions = new Map(); p.deferred = new Map(); p.steers = new Map(); p.steerTexts = new Map();
   p.multiPanel = { webview: { postMessage: (message) => h.messages.push(message) } };
   p.post = (message) => h.messages.push(message);

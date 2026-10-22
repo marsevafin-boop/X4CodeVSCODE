@@ -26,6 +26,8 @@ export interface ProjectInfo {
   serverUser?: string;
   /** Свободные заметки о сервере: пути к логам, как деплоить и т.п. */
   server?: string;
+  /** Original path/key remains unchanged while the files are kept here. */
+  archive?: { path: string; archivedAt: number };
 }
 
 /** Вложение к сообщению: файл или скриншот. */
@@ -52,6 +54,11 @@ export type WebviewToHost =
   | { type: "selectChatSession"; chatId: string; recordId: string }
   | { type: "selectChatAgent"; chatId: string; agent: AgentId }
   | { type: "duplicateProject"; path: string; copyFolder: boolean }
+  | { type: "archiveProject"; path: string }
+  | { type: "restoreProject"; path: string }
+  | { type: "showArchive" }
+  | { type: "moveProject"; path: string; direction: "up" | "down" }
+  | { type: "reorderProjects"; paths: string[] }
   | {
       type: "send";
       text: string;
@@ -189,9 +196,9 @@ export type HostToWebview =
       chatId?: string;
     }
   | { type: "permissionResolved"; requestId: string; allow: boolean; path?: string; chatId?: string }
-  | { type: "projects"; projects: ProjectInfo[]; activePath: string; chatId?: string }
+  | { type: "projects"; projects: ProjectInfo[]; archivedProjects?: ProjectInfo[]; activePath: string; chatId?: string }
   | { type: "transcript"; path: string; items: unknown[]; chatId?: string; recordId?: string }
-  | { type: "multiState"; projects: ProjectInfo[]; chats: { chatId: string; projectPath: string; recordId: string; agent: AgentId; title: string }[] }
+  | { type: "multiState"; projects: ProjectInfo[]; archivedProjects?: ProjectInfo[]; chats: { chatId: string; projectPath: string; recordId: string; agent: AgentId; title: string }[] }
   | { type: "contextUsage"; agent: AgentId; used: number; max: number; path?: string; chatId?: string }
   | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string; path?: string; chatId?: string }
   | { type: "slashCommands"; agent: AgentId; commands: SlashCommandInfo[] }

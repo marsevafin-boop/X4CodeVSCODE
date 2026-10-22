@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type DragEvent as ReactDragEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
@@ -54,6 +55,34 @@ interface MultiChatSlotView {
   recordId: string;
   agent: AgentId;
   title: string;
+}
+
+function ProjectArchiveList({
+  projects,
+  onRestore,
+}: {
+  projects: ProjectInfo[];
+  onRestore: (path: string) => void;
+}) {
+  return (
+    <section className="project-archive-list">
+      <h3>📦 Архив проектов · {projects.length}</h3>
+      {projects.length === 0 && <div className="empty">В архиве пока нет проектов.</div>}
+      {projects.map((project) => (
+        <div className="proj-row archive-row" key={projectKey(project)}>
+          <div className="archive-project-details">
+            <strong className="proj-name">📦 {project.name}</strong>
+            <span className="archive-path">Папка: {project.archive?.path}</span>
+            <span className="archive-origin">Вернётся в: {project.path}</span>
+          </div>
+          {project.serverHost && <span className="proj-server">сервер: {project.serverHost}</span>}
+          <button className="finish-btn" disabled={REMOTE} onClick={() => onRestore(projectKey(project))}>
+            ↶ Восстановить
+          </button>
+        </div>
+      ))}
+    </section>
+  );
 }
 
 type ChatItem =
@@ -186,6 +215,10 @@ function ChatTile({
     vscode.postMessage(scoped);
   }, [chatId]);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [archivedProjects, setArchivedProjects] = useState<ProjectInfo[]>([]);
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [draggedProject, setDraggedProject] = useState<string | null>(null);
+  const draggedProjectRef = useRef<string | null>(null);
   const [activePath, setActivePath] = useState<string>(initialProjectPath ?? "");
   const [projectSwitching, setProjectSwitching] = useState(false);
   const [agentSwitching, setAgentSwitching] = useState(false);
@@ -541,6 +574,7 @@ function ChatTile({
           break;
         case "projects": {
           setProjects(msg.projects);
+          setArchivedProjects(msg.archivedProjects ?? []);
           if (!chatId || (msg.chatId === chatId &&
               msg.activePath === bindingRef.current.projectPath &&
               (!pendingProjectRef.current || msg.activePath === pendingProjectRef.current))) {
@@ -989,6 +1023,35 @@ function ChatTile({
     return Number.isFinite(n) && n >= 0 ? n : fallback;
   };
 
+  const dropProject = (target: string, event: ReactDragEvent<HTMLDivElement>) => {
+    const source = draggedProjectRef.current;
+    if (!source || source === target || !projects.some((project) => projectKey(project) === source)) return;
+    event.preventDefault();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const after = event.clientY > bounds.top + bounds.height / 2;
+    const order = projects.map(projectKey).filter((path) => path !== source);
+    const targetIndex = order.indexOf(target);
+    if (targetIndex < 0) return;
+    order.splice(targetIndex + (after ? 1 : 0), 0, source);
+    post({ type: "reorderProjects", paths: order });
+    draggedProjectRef.current = null;
+    setDraggedProject(null);
+  };
+
+  if (archiveOpen) {
+    return (
+      <div className="app">
+        <header className="topbar">
+          <button className="finish-btn" onClick={() => setArchiveOpen(false)}>← Назад</button>
+          <span className="session">Архив Agent Hub</span>
+        </header>
+        <main className="feed settings">
+          <ProjectArchiveList projects={archivedProjects} onRestore={(path) => post({ type: "restoreProject", path })} />
+        </main>
+      </div>
+    );
+  }
+
   if (settingsOpen) {
     return (
       <div className="app">
@@ -1006,8 +1069,43 @@ function ChatTile({
               <section>
                 <h3>🗂 Все проекты</h3>
                 {projects.length === 0 && <div className="empty">Проектов пока нет.</div>}
-                {projects.map((p) => (
-                  <div key={projectKey(p)} className="proj-row">
+                {projects.map((p, index) => (
+                  <div
+                    key={projectKey(p)}
+                    data-project-key={projectKey(p)}
+                    className={`proj-row${draggedProject === projectKey(p) ? " dragging" : ""}`}
+                    onDragOver={(event) => {
+                      if (draggedProjectRef.current) {
+                        event.preventDefault();
+                        event.dataTransfer.dropEffect = "move";
+                      }
+                    }}
+                    onDrop={(event) => dropProject(projectKey(p), event)}
+                  >
+                    <div className="proj-order" hidden={REMOTE}>
+                      <button
+                        className="finish-btn project-drag-handle"
+                        draggable
+                        title="Перетащите проект для изменения порядка. Клавиши ↑ и ↓ также меняют порядок"
+                        aria-label={`Изменить порядок проекта ${p.name}`}
+                        onDragStart={(event) => {
+                          draggedProjectRef.current = projectKey(p);
+                          setDraggedProject(projectKey(p));
+                          event.dataTransfer.setData("application/x-agent-hub-project", projectKey(p));
+                          event.dataTransfer.effectAllowed = "move";
+                        }}
+                        onDragEnd={() => { draggedProjectRef.current = null; setDraggedProject(null); }}
+                        onKeyDown={(event) => {
+                          if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+                          event.preventDefault();
+                          post({ type: "moveProject", path: projectKey(p), direction: event.key === "ArrowUp" ? "up" : "down" });
+                        }}
+                      >↕</button>
+                      <button className="finish-btn" disabled={index === 0} title="Поднять проект" aria-label={`Поднять проект ${p.name}`}
+                        onClick={() => post({ type: "moveProject", path: projectKey(p), direction: "up" })}>↑</button>
+                      <button className="finish-btn" disabled={index === projects.length - 1} title="Опустить проект" aria-label={`Опустить проект ${p.name}`}
+                        onClick={() => post({ type: "moveProject", path: projectKey(p), direction: "down" })}>↓</button>
+                    </div>
                     <span className="proj-name" title={p.path}>
                       {projectKey(p) === activePath ? "● " : "📁 "}
                       {p.name}
@@ -1015,6 +1113,12 @@ function ChatTile({
                     <span className="proj-path" title={p.path}>{p.path}</span>
                     {p.serverHost && <span className="proj-server">сервер: {p.serverHost}</span>}
                     <div className="proj-actions" hidden={REMOTE}>
+                      <button
+                        className="finish-btn project-copy-btn"
+                        title="Архивировать проект вместе с папкой"
+                        aria-label={`Архивировать проект ${p.name}`}
+                        onClick={() => post({ type: "archiveProject", path: projectKey(p) })}
+                      >📦</button>
                       <button
                         className="finish-btn project-copy-btn"
                         title="Создать копию настроек проекта, используя ту же папку"
@@ -1052,6 +1156,8 @@ function ChatTile({
                   </button>
                 </div>
               </section>
+
+              <ProjectArchiveList projects={archivedProjects} onRestore={(path) => post({ type: "restoreProject", path })} />
 
               {form.project && (
                 <section>
@@ -1616,6 +1722,10 @@ function ChatTile({
           onClick={() => post({ type: "manageProjects" })}
         >
           🗂 Проекты
+        </button>
+        <button className="finish-btn" hidden={REMOTE} title="Архив проектов: восстановить проект вместе с папкой"
+          onClick={() => setArchiveOpen(true)}>
+          📦 Архив{archivedProjects.length > 0 ? ` (${archivedProjects.length})` : ""}
         </button>
         <button
           className="finish-btn"
@@ -2217,12 +2327,15 @@ function ChatTile({
 
 function MultiChatBoard() {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [archivedProjects, setArchivedProjects] = useState<ProjectInfo[]>([]);
+  const [archiveOpen, setArchiveOpen] = useState(false);
   const [chats, setChats] = useState<MultiChatSlotView[]>([]);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent<HostToWebview>) => {
       if (event.data.type !== "multiState") return;
       setProjects(event.data.projects);
+      setArchivedProjects(event.data.archivedProjects ?? []);
       setChats(event.data.chats);
     };
     window.addEventListener("message", onMessage);
@@ -2235,20 +2348,29 @@ function MultiChatBoard() {
       <header className="multi-chat-toolbar">
         <strong>Agent Hub · мультичат</strong>
         <span className="session">{chats.length} чатов</span>
+        <button className="finish-btn" onClick={() => setArchiveOpen((open) => !open)}>
+          {archiveOpen ? "← К чатам" : `📦 Архив${archivedProjects.length ? ` (${archivedProjects.length})` : ""}`}
+        </button>
         <button className="finish-btn" onClick={() => vscode.postMessage({ type: "createChat" })}>
           ＋ Чат
         </button>
       </header>
+      {archiveOpen && (
+        <main className="feed settings">
+          <ProjectArchiveList projects={archivedProjects} onRestore={(path) => vscode.postMessage({ type: "restoreProject", path })} />
+        </main>
+      )}
       {chats.length === 0 ? (
-        <div className="empty">Загружаю чаты…</div>
+        !archiveOpen && <div className="empty">Загружаю чаты…</div>
       ) : (
         <main
           className="multi-chat-grid"
+          hidden={archiveOpen}
           data-count={chats.length}
           aria-label="Независимые чаты Agent Hub"
         >
           {chats.map((slot) => {
-            const project = projects.find((item) => projectKey(item) === slot.projectPath);
+            const project = [...projects, ...archivedProjects].find((item) => projectKey(item) === slot.projectPath);
             return (
               <section className="multi-chat-tile" key={slot.chatId}>
                 <header className="multi-chat-tile-header">
@@ -2265,13 +2387,21 @@ function MultiChatBoard() {
                   </button>
                 </header>
                 <div className="multi-chat-tile-body">
-                  <ChatTile
+                  {project?.archive ? (
+                    <div className="archived-chat-placeholder">
+                      <strong>📦 Проект в архиве</strong>
+                      <span>{project.archive.path}</span>
+                      <button className="finish-btn" onClick={() => vscode.postMessage({ type: "restoreProject", path: projectKey(project) })}>
+                        ↶ Восстановить проект
+                      </button>
+                    </div>
+                  ) : <ChatTile
                     key={slot.chatId}
                     chatId={slot.chatId}
                     initialProjectPath={slot.projectPath}
                     initialRecordId={slot.recordId}
                     initialAgent={slot.agent}
-                  />
+                  />}
                 </div>
               </section>
             );
