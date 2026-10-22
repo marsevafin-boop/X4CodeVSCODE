@@ -43,7 +43,11 @@ const b = { path: "/project-b", name: "B", serverHost: "b.example", serverUser: 
 function provider() {
   harness.spawns.length = 0;
   const p = Object.create(ChatViewProvider.prototype);
-  p.context = { secrets: { get: async (name) => ({
+  const data = new Map();
+  p.context = { globalState: {
+    get: (name, fallback) => data.has(name) ? data.get(name) : fallback,
+    update: async (name, value) => { data.set(name, value); },
+  }, secrets: { get: async (name) => ({
     "agentHub.serverPassword:/project-a": "password-a",
     "agentHub.serverPassword:/project-b": "password-b",
   })[name] } };
@@ -172,6 +176,7 @@ test("resumed turns refresh project context and pass canonical credentials to ba
   p.context.secrets.get = async () => "fresh-password";
   p.getSecretEnv = async () => ({ SSHPASS: "obsolete", CUSTOM_TOKEN: "project-token" });
   p.runs = new Map(); p.steers = new Map(); p.steerTexts = new Map(); p.deferred = new Map();
+  p.directoryRuns = new Map(); p.sessionWriters = new Map(); p.pendingPermissions = new Map();
   p.relocateAttachments = async (_cwd, attachments) => attachments;
   p.autoPull = async () => {};
   const record = { id: "record", createdAt: 1, agentIds: { codex: "resumed", claude: null }, chatLog: [] };

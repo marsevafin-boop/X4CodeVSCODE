@@ -38,9 +38,14 @@ function setup() {
   p.getActiveRecord = () => p.activeRecord;
   p.ensureActiveRecord = async () => p.activeRecord;
   p.mutateRecord = async (_path, id, fn) => { const target = p.records.get(id); if (target) fn(target); };
-  p.context = { secrets: { get: async () => undefined }, globalState: { update: async () => {} } };
+  const state = new Map();
+  p.context = { secrets: { get: async () => undefined }, globalState: {
+    get: (key, fallback) => state.has(key) ? state.get(key) : fallback,
+    update: async (key, value) => state.set(key, value),
+  } };
   p.getSecretEnv = async () => ({}); p.buildProjectCard = async () => "";
   p.runs = new Map(); p.steers = new Map(); p.steerTexts = new Map(); p.deferred = new Map(); p.pendingPermissions = new Map();
+  p.directoryRuns = new Map(); p.sessionWriters = new Map();
   p.relocateAttachments = async (_cwd, attachments) => attachments;
   p.autoPull = async () => {}; p.autoCommit = async () => {}; p.buildAgentConfig = () => ({ contextWindow: 0 });
   p.revealUi = () => {}; p.notifyBackgroundPermission = () => {};

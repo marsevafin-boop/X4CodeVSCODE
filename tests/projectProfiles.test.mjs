@@ -53,6 +53,7 @@ function setup(projects = [], workspaceFolders = []) {
   const p = Object.create(ChatViewProvider.prototype);
   p.context = { globalState: state(), workspaceState: state(), secrets: { get: async (k) => secrets.get(k), store: async (k, v) => secrets.set(k, v), delete: async (k) => secrets.delete(k) } };
   p.runs = new Map(); p.steers = new Map(); p.steerTexts = new Map(); p.deferred = new Map(); p.pendingPermissions = new Map();
+  p.directoryRuns = new Map(); p.sessionWriters = new Map();
   p.messages = []; p.post = (message) => p.messages.push(message);
   p.postSafety = () => {}; p.postEfforts = () => {}; p.postSlashCommands = () => {}; p.revealUi = () => {};
   p.autoPull = async (...args) => { h.pull = args; }; p.autoCommit = async (...args) => { h.commit = args; };
@@ -245,28 +246,37 @@ test("backend uses physical cwd while sessions, permissions and events use the p
   assert.equal(p.getActiveRecord(b.id).agentIds.codex, "session-b");
   assert.equal(p.getActiveRecord(a.id), null);
   assert.ok(p.messages.filter((m) => ["busy", "sessionInfo", "assistantText"].includes(m.type)).every((m) => m.path === b.id));
-  assert.deepEqual(h.pull, [folder, b.id]);
-  assert.deepEqual(h.commit, [folder, "codex", "B task", b.id]);
+  assert.deepEqual(h.pull, [folder, b.id, undefined]);
+  assert.deepEqual(h.commit, [folder, "codex", "B task", b.id, undefined]);
   assert.deepEqual(h.journalDirs, [folder]);
 });
 
-test("same real folder cannot run through a sibling profile while relocation is pending", async () => {
+test("same real folder permits independent sibling sessions and suppresses overlapping Git", async (t) => {
   const { p } = setup([a, { ...b, path: alias }]);
   const relocation = deferred();
   let relocations = 0;
   p.relocateAttachments = async (_path, files) => { relocations++; await relocation.promise; return files; };
   const calls = [];
-  p.backends = { codex: { async *start(_prompt, opts) { calls.push(opts.cwd); yield { kind: "result", ok: false }; } } };
+  const pulls = []; const commits = [];
+  p.autoPull = async (...args) => { pulls.push(args); };
+  p.autoCommit = async (...args) => { commits.push(args); };
+  p.backends = { codex: { async *start(_prompt, opts) { calls.push(opts.cwd); yield { kind: "result", ok: true }; } } };
   const first = p.runTurn("A task", "codex", [], a.id);
+  const second = p.runTurn("B task", "codex", [], b.id);
+  t.after(async () => { relocation.resolve(); await Promise.all([first, second]); });
   await tick();
-  await p.runTurn("B task", "codex", [], b.id);
-  assert.equal(relocations, 1);
-  assert.equal(p.runs.has(b.id), false);
-  relocation.resolve(); await first;
-  assert.deepEqual(calls, [folder]);
-  assert.ok(p.messages.some((m) => m.path === b.id && m.type === "error"));
+  assert.equal(relocations, 2);
+  assert.equal(p.runs.has(a.id), true);
+  assert.equal(p.runs.has(b.id), true);
+  relocation.resolve(); await Promise.all([first, second]);
+  assert.deepEqual(calls, [folder, alias]);
+  assert.deepEqual(pulls, []);
+  assert.deepEqual(commits, []);
+  assert.ok(p.messages.some((m) => m.path === b.id && m.type === "info" && /Git пропущено/.test(m.text)));
   await p.runTurn("B later", "codex", [], b.id);
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
+  assert.equal(pulls.length, 1, "normal Git resumes after overlapping runs finish");
+  assert.equal(commits.length, 1);
 });
 
 test("different physical folders can run concurrently and failed preparation releases ownership", async () => {

@@ -39,13 +39,13 @@ const CHAT_COMMAND_TYPES = new Set([
   "ready", "send", "steer", "saveTranscript", "permission", "newSession", "finishSession",
   "showSessions", "showContext", "pickModel", "pickEffort", "stop", "choose",
   "selectChatProject", "selectChatSession", "selectChatAgent", "pickAttachment", "saveAttachment",
-  "manageSecretEnv", "sendSecretEnv",
+  "manageSecretEnv", "sendSecretEnv", "manageProjects", "getSettings", "saveSettings",
 ]);
 const CHAT_EVENT_TYPES = new Set([
   "busy", "activity", "sessionInfo", "userMessage", "transcript", "contextUsage", "modelInfo",
   "draftHandled", "choices", "attachmentAdded", "ask", "permissionResolved", "toolUse",
   "toolResult", "assistantText", "textDelta", "error", "info", "meta", "turnResult",
-  "permissionRequest", "reset",
+  "permissionRequest", "reset", "settings", "configJson", "openSettingsScreen", "chatProjectRejected",
 ]);
 
 interface MultiChatSlotView {
@@ -171,10 +171,12 @@ const NO_MODELS: Record<AgentId, { model: string; fallbackFrom?: string }> = {
 function ChatTile({
   chatId,
   initialProjectPath,
+  initialRecordId,
   initialAgent,
 }: {
   chatId?: string;
   initialProjectPath?: string;
+  initialRecordId?: string;
   initialAgent?: AgentId;
 } = {}) {
   const post = useCallback((msg: WebviewToHost) => {
@@ -185,6 +187,8 @@ function ChatTile({
   }, [chatId]);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [activePath, setActivePath] = useState<string>(initialProjectPath ?? "");
+  const [projectSwitching, setProjectSwitching] = useState(false);
+  const [agentSwitching, setAgentSwitching] = useState(false);
   const [itemsByProject, setItemsByProject] = useState<Record<string, ChatItem[]>>({});
 
   // Все рабочие состояния — по проектам: ходы идут параллельно.
@@ -316,6 +320,11 @@ function ChatTile({
   busyRef.current = busyBy;
   /** Прошлые ссылки лент — сохраняем на хост только реально изменившиеся. */
   const prevItemsRef = useRef<Record<string, ChatItem[]>>({});
+  /** A tile owns one exact record; project paths alone cannot identify a session. */
+  const bindingRef = useRef({ projectPath: initialProjectPath ?? "", recordId: initialRecordId });
+  const pendingProjectRef = useRef<string | null>(null);
+  const pendingAgentRef = useRef<AgentId | null>(null);
+  const itemRecordsRef = useRef(new WeakMap<ChatItem[], string>());
 
   // Производные значения активного проекта.
   const items = itemsByProject[activePath] ?? [];
@@ -427,7 +436,12 @@ function ChatTile({
   const mutateItems = useCallback(
     (path: string, updater: (prev: ChatItem[]) => ChatItem[]) => {
       if (!path) return;
-      setItemsByProject((prev) => ({ ...prev, [path]: updater(prev[path] ?? []) }));
+      const recordId = bindingRef.current.projectPath === path ? bindingRef.current.recordId : undefined;
+      setItemsByProject((prev) => {
+        const updated = updater(prev[path] ?? []);
+        if (recordId) itemRecordsRef.current.set(updated, recordId);
+        return { ...prev, [path]: updated };
+      });
     },
     [],
   );
@@ -449,9 +463,9 @@ function ChatTile({
   const finalizeStreaming = useCallback(
     (path: string) => {
       mutateItems(path, (prev) =>
-        prev.map((it) =>
+        prev.some((it) => it.role === "assistant" && it.streaming) ? prev.map((it) =>
           it.role === "assistant" && it.streaming ? { ...it, streaming: false } : it,
-        ),
+        ) : prev,
       );
     },
     [mutateItems],
@@ -478,6 +492,34 @@ function ChatTile({
       // Адресат события: свой проект или активный, если метки нет.
       const p = ("path" in msg && msg.path) || activeRef.current;
       switch (msg.type) {
+        case "chatProjectRejected": {
+          if (!chatId || (pendingProjectRef.current && pendingProjectRef.current !== msg.requestedProjectPath)) break;
+          if (!pendingProjectRef.current && bindingRef.current.projectPath !== msg.projectPath) break;
+          bindingRef.current = { projectPath: msg.projectPath, recordId: msg.recordId };
+          pendingProjectRef.current = null;
+          setProjectSwitching(false);
+          activeRef.current = msg.projectPath;
+          setActivePath(msg.projectPath);
+          setAgent(msg.agent);
+          mutateItems(msg.projectPath, (items) => [...items, { id: nextId++, role: "error", text: msg.message }]);
+          break;
+        }
+        case "multiState": {
+          if (!chatId) break;
+          const slot = msg.chats.find((entry) => entry.chatId === chatId);
+          if (!slot || (pendingProjectRef.current && slot.projectPath !== pendingProjectRef.current)) break;
+          bindingRef.current = { projectPath: slot.projectPath, recordId: slot.recordId };
+          pendingProjectRef.current = null;
+          setProjectSwitching(false);
+          activeRef.current = slot.projectPath;
+          setActivePath(slot.projectPath);
+          if (!pendingAgentRef.current || pendingAgentRef.current === slot.agent) {
+            pendingAgentRef.current = null;
+            setAgentSwitching(false);
+            setAgent(slot.agent);
+          }
+          break;
+        }
         case "busy":
           setBusyBy((prev) => ({ ...prev, [p]: msg.value }));
           if (msg.value) {
@@ -499,8 +541,11 @@ function ChatTile({
           break;
         case "projects": {
           setProjects(msg.projects);
-          if (!chatId || msg.chatId === chatId) {
+          if (!chatId || (msg.chatId === chatId &&
+              msg.activePath === bindingRef.current.projectPath &&
+              (!pendingProjectRef.current || msg.activePath === pendingProjectRef.current))) {
             if (msg.activePath !== activeRef.current) clearServerTest();
+            activeRef.current = msg.activePath;
             setActivePath(msg.activePath);
           }
           // Чистим состояние удалённых проектов, чтобы их ленты/очереди
@@ -522,6 +567,9 @@ function ChatTile({
           break;
         }
         case "transcript": {
+          if (chatId && (msg.path !== bindingRef.current.projectPath ||
+              msg.recordId !== bindingRef.current.recordId ||
+              (pendingProjectRef.current && msg.path !== pendingProjectRef.current))) break;
           const restored = msg.items as ChatItem[];
           const maxId = restored.reduce((m, it) => Math.max(m, it?.id ?? 0), 0);
           if (maxId >= nextId) nextId = maxId + 1;
@@ -530,6 +578,9 @@ function ChatTile({
             if (busyRef.current[msg.path] && (prev[msg.path]?.length ?? 0) > 0) {
               return prev;
             }
+            // IPC creates a fresh array, but hydration is already persisted by the host.
+            prevItemsRef.current[msg.path] = restored;
+            if (msg.recordId) itemRecordsRef.current.set(restored, msg.recordId);
             return { ...prev, [msg.path]: restored };
           });
           break;
@@ -700,11 +751,15 @@ function ChatTile({
   useEffect(() => {
     for (const [path, projItems] of Object.entries(itemsByProject)) {
       if (prevItemsRef.current[path] !== projItems) {
-        post({ type: "saveTranscript", path, items: projItems });
+        const binding = bindingRef.current;
+        const recordId = itemRecordsRef.current.get(projItems);
+        if (chatId && (path !== binding.projectPath || !recordId || recordId !== binding.recordId)) continue;
+        post({ type: "saveTranscript", path, items: projItems,
+          ...(chatId ? { recordId } : {}) });
       }
     }
     prevItemsRef.current = itemsByProject;
-  }, [itemsByProject, post]);
+  }, [itemsByProject, post, chatId]);
 
   // Секундомер виден только у активного проекта — и тикаем только для него,
   // чтобы фоновый ход не перерисовывал ленту каждую секунду.
@@ -737,25 +792,33 @@ function ChatTile({
     setAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 60);
   };
 
+  const scrollFeedToBottom = useCallback(() => {
+    const feed = feedRef.current;
+    feed?.scrollTo({ top: feed.scrollHeight, behavior: "smooth" });
+  }, []);
+
   useEffect(() => {
     if (autoScrollOn) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      scrollFeedToBottom();
     } else {
       // Контент дорос без прокрутки — пересчитать, показывать ли кнопку ⇣.
       updateAtBottom();
     }
-  }, [items, activity, autoScrollOn, activePath]);
+  }, [items, activity, autoScrollOn, activePath, scrollFeedToBottom]);
 
   const answerPermission = (requestId: string, allow: boolean, answer?: string) => {
     // Карточка может лежать в любой ленте — обновляем во всех проектах.
     setItemsByProject((prev) => {
       const next: typeof prev = {};
       for (const [path, list] of Object.entries(prev)) {
-        next[path] = list.map((it) =>
+        const updated: ChatItem[] = list.map((it) =>
           it.role === "permission" && it.requestId === requestId && it.status === "pending"
             ? { ...it, status: allow ? "allowed" : "denied", ...(answer ? { answerText: answer } : {}) }
             : it,
         );
+        const recordId = itemRecordsRef.current.get(list);
+        if (recordId) itemRecordsRef.current.set(updated, recordId);
+        next[path] = updated;
       }
       return next;
     });
@@ -814,6 +877,7 @@ function ChatTile({
   };
 
   const send = () => {
+    if (pendingProjectRef.current) return;
     const text = draft.trim();
     if (!text && pending.length === 0) return;
     const finalText = text || "Посмотри приложенные файлы.";
@@ -839,6 +903,7 @@ function ChatTile({
 
   /** Вставка/перетаскивание файлов: байты уходят хосту, он сохраняет в проект. */
   const ingestFiles = (files: FileList | File[]) => {
+    if (pendingProjectRef.current) return;
     for (const file of Array.from(files)) {
       if (file.size > 20 * 1024 * 1024) {
         mutateItems(activePath, (p) => [
@@ -871,7 +936,13 @@ function ChatTile({
       post({ type: "manageProjects" });
       return;
     }
+    if (value === activeRef.current) return;
     clearServerTest();
+    if (chatId) {
+      pendingProjectRef.current = value;
+      setProjectSwitching(true);
+    }
+    activeRef.current = value;
     setActivePath(value);
     post(chatId
       ? { type: "selectChatProject", chatId, projectPath: value }
@@ -1474,11 +1545,12 @@ function ChatTile({
   }
 
   return (
-    <div className="app">
+    <div className="app" inert={projectSwitching} aria-busy={projectSwitching}>
       <header className="topbar">
         <select
           className="project-select"
           value={activePath}
+          disabled={busy || projectSwitching}
           onChange={(e) => onProjectChange(e.target.value)}
           title={
             activeProject
@@ -1509,10 +1581,14 @@ function ChatTile({
           value={agent}
           onChange={(e) => {
             const nextAgent = e.target.value as AgentId;
+            if (chatId) {
+              pendingAgentRef.current = nextAgent;
+              setAgentSwitching(true);
+            }
             setAgent(nextAgent);
             if (chatId) post({ type: "selectChatAgent", chatId, agent: nextAgent });
           }}
-          disabled={busy}
+          disabled={busy || agentSwitching}
         >
           <option value="claude">Claude</option>
           <option value="codex">GPT (Codex)</option>
@@ -1569,7 +1645,7 @@ function ChatTile({
         </button>
         <button
           className="finish-btn"
-          hidden={REMOTE}
+          hidden={REMOTE || IN_MULTI_PANEL}
           title={
             IN_PANEL
               ? "Свернуть: вернуть чат в боковую панель"
@@ -1590,7 +1666,9 @@ function ChatTile({
             (models[agent].fallbackFrom
               ? `Сработал фоллбэк: фактически отвечает ${models[agent].model}, хотя сессия начиналась на ${models[agent].fallbackFrom}. `
               : "") +
-            "Клик — выбрать модель: только для этого чата или базовую для новых чатов (применится со следующего хода)"
+            (chatId
+              ? "Клик — выбрать модель этой плитки: сохранится при смене проекта и новой сессии; либо изменить базовую модель"
+              : "Клик — выбрать модель: только для этого чата или базовую для новых чатов (применится со следующего хода)")
           }
           onClick={() => post({ type: "pickModel", agent })}
         >
@@ -1837,7 +1915,7 @@ function ChatTile({
             <button
               className="scroll-down"
               title="К последнему сообщению"
-              onClick={() => bottomRef.current?.scrollIntoView({ behavior: "smooth" })}
+              onClick={scrollFeedToBottom}
             >
               ⇣
             </button>
@@ -2191,6 +2269,7 @@ function MultiChatBoard() {
                     key={slot.chatId}
                     chatId={slot.chatId}
                     initialProjectPath={slot.projectPath}
+                    initialRecordId={slot.recordId}
                     initialAgent={slot.agent}
                   />
                 </div>

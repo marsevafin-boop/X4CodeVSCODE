@@ -90,10 +90,10 @@ export type WebviewToHost =
   | { type: "selectProject"; path: string }
   | { type: "addProject" }
   | { type: "deleteProject"; path: string }
-  | { type: "manageProjects" }
+  | { type: "manageProjects"; chatId?: string }
   | { type: "showSessions"; chatId?: string }
   | { type: "openFullView" }
-  | { type: "getSettings" }
+  | { type: "getSettings"; chatId?: string }
   | { type: "exportSettings" }
   | { type: "importSettings" }
   | { type: "applyConfigJson"; json: string }
@@ -108,7 +108,7 @@ export type WebviewToHost =
       protocol?: "ssh" | "sftp" | "ftp";
       port?: number;
     }
-  | { type: "saveSettings"; settings: SettingsSave }
+  | { type: "saveSettings"; settings: SettingsSave; chatId?: string }
   | { type: "cycleSafety"; agent: AgentId }
   | { type: "pickModel"; agent: AgentId; chatId?: string }
   | { type: "pickEffort"; agent: AgentId; chatId?: string }
@@ -148,6 +148,7 @@ export type WebviewToHost =
  * Пустой path трактуется как «активный проект».
  */
 export type HostToWebview =
+  | { type: "chatProjectRejected"; chatId: string; requestedProjectPath: string; projectPath: string; recordId: string; agent: AgentId; message: string }
   | { type: "busy"; value: boolean; path?: string; chatId?: string }
   | { type: "activity"; label: string; path?: string; chatId?: string }
   | { type: "sessionInfo"; sessionId: string | null; agent: AgentId; path?: string; chatId?: string }
@@ -194,7 +195,7 @@ export type HostToWebview =
   | { type: "contextUsage"; agent: AgentId; used: number; max: number; path?: string; chatId?: string }
   | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string; path?: string; chatId?: string }
   | { type: "slashCommands"; agent: AgentId; commands: SlashCommandInfo[] }
-  | { type: "settings"; settings: SettingsSnapshot }
+  | { type: "settings"; settings: SettingsSnapshot; chatId?: string }
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }
   | { type: "effortInfo"; agent: AgentId; effort: string }
   | { type: "autoScrollMode"; mode: string }
@@ -213,9 +214,9 @@ export type HostToWebview =
     }
   | { type: "attachmentAdded"; files: Attachment[]; path?: string }
   | { type: "serverTestResult"; projectPath: string; requestId: string; ok: boolean; message: string }
-  | { type: "configJson"; json: string }
+  | { type: "configJson"; json: string; chatId?: string }
   | { type: "configJsonResult"; ok: boolean; message: string }
-  | { type: "openSettingsScreen" };
+  | { type: "openSettingsScreen"; chatId?: string };
 
 /** Снимок всех настроек для экрана настроек внутри панели. */
 export interface SettingsSnapshot {
