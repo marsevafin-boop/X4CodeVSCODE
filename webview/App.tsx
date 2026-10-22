@@ -897,7 +897,8 @@ export function App() {
                       {projectKey(p) === activePath ? "● " : "📁 "}
                       {p.name}
                     </span>
-                    <span className="proj-path">{p.path}</span>
+                    <span className="proj-path" title={p.path}>{p.path}</span>
+                    {p.serverHost && <span className="proj-server">сервер: {p.serverHost}</span>}
                     <button
                       className="finish-btn delete-btn"
                       hidden={REMOTE}
