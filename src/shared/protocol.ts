@@ -43,7 +43,15 @@ export interface SlashCommandInfo {
 
 /** webview → extension */
 export type WebviewToHost =
-  | { type: "ready" }
+  | { type: "ready"; chatId?: string }
+  | { type: "openMultiChat" }
+  | { type: "multiStateReady"; chatIds: string[] }
+  | { type: "createChat"; projectPath?: string }
+  | { type: "removeChat"; chatId: string }
+  | { type: "selectChatProject"; chatId: string; projectPath: string }
+  | { type: "selectChatSession"; chatId: string; recordId: string }
+  | { type: "selectChatAgent"; chatId: string; agent: AgentId }
+  | { type: "duplicateProject"; path: string; copyFolder: boolean }
   | {
       type: "send";
       text: string;
@@ -53,6 +61,7 @@ export type WebviewToHost =
        * Нужен очереди
        *  фонового проекта, чтобы не стрелять в активный. */
       path?: string;
+      chatId?: string;
     }
   | {
       /** Докинуть сообщение в идущий ход (корректировка на лету). */
@@ -63,24 +72,26 @@ export type WebviewToHost =
       agent: AgentId;
       attachments?: Attachment[];
       path?: string;
+      chatId?: string;
     }
-  | { type: "pickAttachment"; path?: string }
+  | { type: "pickAttachment"; path?: string; chatId?: string }
   | {
       /** path — проект ленты, в чью папку сохранить (не «активный» хоста). */
       type: "saveAttachment";
       name: string;
       dataBase64: string;
       path?: string;
+      chatId?: string;
     }
-  | { type: "stop"; path?: string }
-  | { type: "newSession" }
-  | { type: "finishSession"; agent: AgentId }
-  | { type: "permission"; requestId: string; allow: boolean; answer?: string }
+  | { type: "stop"; path?: string; chatId?: string }
+  | { type: "newSession"; chatId?: string }
+  | { type: "finishSession"; agent: AgentId; chatId?: string }
+  | { type: "permission"; requestId: string; allow: boolean; answer?: string; chatId?: string }
   | { type: "selectProject"; path: string }
   | { type: "addProject" }
   | { type: "deleteProject"; path: string }
   | { type: "manageProjects" }
-  | { type: "showSessions" }
+  | { type: "showSessions"; chatId?: string }
   | { type: "openFullView" }
   | { type: "getSettings" }
   | { type: "exportSettings" }
@@ -99,9 +110,9 @@ export type WebviewToHost =
     }
   | { type: "saveSettings"; settings: SettingsSave }
   | { type: "cycleSafety"; agent: AgentId }
-  | { type: "pickModel"; agent: AgentId }
-  | { type: "pickEffort"; agent: AgentId }
-  | { type: "showContext"; agent: AgentId }
+  | { type: "pickModel"; agent: AgentId; chatId?: string }
+  | { type: "pickEffort"; agent: AgentId; chatId?: string }
+  | { type: "showContext"; agent: AgentId; chatId?: string }
   | {
       /** Выбор из меню мобильного клиента (вместо QuickPick VS Code). */
       type: "choose";
@@ -109,14 +120,16 @@ export type WebviewToHost =
       agent?: AgentId;
       value: string;
       scope?: "chat" | "base";
+      chatId?: string;
     }
-  | { type: "manageSecretEnv" }
+  | { type: "manageSecretEnv"; chatId?: string }
   | {
       /** Текст сообщения с доступами (KEY=value построчно) — сохранить в env
        *  выбранных проектов, агенту НЕ отправлять. path — проект ленты. */
       type: "sendSecretEnv";
       text: string;
       path?: string;
+      chatId?: string;
     }
   | {
       /** Клик по плашке файла в ленте: открыть файл в редакторе.
@@ -125,7 +138,7 @@ export type WebviewToHost =
       path: string;
       project?: string;
     }
-  | { type: "saveTranscript"; path: string; items: unknown[] };
+  | { type: "saveTranscript"; path: string; items: unknown[]; chatId?: string; recordId?: string };
 
 /**
  * extension → webview.
@@ -135,9 +148,9 @@ export type WebviewToHost =
  * Пустой path трактуется как «активный проект».
  */
 export type HostToWebview =
-  | { type: "busy"; value: boolean; path?: string }
-  | { type: "activity"; label: string; path?: string }
-  | { type: "sessionInfo"; sessionId: string | null; agent: AgentId; path?: string }
+  | { type: "busy"; value: boolean; path?: string; chatId?: string }
+  | { type: "activity"; label: string; path?: string; chatId?: string }
+  | { type: "sessionInfo"; sessionId: string | null; agent: AgentId; path?: string; chatId?: string }
   | {
       /** Эхо сообщения пользователя: пузырь создаёт хост, чтобы обе
        *  поверхности (сайдбар и вкладка) имели одинаковую ленту. */
@@ -145,10 +158,11 @@ export type HostToWebview =
       text: string;
       attachments?: string[];
       path?: string;
+      chatId?: string;
     }
-  | { type: "textDelta"; text: string; path?: string }
-  | { type: "assistantText"; text: string; path?: string }
-  | { type: "toolUse"; toolName: string; summary: string; path?: string }
+  | { type: "textDelta"; text: string; path?: string; chatId?: string }
+  | { type: "assistantText"; text: string; path?: string; chatId?: string }
+  | { type: "toolUse"; toolName: string; summary: string; path?: string; chatId?: string }
   | {
       type: "turnResult";
       ok: boolean;
@@ -156,10 +170,11 @@ export type HostToWebview =
       durationMs?: number;
       numTurns?: number;
       path?: string;
+      chatId?: string;
     }
-  | { type: "info"; text: string; path?: string }
-  | { type: "error"; message: string; path?: string }
-  | { type: "reset"; path?: string }
+  | { type: "info"; text: string; path?: string; chatId?: string }
+  | { type: "error"; message: string; path?: string; chatId?: string }
+  | { type: "reset"; path?: string; chatId?: string }
   | {
       type: "permissionRequest";
       requestId: string;
@@ -170,12 +185,14 @@ export type HostToWebview =
       question?: string;
       options?: { label: string; description?: string }[];
       path?: string;
+      chatId?: string;
     }
-  | { type: "permissionResolved"; requestId: string; allow: boolean; path?: string }
-  | { type: "projects"; projects: ProjectInfo[]; activePath: string }
-  | { type: "transcript"; path: string; items: unknown[] }
-  | { type: "contextUsage"; agent: AgentId; used: number; max: number; path?: string }
-  | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string; path?: string }
+  | { type: "permissionResolved"; requestId: string; allow: boolean; path?: string; chatId?: string }
+  | { type: "projects"; projects: ProjectInfo[]; activePath: string; chatId?: string }
+  | { type: "transcript"; path: string; items: unknown[]; chatId?: string; recordId?: string }
+  | { type: "multiState"; projects: ProjectInfo[]; chats: { chatId: string; projectPath: string; recordId: string; agent: AgentId; title: string }[] }
+  | { type: "contextUsage"; agent: AgentId; used: number; max: number; path?: string; chatId?: string }
+  | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string; path?: string; chatId?: string }
   | { type: "slashCommands"; agent: AgentId; commands: SlashCommandInfo[] }
   | { type: "settings"; settings: SettingsSnapshot }
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }

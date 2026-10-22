@@ -32,6 +32,29 @@ const REMOTE = Boolean((window as unknown as { __AGENT_HUB_REMOTE__?: boolean })
 /** Где открыт чат в VS Code: боковая панель (view) или вкладка редактора (panel). */
 const IN_PANEL =
   (window as unknown as { __AGENT_HUB_SURFACE__?: string }).__AGENT_HUB_SURFACE__ === "panel";
+const IN_MULTI_PANEL =
+  (window as unknown as { __AGENT_HUB_SURFACE__?: string }).__AGENT_HUB_SURFACE__ === "multi-panel";
+
+const CHAT_COMMAND_TYPES = new Set([
+  "ready", "send", "steer", "saveTranscript", "permission", "newSession", "finishSession",
+  "showSessions", "showContext", "pickModel", "pickEffort", "stop", "choose",
+  "selectChatProject", "selectChatSession", "selectChatAgent", "pickAttachment", "saveAttachment",
+  "manageSecretEnv", "sendSecretEnv",
+]);
+const CHAT_EVENT_TYPES = new Set([
+  "busy", "activity", "sessionInfo", "userMessage", "transcript", "contextUsage", "modelInfo",
+  "draftHandled", "choices", "attachmentAdded", "ask", "permissionResolved", "toolUse",
+  "toolResult", "assistantText", "textDelta", "error", "info", "meta", "turnResult",
+  "permissionRequest", "reset",
+]);
+
+interface MultiChatSlotView {
+  chatId: string;
+  projectPath: string;
+  recordId: string;
+  agent: AgentId;
+  title: string;
+}
 
 type ChatItem =
   | {
@@ -145,9 +168,23 @@ const NO_MODELS: Record<AgentId, { model: string; fallbackFrom?: string }> = {
   codex: { model: "" },
 };
 
-export function App() {
+function ChatTile({
+  chatId,
+  initialProjectPath,
+  initialAgent,
+}: {
+  chatId?: string;
+  initialProjectPath?: string;
+  initialAgent?: AgentId;
+} = {}) {
+  const post = useCallback((msg: WebviewToHost) => {
+    const scoped = chatId && CHAT_COMMAND_TYPES.has(msg.type)
+      ? ({ ...msg, chatId } as WebviewToHost)
+      : msg;
+    vscode.postMessage(scoped);
+  }, [chatId]);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
-  const [activePath, setActivePath] = useState<string>("");
+  const [activePath, setActivePath] = useState<string>(initialProjectPath ?? "");
   const [itemsByProject, setItemsByProject] = useState<Record<string, ChatItem[]>>({});
 
   // Все рабочие состояния — по проектам: ходы идут параллельно.
@@ -178,7 +215,7 @@ export function App() {
   const [efforts, setEfforts] = useState<Record<AgentId, string>>({ claude: "", codex: "" });
   const [slashIdx, setSlashIdx] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
-  const [agent, setAgent] = useState<AgentId>("claude");
+  const [agent, setAgent] = useState<AgentId>(initialAgent ?? "claude");
   const [draft, setDraft] = useState("");
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -344,7 +381,7 @@ export function App() {
   /** Инлайн-код с путями и не-http ссылки → кликабельные плашки файлов. */
   const mdComponents = useMemo<Components>(() => {
     const open = (p: string) =>
-      vscode.postMessage({ type: "openFile", path: p, project: activeRef.current });
+      post({ type: "openFile", path: p, project: activeRef.current });
     return {
       code({ className, children, ...props }) {
         const text =
@@ -427,14 +464,17 @@ export function App() {
    */
   const dispatchSend = useCallback(
     (path: string, text: string, attachments: Attachment[], agentId: AgentId) => {
-      vscode.postMessage({ type: "send", text, agent: agentId, attachments, path });
+      post({ type: "send", text, agent: agentId, attachments, path });
     },
-    [],
+    [post],
   );
 
   useEffect(() => {
     const onMessage = (e: MessageEvent<HostToWebview>) => {
       const msg = e.data;
+      const eventChatId = "chatId" in msg ? msg.chatId : undefined;
+      if (eventChatId && eventChatId !== chatId) return;
+      if (chatId && CHAT_EVENT_TYPES.has(msg.type) && !eventChatId) return;
       // Адресат события: свой проект или активный, если метки нет.
       const p = ("path" in msg && msg.path) || activeRef.current;
       switch (msg.type) {
@@ -459,8 +499,10 @@ export function App() {
           break;
         case "projects": {
           setProjects(msg.projects);
-          if (msg.activePath !== activeRef.current) clearServerTest();
-          setActivePath(msg.activePath);
+          if (!chatId || msg.chatId === chatId) {
+            if (msg.activePath !== activeRef.current) clearServerTest();
+            setActivePath(msg.activePath);
+          }
           // Чистим состояние удалённых проектов, чтобы их ленты/очереди
           // не жили вечно и не пересоздавали записи на хосте.
           const known = new Set(msg.projects.map(projectKey));
@@ -648,9 +690,9 @@ export function App() {
       }
     };
     window.addEventListener("message", onMessage);
-    vscode.postMessage({ type: "ready" });
+    post({ type: "ready" });
     return () => window.removeEventListener("message", onMessage);
-  }, [appendDelta, finalizeStreaming, mutateItems, dispatchSend, clearServerTest, updateServerTest]);
+  }, [appendDelta, finalizeStreaming, mutateItems, dispatchSend, clearServerTest, updateServerTest, post, chatId]);
 
   // Ленты сохраняются на хосте; шлём ТОЛЬКО изменившиеся (по ссылке) —
   // иначе фоновый стрим мог бы перезаписать только что переключённую сессию
@@ -658,11 +700,11 @@ export function App() {
   useEffect(() => {
     for (const [path, projItems] of Object.entries(itemsByProject)) {
       if (prevItemsRef.current[path] !== projItems) {
-        vscode.postMessage({ type: "saveTranscript", path, items: projItems });
+        post({ type: "saveTranscript", path, items: projItems });
       }
     }
     prevItemsRef.current = itemsByProject;
-  }, [itemsByProject]);
+  }, [itemsByProject, post]);
 
   // Секундомер виден только у активного проекта — и тикаем только для него,
   // чтобы фоновый ход не перерисовывал ленту каждую секунду.
@@ -717,7 +759,7 @@ export function App() {
       }
       return next;
     });
-    vscode.postMessage({ type: "permission", requestId, allow, answer });
+    post({ type: "permission", requestId, allow, answer });
   };
 
   // Высота поля ввода: развёрнуто — из CSS; ручная — как потянули; иначе —
@@ -781,7 +823,7 @@ export function App() {
     setPendingBy((prev) => ({ ...prev, [path]: [] }));
     if (busyBy[path] && sendMode !== "later") {
       // Корректировка на лету: сообщение уходит в идущий ход.
-      vscode.postMessage({ type: "steer", text: finalText, mode: sendMode, agent, attachments, path });
+      post({ type: "steer", text: finalText, mode: sendMode, agent, attachments, path });
       return;
     }
     if (busyBy[path]) {
@@ -809,7 +851,7 @@ export function App() {
       reader.onload = () => {
         const dataUrl = reader.result as string;
         const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
-        vscode.postMessage({
+        post({
           type: "saveAttachment",
           name: file.name || "screenshot.png",
           dataBase64: base64,
@@ -822,16 +864,18 @@ export function App() {
 
   const onProjectChange = (value: string) => {
     if (value === "__add__") {
-      vscode.postMessage({ type: "addProject" });
+      post({ type: "addProject" });
       return;
     }
     if (value === "__manage__") {
-      vscode.postMessage({ type: "manageProjects" });
+      post({ type: "manageProjects" });
       return;
     }
     clearServerTest();
     setActivePath(value);
-    vscode.postMessage({ type: "selectProject", path: value });
+    post(chatId
+      ? { type: "selectChatProject", chatId, projectPath: value }
+      : { type: "selectProject", path: value });
   };
 
   const formatElapsed = (s: number) =>
@@ -899,11 +943,29 @@ export function App() {
                     </span>
                     <span className="proj-path" title={p.path}>{p.path}</span>
                     {p.serverHost && <span className="proj-server">сервер: {p.serverHost}</span>}
+                    <div className="proj-actions" hidden={REMOTE}>
+                      <button
+                        className="finish-btn project-copy-btn"
+                        title="Создать копию настроек проекта, используя ту же папку"
+                        aria-label={`Копировать настройки проекта ${p.name} в ту же папку`}
+                        onClick={() => post({ type: "duplicateProject", path: projectKey(p), copyFolder: false })}
+                      >
+                        ⧉
+                      </button>
+                      <button
+                        className="finish-btn project-copy-btn"
+                        title="Скопировать папку проекта рядом и создать для неё копию проекта"
+                        aria-label={`Дублировать папку проекта ${p.name}`}
+                        onClick={() => post({ type: "duplicateProject", path: projectKey(p), copyFolder: true })}
+                      >
+                        📁+
+                      </button>
+                    </div>
                     <button
                       className="finish-btn delete-btn"
                       hidden={REMOTE}
                       title="Удалить проект: убрать из списка или удалить вместе с папкой (в Корзину)"
-                      onClick={() => vscode.postMessage({ type: "deleteProject", path: projectKey(p) })}
+                      onClick={() => post({ type: "deleteProject", path: projectKey(p) })}
                     >
                       🗑
                     </button>
@@ -913,7 +975,7 @@ export function App() {
                   <button
                     className="finish-btn"
                     hidden={REMOTE}
-                    onClick={() => vscode.postMessage({ type: "addProject" })}
+                    onClick={() => post({ type: "addProject" })}
                   >
                     ＋ Добавить проект…
                   </button>
@@ -1024,7 +1086,7 @@ export function App() {
                     <span>Доступы (env)</span>
                     <button
                       className="finish-btn"
-                      onClick={() => vscode.postMessage({ type: "manageSecretEnv" })}
+                      onClick={() => post({ type: "manageSecretEnv" })}
                     >
                       🔐 {form.secretEnvNames.length > 0
                         ? form.secretEnvNames.join(", ")
@@ -1054,7 +1116,7 @@ export function App() {
                         const requestId = globalThis.crypto?.randomUUID?.() ??
                           `${Date.now()}-${Math.random().toString(36).slice(2)}`;
                         updateServerTest(beginServerTest(serverDraft, requestId));
-                        vscode.postMessage({ type: "testServer", ...serverDraft, requestId });
+                        post({ type: "testServer", ...serverDraft, requestId });
                       }}
                     >
                       {visibleServerTest.status === "pending" ? "⏳ Проверяю…" : "🔌 Проверить поля формы"}
@@ -1076,7 +1138,7 @@ export function App() {
                       hidden={REMOTE}
                       title="Убрать проект из списка или удалить вместе с папкой (папка уедет в Корзину)"
                       onClick={() =>
-                        vscode.postMessage({ type: "deleteProject", path: projectKey(form.project!) })
+                        post({ type: "deleteProject", path: projectKey(form.project!) })
                       }
                     >
                       🗑 Удалить проект…
@@ -1343,7 +1405,7 @@ export function App() {
                 <div className="set-actions" style={{ paddingBottom: 0 }}>
                   <button
                     className="send set-save"
-                    onClick={() => vscode.postMessage({ type: "applyConfigJson", json: configJson })}
+                    onClick={() => post({ type: "applyConfigJson", json: configJson })}
                   >
                     Применить JSON
                   </button>
@@ -1352,7 +1414,7 @@ export function App() {
                     title="Вернуть текущее сохранённое состояние"
                     onClick={() => {
                       setConfigResult(null);
-                      vscode.postMessage({ type: "getSettings" });
+                      post({ type: "getSettings" });
                     }}
                   >
                     Сбросить
@@ -1375,14 +1437,14 @@ export function App() {
                   <button
                     className="finish-btn"
                     title="Все настройки и проекты — в JSON-файл (пароли не выгружаются)"
-                    onClick={() => vscode.postMessage({ type: "exportSettings" })}
+                    onClick={() => post({ type: "exportSettings" })}
                   >
                     ⬇ Экспорт в JSON
                   </button>
                   <button
                     className="finish-btn"
                     title="Загрузить настройки из JSON: настройки перезапишутся, проекты добавятся/обновятся"
-                    onClick={() => vscode.postMessage({ type: "importSettings" })}
+                    onClick={() => post({ type: "importSettings" })}
                   >
                     ⬆ Импорт из JSON
                   </button>
@@ -1393,7 +1455,7 @@ export function App() {
                 <button
                   className="send set-save"
                   onClick={() => {
-                    vscode.postMessage({ type: "saveSettings", settings: { ...form, newPassword } });
+                    post({ type: "saveSettings", settings: { ...form, newPassword } });
                     setAutoScrollMode(form.autoScrollMode);
                     closeSettings();
                   }}
@@ -1445,7 +1507,11 @@ export function App() {
         <select
           className="agent-select"
           value={agent}
-          onChange={(e) => setAgent(e.target.value as AgentId)}
+          onChange={(e) => {
+            const nextAgent = e.target.value as AgentId;
+            setAgent(nextAgent);
+            if (chatId) post({ type: "selectChatAgent", chatId, agent: nextAgent });
+          }}
           disabled={busy}
         >
           <option value="claude">Claude</option>
@@ -1455,7 +1521,7 @@ export function App() {
           className="finish-btn"
           title="Новая сессия (текущая непустая сохранится в истории 🕘)"
           disabled={busy}
-          onClick={() => vscode.postMessage({ type: "newSession" })}
+          onClick={() => post({ type: "newSession" })}
         >
           ＋ Новая
         </button>
@@ -1463,7 +1529,7 @@ export function App() {
           className="finish-btn"
           title="История сессий проекта: вернуться к старой или удалить"
           disabled={busy}
-          onClick={() => vscode.postMessage({ type: "showSessions" })}
+          onClick={() => post({ type: "showSessions" })}
         >
           🕘 История
         </button>
@@ -1471,15 +1537,23 @@ export function App() {
           className="finish-btn"
           hidden={REMOTE}
           title="Все проекты: переключиться, удалить любой (🗑 у строки), добавить"
-          onClick={() => vscode.postMessage({ type: "manageProjects" })}
+          onClick={() => post({ type: "manageProjects" })}
         >
           🗂 Проекты
         </button>
         <button
           className="finish-btn"
+          hidden={REMOTE || IN_MULTI_PANEL}
+          title="Открыть несколько независимых чатов на одной панели"
+          onClick={() => post({ type: "openMultiChat" })}
+        >
+          ▦ Мультичат
+        </button>
+        <button
+          className="finish-btn"
           title="Записать итоги сессии в журнал (docs/journal) и начать новую"
           disabled={busy || !sessionId}
-          onClick={() => vscode.postMessage({ type: "finishSession", agent })}
+          onClick={() => post({ type: "finishSession", agent })}
         >
           ✍ Итоги
         </button>
@@ -1488,7 +1562,7 @@ export function App() {
           title="Настройки: проект, модели агентов, effort, YOLO, пароль сервера"
           onClick={() => {
             setSettingsOpen(true);
-            vscode.postMessage({ type: "getSettings" });
+            post({ type: "getSettings" });
           }}
         >
           ⚙
@@ -1501,7 +1575,7 @@ export function App() {
               ? "Свернуть: вернуть чат в боковую панель"
               : "Во всю ширину: открыть чат вкладкой редактора (сайдбар спрячется)"
           }
-          onClick={() => vscode.postMessage({ type: "openFullView" })}
+          onClick={() => post({ type: "openFullView" })}
         >
           {IN_PANEL ? "⇲" : "⛶"}
         </button>
@@ -1518,7 +1592,7 @@ export function App() {
               : "") +
             "Клик — выбрать модель: только для этого чата или базовую для новых чатов (применится со следующего хода)"
           }
-          onClick={() => vscode.postMessage({ type: "pickModel", agent })}
+          onClick={() => post({ type: "pickModel", agent })}
         >
           {models[agent].fallbackFrom
             ? `⚠️ ${models[agent].model} (фоллбэк с ${models[agent].fallbackFrom})`
@@ -1527,14 +1601,14 @@ export function App() {
         <button
           className="safety-btn"
           title="Effort — глубина размышлений выбранного агента. Клик — выбрать (применится со следующего хода)"
-          onClick={() => vscode.postMessage({ type: "pickEffort", agent })}
+          onClick={() => post({ type: "pickEffort", agent })}
         >
           ⚡ {efforts[agent] || "effort: авто"}
         </button>
         <button
           className={`safety-btn ${safety[agent]?.dangerous ? "safety-danger" : ""}`}
           title="Режим разрешений выбранного агента — клик переключает (Claude: подтверждения → правки без спроса → YOLO; Codex: песочница ↔ YOLO)"
-          onClick={() => vscode.postMessage({ type: "cycleSafety", agent })}
+          onClick={() => post({ type: "cycleSafety", agent })}
         >
           {safety[agent]?.label ?? "🔒"}
         </button>
@@ -1582,7 +1656,7 @@ export function App() {
           className="safety-btn"
           hidden={REMOTE}
           title="Показать контекст агента: что он получит из базы проекта со следующим сообщением (карточка проекта, журнал, лента другого агента) и точный промпт последнего хода"
-          onClick={() => vscode.postMessage({ type: "showContext", agent })}
+          onClick={() => post({ type: "showContext", agent })}
         >
           🧠
         </button>
@@ -1803,7 +1877,7 @@ export function App() {
                       ...prev,
                       [activePath]: (prev[activePath] ?? []).filter((_, j) => j !== i),
                     }));
-                    vscode.postMessage({
+                    post({
                       type: "steer",
                       text: q.text,
                       mode: "next",
@@ -1931,7 +2005,7 @@ export function App() {
               onClick={() =>
                 REMOTE
                   ? fileInputRef.current?.click()
-                  : vscode.postMessage({ type: "pickAttachment", path: activePath })
+                  : post({ type: "pickAttachment", path: activePath })
               }
             >
               📎
@@ -1942,7 +2016,7 @@ export function App() {
               title="Не отправлять агенту, а сохранить доступы из сообщения в переменные окружения выбранных проектов. Формат — по строке на переменную: SSH_PASSWORD=секрет"
               disabled={!draft.trim()}
               onClick={() =>
-                vscode.postMessage({ type: "sendSecretEnv", text: draft, path: activePath })
+                post({ type: "sendSecretEnv", text: draft, path: activePath })
               }
             >
               🔐 в env
@@ -2004,7 +2078,7 @@ export function App() {
                 onClick={() => {
                   setQueueBy((prev) => ({ ...prev, [activePath]: [] }));
                   setActivityBy((prev) => ({ ...prev, [activePath]: "Останавливаю…" }));
-                  vscode.postMessage({ type: "stop", path: activePath });
+                  post({ type: "stop", path: activePath });
                 }}
               >
                 ⏹ Стоп
@@ -2039,7 +2113,7 @@ export function App() {
                     return;
                   }
                   if (choice.step === "scope") {
-                    vscode.postMessage({
+                    post({
                       type: "choose",
                       kind: "model",
                       agent: choice.agent,
@@ -2047,7 +2121,7 @@ export function App() {
                       scope: it.value === "base" ? "base" : "chat",
                     });
                   } else {
-                    vscode.postMessage({ type: "choose", kind: choice.kind, agent: choice.agent, value: it.value });
+                    post({ type: "choose", kind: choice.kind, agent: choice.agent, value: it.value });
                   }
                   setChoice(null);
                 }}
@@ -2061,4 +2135,74 @@ export function App() {
       )}
     </div>
   );
+}
+
+function MultiChatBoard() {
+  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [chats, setChats] = useState<MultiChatSlotView[]>([]);
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent<HostToWebview>) => {
+      if (event.data.type !== "multiState") return;
+      setProjects(event.data.projects);
+      setChats(event.data.chats);
+    };
+    window.addEventListener("message", onMessage);
+    vscode.postMessage({ type: "multiStateReady", chatIds: [] });
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
+  return (
+    <div className="multi-chat-board">
+      <header className="multi-chat-toolbar">
+        <strong>Agent Hub · мультичат</strong>
+        <span className="session">{chats.length} чатов</span>
+        <button className="finish-btn" onClick={() => vscode.postMessage({ type: "createChat" })}>
+          ＋ Чат
+        </button>
+      </header>
+      {chats.length === 0 ? (
+        <div className="empty">Загружаю чаты…</div>
+      ) : (
+        <main
+          className="multi-chat-grid"
+          data-count={chats.length}
+          aria-label="Независимые чаты Agent Hub"
+        >
+          {chats.map((slot) => {
+            const project = projects.find((item) => projectKey(item) === slot.projectPath);
+            return (
+              <section className="multi-chat-tile" key={slot.chatId}>
+                <header className="multi-chat-tile-header">
+                  <span title={`${project?.name ?? "Проект"} · ${slot.title}`}>
+                    {project?.name ?? "Проект"} · {slot.agent === "claude" ? "Claude" : "GPT (Codex)"}
+                  </span>
+                  <button
+                    className="finish-btn"
+                    title="Убрать чат с доски"
+                    aria-label={`Убрать чат проекта ${project?.name ?? ""}`}
+                    onClick={() => vscode.postMessage({ type: "removeChat", chatId: slot.chatId })}
+                  >
+                    ×
+                  </button>
+                </header>
+                <div className="multi-chat-tile-body">
+                  <ChatTile
+                    key={slot.chatId}
+                    chatId={slot.chatId}
+                    initialProjectPath={slot.projectPath}
+                    initialAgent={slot.agent}
+                  />
+                </div>
+              </section>
+            );
+          })}
+        </main>
+      )}
+    </div>
+  );
+}
+
+export function App() {
+  return IN_MULTI_PANEL ? <MultiChatBoard /> : <ChatTile />;
 }

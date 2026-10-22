@@ -33,6 +33,7 @@ import {
 const LEGACY_SESSIONS_KEY = "agentHub.sessions";
 const LEGACY_TRANSCRIPTS_KEY = "agentHub.transcripts";
 const STORE_KEY = "agentHub.sessionStore";
+const MULTI_CHATS_KEY = "agentHub.multiChats";
 const ACTIVE_PROJECT_KEY = "agentHub.activeProject";
 const CLAUDE_COMMANDS_KEY = "agentHub.claudeCommands";
 const CLAUDE_MODELS_KEY = "agentHub.claudeModels";
@@ -51,6 +52,8 @@ const VSCODE_ONLY_ACTIONS = new Set<string>([
   "importSettings",
   "applyConfigJson",
   "openFullView",
+  "openMultiChat",
+  "duplicateProject",
   "pickAttachment",
   "sendSecretEnv",
 ]);
@@ -133,6 +136,19 @@ interface SessionRecord {
 interface ProjectStore {
   activeId: string | null;
   sessions: SessionRecord[];
+}
+
+interface ChatSlot {
+  chatId: string;
+  projectPath: string;
+  recordId: string;
+  agent: AgentId;
+}
+
+interface DirectoryRunGroup {
+  controllers: Set<AbortController>;
+  overlapped: boolean;
+  gitOperation?: Promise<void>;
 }
 
 /** Стартовый список команд Claude до первого хода — реальный приходит из CLI. */
@@ -256,6 +272,7 @@ function formatInputPreview(input: unknown): string {
 }
 
 interface QuestionOrigin {
+  chatId: string;
   recordId: string;
   createdAt: number;
   sessionId: string | null;
@@ -264,6 +281,7 @@ interface QuestionOrigin {
 interface DeferredTurn {
   prompt: string;
   agent: AgentId;
+  chatId?: string;
   questionOrigin?: QuestionOrigin;
 }
 
@@ -273,6 +291,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   /** Полноэкранный режим: тот же чат вкладкой редактора; работает синхронно с сайдбаром. */
   private panel: vscode.WebviewPanel | null = null;
+  /** One optional grid panel; legacy sidebar/panel/remote remain single-chat. */
+  private multiPanel: vscode.WebviewPanel | null = null;
+  private multiInit?: Promise<void>;
   private readonly backends: Record<AgentId, AgentBackend> = {
     claude: new ClaudeBackend(),
     // app-server: корректировка на лету, стриминг, синхронные вопросы.
@@ -280,14 +301,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   };
   /** Запасной транспорт Codex (настройка agentHub.codex.transport = exec). */
   private readonly codexExec = new CodexWriterRecoveryBackend(new CodexBackend(), this.backends.codex);
-  /** Каналы докидывания сообщений в идущие ходы — по проектам. */
+  /** Live state is keyed by chat identity (legacy surfaces use project keys). */
   private steers = new Map<string, SteerChannel>();
   /** Тексты, докинутые в текущий ход, — для общего лога беседы. */
   private steerTexts = new Map<string, string[]>();
   /** Запущенные ходы: логический ключ профиля → контроллер. */
   private runs = new Map<string, AbortController>();
-  /** Logical profiles may share files; only one turn may write that directory. */
-  private directoryRuns = new Map<string, AbortController>();
+  /** Shared cwd runs are permitted; overlap disables unsafe pull/auto-Git. */
+  private directoryRuns = new Map<string, DirectoryRunGroup>();
+  private sessionWriters = new Map<string, AbortController>();
   /** Сообщения для транспорта без живого канала; вопросы привязаны к сессии. */
   private deferred = new Map<string, DeferredTurn[]>();
   /** Сервер мобильного доступа (третья поверхность рядом с сайдбаром и панелью). */
@@ -297,21 +319,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Ожидающие решения запросы canUseTool: requestId → {проект, resolve}. */
   private pendingPermissions = new Map<
     string,
-    { path: string; resolve: (result: { allow: boolean; answer?: string }) => void | Promise<void> }
+    { path: string; chatId?: string; recordId?: string; resolve: (result: { allow: boolean; answer?: string }) => void | Promise<void> }
   >();
 
   /** Сообщение с меткой проекта — webview маршрутизирует в свою ленту. */
-  private postScoped(path: string, msg: HostToWebview) {
-    this.post({ ...msg, path } as HostToWebview);
+  private postScoped(path: string, msg: HostToWebview, chatId?: string) {
+    const event = { ...msg, path, ...(chatId ? { chatId } : {}) } as HostToWebview;
+    if (chatId) this.multiPanel?.webview.postMessage(event);
+    else this.post(event);
   }
 
   /** После изменения реестра: остановить ходы проектов, которых больше нет. */
   private abortOrphanRuns() {
     const known = new Set(this.getProjects().map(projectKey));
+    const liveChats = new Set(this.getChatSlots().map((slot) => slot.chatId));
     for (const [path, controller] of [...this.runs]) {
-      if (!known.has(path)) {
+      if (path.startsWith("chat-") ? !liveChats.has(path) : !known.has(path)) {
         controller.abort();
-        this.denyAllPending(path);
+        this.denyAllPending(path.startsWith("chat-") ? undefined : path, path.startsWith("chat-") ? path : undefined);
       }
     }
   }
@@ -468,14 +493,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * сообщением (карточка, журнал, лента другого агента) и точный промпт
    * последнего хода. Открывается отдельным markdown-документом.
    */
-  async showContext(agent: AgentId) {
-    const project = this.getActiveProject();
+  async showContext(agent: AgentId, chatId?: string) {
+    const slot = this.findChatSlot(chatId);
+    const project = slot
+      ? this.getProjects().find((entry) => projectKey(entry) === slot.projectPath)
+      : this.getActiveProject();
     if (!project) {
       void vscode.window.showWarningMessage("Нет проектов — контекст показывать не для чего.");
       return;
     }
     const cfg = vscode.workspace.getConfiguration("agentHub");
-    const record = this.getActiveRecord(projectKey(project));
+    const record = slot
+      ? this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId) ?? null
+      : this.getActiveRecord(projectKey(project));
     const agentName = agent === "claude" ? "Claude" : "GPT (Codex)";
     const sessionId = record?.agentIds[agent] ?? null;
     const journalDir = cfg.get<string>("journalDir", "docs/journal");
@@ -639,6 +669,96 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /** Clone a profile, optionally copying its complete folder to a sibling. */
+  async duplicateProject(path: string, copyFolder: boolean) {
+    const source = this.getProjects().find((entry) => projectKey(entry) === path);
+    if (!source) return;
+    const mode = copyFolder ? "папку и профиль" : "профиль в той же папке";
+    const confirmed = await vscode.window.showWarningMessage(
+      `Создать ${mode} «${source.name}»?`,
+      { modal: true, detail: copyFolder
+        ? `Будет рекурсивно скопирована вся папка в соседнюю «${nodePath.basename(source.path)} (копия)». Пароль SSH и переменные окружения проекта также будут скопированы в отдельные записи хранилища.`
+        : `Новая запись будет использовать ту же папку, но получит собственную историю и отдельные копии пароля SSH и переменных окружения.` },
+      "Создать копию",
+    );
+    if (confirmed !== "Создать копию") return;
+
+    let targetPath = source.path;
+    let targetName: string;
+    if (copyFolder) {
+      if (!fs.existsSync(source.path) || !fs.statSync(source.path).isDirectory()) {
+        void vscode.window.showErrorMessage("Не удалось скопировать проект: исходная папка недоступна.");
+        return;
+      }
+      const parent = nodePath.dirname(source.path);
+      const basename = nodePath.basename(source.path);
+      for (let suffix = 1; ; suffix++) {
+        const candidateName = suffix === 1 ? `${basename} (копия)` : `${basename} (копия ${suffix})`;
+        const candidate = nodePath.join(parent, candidateName);
+        if (!fs.existsSync(candidate)) {
+          targetName = candidateName;
+          targetPath = candidate;
+          break;
+        }
+      }
+    } else {
+      const names = new Set(this.getProjects().map((entry) => entry.name));
+      const baseName = `${source.name} (копия)`;
+      targetName = baseName;
+      for (let suffix = 2; names.has(targetName); suffix++) targetName = `${baseName} ${suffix}`;
+    }
+
+    let copiedFolder = false;
+    let targetKey: string | undefined;
+    let profilePersisted = false;
+    try {
+      if (copyFolder) {
+        await fs.promises.cp(source.path, targetPath, { recursive: true, force: false, errorOnExist: true });
+        copiedFolder = true;
+      }
+      const profile: ProjectInfo = {
+        ...source,
+        id: `project-${randomUUID()}`,
+        name: copyFolder
+          ? (() => {
+              const names = new Set(this.getProjects().map((entry) => entry.name));
+              const base = `${source.name} (копия)`;
+              let candidate = base;
+              for (let suffix = 2; names.has(candidate); suffix++) candidate = `${base} ${suffix}`;
+              return candidate;
+            })()
+          : targetName!,
+        path: targetPath,
+      };
+      targetKey = projectKey(profile);
+      const password = await this.context.secrets.get(this.passwordKey(path));
+      const env = await this.context.secrets.get(this.secretEnvKey(path));
+      if (password !== undefined) await this.context.secrets.store(this.passwordKey(targetKey), password);
+      if (env !== undefined) await this.context.secrets.store(this.secretEnvKey(targetKey), env);
+      const cfg = vscode.workspace.getConfiguration("agentHub");
+      const configured = [...(cfg.get<ProjectInfo[]>("projects", []) ?? []), profile];
+      await cfg.update("projects", configured, vscode.ConfigurationTarget.Global);
+      profilePersisted = true;
+      await this.setActivePath(targetKey);
+      this.postFullState();
+      await this.postSettings();
+      this.post({ type: "info", text: `Копия проекта «${profile.name}» создана и выбрана.` });
+    } catch (err) {
+      if (!profilePersisted) {
+        if (targetKey) {
+          try { await this.context.secrets.delete(this.passwordKey(targetKey)); } catch { /* best-effort cleanup */ }
+          try { await this.context.secrets.delete(this.secretEnvKey(targetKey)); } catch { /* best-effort cleanup */ }
+        }
+        if (copiedFolder) {
+          await fs.promises.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
+        }
+      }
+      void vscode.window.showErrorMessage(
+        `Не удалось создать копию проекта: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   /**
    * Удаление проекта: «убрать из списка» (файлы не трогаем, история сессий
    * сохраняется на случай возврата) или «удалить с диска» (папка — в Корзину,
@@ -693,8 +813,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    // Останавливаем ход проекта и снимаем зависшие подтверждения.
+    // Останавливаем legacy run and every multi-chat slot bound to this profile.
     this.runs.get(path)?.abort();
+    const removedChatIds = this.getChatSlots().filter((slot) => slot.projectPath === path).map((slot) => slot.chatId);
+    for (const chatId of removedChatIds) {
+      this.runs.get(chatId)?.abort();
+      this.denyAllPending(path, chatId);
+    }
+    if (removedChatIds.length) {
+      const removed = new Set(removedChatIds);
+      await this.saveChatSlots(this.getChatSlots().filter((slot) => !removed.has(slot.chatId)));
+    }
     this.denyAllPending(path);
 
     // Из реестра — в любом случае.
@@ -926,7 +1055,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * с нескольких устройств). Fast-forward, при расхождении — rebase с
    * автостэшем; конфликт не решаем — предупреждаем и работаем на текущей.
    */
-  private async autoPull(cwd: string, eventKey = cwd) {
+  private async autoPull(cwd: string, eventKey = cwd, chatId?: string) {
     const cfg = vscode.workspace.getConfiguration("agentHub");
     if (!cfg.get<boolean>("autoPull", true)) return;
 
@@ -935,7 +1064,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const remotes = await this.execGit(cwd, ["remote"]);
     if (remotes.code !== 0 || !remotes.out.trim()) return;
 
-    this.postScoped(eventKey, { type: "activity", label: "Проверяю обновления в origin…" });
+    this.postScoped(eventKey, { type: "activity", label: "Проверяю обновления в origin…" }, chatId);
     const fetched = await this.execGit(cwd, ["fetch", "--quiet"], 30000);
     if (fetched.code !== 0) return; // офлайн/нет доступа — работаем с тем, что есть
 
@@ -964,7 +1093,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const aheadRes = await this.execGit(cwd, ["rev-list", "--count", `${upstream}..HEAD`]);
     const ahead = aheadRes.code === 0 ? parseInt(aheadRes.out.trim(), 10) || 0 : 0;
 
-    this.postScoped(eventKey, { type: "activity", label: `Подтягиваю новые коммиты (${behind})…` });
+    this.postScoped(eventKey, { type: "activity", label: `Подтягиваю новые коммиты (${behind})…` }, chatId);
     let ok: boolean;
     if (ahead === 0) {
       const merge = await this.execGit(
@@ -984,14 +1113,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.postScoped(eventKey, {
         type: "info",
         text: `Подтянуты обновления из ${upstream}: коммитов — ${behind}. Теперь HEAD ${sha.out.trim()}.`,
-      });
+      }, chatId);
     } else {
       this.postScoped(eventKey, {
         type: "info",
         text:
           `⚠️ В ${upstream} есть новые коммиты (${behind}), но обновиться автоматически не удалось ` +
           `(конфликт или несовместимые локальные изменения). Ход продолжится на текущей версии.`,
-      });
+      }, chatId);
     }
   }
 
@@ -1000,7 +1129,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * commit с заголовком из промпта (+ опциональный push). Claude и Codex
    * проходят через одну точку — runTurn, поэтому покрыты оба.
    */
-  private async autoCommit(cwd: string, agent: AgentId, prompt: string, eventKey = cwd) {
+  private async autoCommit(cwd: string, agent: AgentId, prompt: string, eventKey = cwd, chatId?: string) {
     const cfg = vscode.workspace.getConfiguration("agentHub");
     if (!cfg.get<boolean>("autoCommit", true)) return;
     const short = (s: string) => {
@@ -1034,10 +1163,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (status.code !== 0 || !status.out.trim()) return;
     const changed = status.out.trim().split("\n").length;
 
-    this.postScoped(eventKey, { type: "activity", label: "Коммичу изменения…" });
+    this.postScoped(eventKey, { type: "activity", label: "Коммичу изменения…" }, chatId);
     const add = await this.execGit(cwd, ["add", "-A"]);
     if (add.code !== 0) {
-      this.postScoped(eventKey, { type: "info", text: `Автокоммит: git add не удался — ${short(add.err)}` });
+      this.postScoped(eventKey, { type: "info", text: `Автокоммит: git add не удался — ${short(add.err)}` }, chatId);
       return;
     }
 
@@ -1056,17 +1185,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.postScoped(eventKey, {
         type: "info",
         text: `Автокоммит не удался: ${short(commit.err || commit.out)}`,
-      });
+      }, chatId);
       return;
     }
     const sha = await this.execGit(cwd, ["rev-parse", "--short", "HEAD"]);
     this.postScoped(eventKey, {
       type: "info",
       text: `Автокоммит ${sha.out.trim()}: файлов в изменениях — ${changed}.`,
-    });
+    }, chatId);
 
     if (!cfg.get<boolean>("autoPush", false)) return;
-    this.postScoped(eventKey, { type: "activity", label: "Пушу в origin…" });
+    this.postScoped(eventKey, { type: "activity", label: "Пушу в origin…" }, chatId);
     let push = await this.execGit(cwd, ["push"], 60000);
     if (push.code !== 0 && /no upstream|set-upstream/i.test(push.err)) {
       push = await this.execGit(cwd, ["push", "-u", "origin", "HEAD"], 60000);
@@ -1074,7 +1203,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postScoped(eventKey, {
       type: "info",
       text: push.code === 0 ? "Изменения запушены в origin." : `Пуш не удался: ${short(push.err)}`,
-    });
+    }, chatId);
   }
 
   // ---------- Импорт/экспорт всех настроек ----------
@@ -1339,8 +1468,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * попадают ТОЛЬКО в окружение процессов агентов — в чат и промпт идут лишь
    * имена переменных. Для логинов, ключей API, паролей БД и т.п.
    */
-  async manageSecretEnv() {
-    const project = this.getActiveProject();
+  async manageSecretEnv(chatId?: string) {
+    const slot = this.findChatSlot(chatId);
+    const project = slot
+      ? this.getProjects().find((entry) => projectKey(entry) === slot.projectPath)
+      : this.getActiveProject();
     if (!project) {
       void vscode.window.showWarningMessage("Сначала добавьте проект.");
       return;
@@ -1422,9 +1554,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * Текст разбирается построчно (KEY=value | KEY: value | export KEY=value),
    * агенту НЕ отправляется; в ленту попадают только имена переменных.
    */
-  async sendSecretEnvFromMessage(text: string, sourcePath?: string) {
+  async sendSecretEnvFromMessage(text: string, sourcePath?: string, chatId?: string) {
+    const slot = this.findChatSlot(chatId);
+    if (chatId && !slot) return;
+    sourcePath = slot?.projectPath ?? sourcePath;
     const post = (m: HostToWebview) =>
-      sourcePath ? this.postScoped(sourcePath, m as HostToWebview & { path?: string }) : this.post(m);
+      sourcePath ? this.postScoped(sourcePath, m as HostToWebview & { path?: string }, chatId) : this.post(m);
 
     const pairs: Record<string, string> = {};
     const bad: string[] = [];
@@ -1481,7 +1616,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     await this.postSettings();
     // Поле ввода можно очищать только после успешного сохранения.
-    this.post({ type: "draftHandled", path: sourcePath });
+    if (sourcePath) this.postScoped(sourcePath, { type: "draftHandled" }, chatId);
+    else this.post({ type: "draftHandled" });
     post({
       type: "info",
       text:
@@ -1567,6 +1703,176 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const all = { ...this.getStoreAll() };
     all[projectPath] = store;
     await this.context.globalState.update(STORE_KEY, all);
+  }
+
+  private getChatSlots(): ChatSlot[] {
+    const raw = this.context.globalState.get<unknown[]>(MULTI_CHATS_KEY, []);
+    const projects = new Set(this.getProjects().map(projectKey));
+    return raw.flatMap((value) => {
+      if (!value || typeof value !== "object") return [];
+      const slot = value as Partial<ChatSlot>;
+      if (typeof slot.chatId !== "string" || !/^chat-[a-z0-9-]{8,80}$/i.test(slot.chatId) ||
+          typeof slot.projectPath !== "string" || !projects.has(slot.projectPath) ||
+          typeof slot.recordId !== "string" || (slot.agent !== "claude" && slot.agent !== "codex")) return [];
+      const store = this.getProjectStore(slot.projectPath);
+      if (!store.sessions.some((record) => record.id === slot.recordId)) return [];
+      return [{ chatId: slot.chatId, projectPath: slot.projectPath, recordId: slot.recordId, agent: slot.agent }];
+    });
+  }
+
+  private async saveChatSlots(slots: ChatSlot[]) {
+    await this.context.globalState.update(MULTI_CHATS_KEY, slots);
+  }
+
+  private findChatSlot(chatId: string | undefined): ChatSlot | undefined {
+    return chatId ? this.getChatSlots().find((slot) => slot.chatId === chatId) : undefined;
+  }
+
+  private chatDescriptor(slot: ChatSlot) {
+    const record = this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId);
+    return { ...slot, title: record?.title ?? "Новая сессия" };
+  }
+
+  private async postMultiState(onlyChatId?: string) {
+    if (!this.multiPanel) return;
+    if (!onlyChatId) {
+      this.multiPanel.webview.postMessage({
+        type: "multiState",
+        projects: this.getProjects(),
+        chats: this.getChatSlots().map((slot) => this.chatDescriptor(slot)),
+      } satisfies HostToWebview);
+    }
+    const projects = this.getProjects();
+    for (const slot of this.getChatSlots().filter((entry) => !onlyChatId || entry.chatId === onlyChatId)) {
+      const record = this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId);
+      if (!record) continue;
+      this.postScoped(slot.projectPath, { type: "projects", projects, activePath: slot.projectPath }, slot.chatId);
+      this.postScoped(slot.projectPath, { type: "transcript", path: slot.projectPath, items: record.items, recordId: record.id }, slot.chatId);
+      this.postScoped(slot.projectPath, { type: "busy", value: this.runs.has(slot.chatId) }, slot.chatId);
+      for (const agent of ["claude", "codex"] as const) {
+        this.postScoped(slot.projectPath, { type: "sessionInfo", sessionId: record.agentIds[agent], agent }, slot.chatId);
+        const ctx = record.context?.[agent];
+        this.postScoped(slot.projectPath, { type: "contextUsage", agent, used: ctx?.used ?? 0, max: ctx?.max ?? 0 }, slot.chatId);
+        this.postScoped(slot.projectPath, { type: "modelInfo", agent, model: record.models?.[agent] ?? "", fallbackFrom: record.modelFallbacks?.[agent] }, slot.chatId);
+      }
+    }
+  }
+
+  private async openMultiChat() {
+    if (this.multiPanel) {
+      this.multiPanel.reveal();
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      "agentHub.multiChat",
+      "Agent Hub — мультичат",
+      vscode.ViewColumn.One,
+      { enableScripts: true, retainContextWhenHidden: true,
+        localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "dist")] },
+    );
+    panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, "media", "icon.svg");
+    panel.webview.html = this.renderHtml(panel.webview, "multi-panel");
+    panel.webview.onDidReceiveMessage((msg: WebviewToHost) =>
+      this.onMessage(msg, "vscode", undefined, "multi-panel"),
+    );
+    panel.onDidDispose(() => { if (this.multiPanel === panel) this.multiPanel = null; });
+    this.multiPanel = panel;
+    await this.ensureMultiChats();
+  }
+
+  private async createMultiChat(projectPath?: string) {
+    const slot = await this.createChatSlot(projectPath);
+    if (!slot) {
+      this.multiPanel?.webview.postMessage({ type: "error", message: "Сначала добавьте или выберите проект." });
+      return;
+    }
+    await this.postMultiState();
+  }
+
+  private async removeMultiChat(chatId: string) {
+    this.runs.get(chatId)?.abort();
+    this.denyAllPending(undefined, chatId);
+    await this.saveChatSlots(this.getChatSlots().filter((slot) => slot.chatId !== chatId));
+    await this.postMultiState();
+  }
+
+  private async selectMultiChatProject(chatId: string, projectPath: string) {
+    const slot = this.findChatSlot(chatId);
+    const project = this.getProjects().find((entry) => projectKey(entry) === projectPath);
+    if (!slot || !project || this.runs.has(chatId)) return;
+    const store = this.getProjectStore(projectPath);
+    const record = this.createRecord();
+    store.sessions.push(record);
+    await this.saveProjectStore(projectPath, store);
+    await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId
+      ? { ...entry, projectPath, recordId: record.id } : entry));
+    await this.postMultiState();
+  }
+
+  private async selectMultiChatSession(chatId: string, recordId: string) {
+    const slot = this.findChatSlot(chatId);
+    if (!slot || this.runs.has(chatId) || !this.getProjectStore(slot.projectPath).sessions.some((record) => record.id === recordId)) return;
+    await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId
+      ? { ...entry, recordId } : entry));
+    await this.postMultiState();
+  }
+
+  private async selectMultiChatAgent(chatId: string, agent: AgentId) {
+    const slot = this.findChatSlot(chatId);
+    if (!slot) return;
+    await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId
+      ? { ...entry, agent } : entry));
+    await this.postMultiState();
+  }
+
+  private async createChatSlot(projectPath?: string): Promise<ChatSlot | null> {
+    const project = projectPath
+      ? this.getProjects().find((entry) => projectKey(entry) === projectPath)
+      : this.getActiveProject();
+    if (!project) return null;
+    const key = projectKey(project);
+    const store = this.getProjectStore(key);
+    const record = this.createRecord();
+    store.sessions.push(record);
+    await this.saveProjectStore(key, store);
+    const slot: ChatSlot = {
+      chatId: `chat-${randomUUID()}`,
+      projectPath: key,
+      recordId: record.id,
+      agent: "claude",
+    };
+    await this.saveChatSlots([...this.getChatSlots(), slot]);
+    return slot;
+  }
+
+  private async ensureMultiChats() {
+    if (this.multiInit) return this.multiInit;
+    this.multiInit = this.initializeMultiChats();
+    try {
+      await this.multiInit;
+    } finally {
+      this.multiInit = undefined;
+    }
+  }
+
+  private async initializeMultiChats() {
+    let slots = this.getChatSlots();
+    if (slots.length === 0) {
+      const project = this.getActiveProject() ?? this.getProjects()[0];
+      if (!project) return;
+      const key = projectKey(project);
+      const store = this.getProjectStore(key);
+      const created: ChatSlot[] = [];
+      for (let i = 0; i < 4; i++) {
+        const record = this.createRecord();
+        store.sessions.push(record);
+        created.push({ chatId: `chat-${randomUUID()}`, projectPath: key, recordId: record.id, agent: "claude" });
+      }
+      await this.saveProjectStore(key, store);
+      await this.saveChatSlots(created);
+      slots = created;
+    }
+    await this.postMultiState();
   }
 
   /** Хранилище проекта; при первом обращении мигрирует данные v0.0.2–0.0.3. */
@@ -1699,6 +2005,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postSafety();
     this.postEfforts();
     this.postSlashCommands();
+    if (this.multiPanel) void this.postMultiState();
   }
 
   /** Настройки агента (модель, effort и т.п.) из VS Code settings. */
@@ -1851,7 +2158,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * Быстрый выбор модели по клику на бейдж. Применяется со следующего хода —
    * в т.ч. чтобы вернуться на основную модель после «липкого» фоллбэка.
    */
-  async pickModel(agent: AgentId, remote?: RemoteClient) {
+  async pickModel(agent: AgentId, remote?: RemoteClient, chatId?: string) {
     const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
     const current = section.get<string>("model", "");
     const CUSTOM = "__custom__";
@@ -1960,21 +2267,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     );
     if (!scope) return;
-    await this.applyModel(agent, value, scope.base);
+    await this.applyModel(agent, value, scope.base, chatId);
   }
 
   /** Применить выбор модели: только в этот чат или как базовую для новых. */
-  async applyModel(agent: AgentId, value: string, base: boolean) {
+  async applyModel(agent: AgentId, value: string, base: boolean, chatId?: string) {
     const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
     const agentName = agent === "claude" ? "Claude" : "Codex";
-    const project = this.getActiveProject();
+    const slot = this.findChatSlot(chatId);
+    const project = slot
+      ? this.getProjects().find((entry) => projectKey(entry) === slot.projectPath)
+      : this.getActiveProject();
     if (base) {
       await section.update("model", value, vscode.ConfigurationTarget.Global);
       // Базовая изменилась — текущий чат следует ей, свой выбор снимаем.
       if (project) {
-        await this.mutateActiveRecord(projectKey(project), (r) => {
+        const mutate = (r: SessionRecord) => {
           if (r.modelOverrides) delete r.modelOverrides[agent];
-        });
+        };
+        if (slot) await this.mutateRecord(slot.projectPath, slot.recordId, mutate);
+        else await this.mutateActiveRecord(projectKey(project), mutate);
       }
       this.post({
         type: "info",
@@ -1984,11 +2296,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
     } else {
       if (!project) return;
-      await this.mutateActiveRecord(projectKey(project), (r) => {
+        const mutate = (r: SessionRecord) => {
         const o = (r.modelOverrides ??= {});
         if (value) o[agent] = value;
         else delete o[agent];
-      });
+        };
+        if (slot) await this.mutateRecord(slot.projectPath, slot.recordId, mutate);
+        else await this.mutateActiveRecord(projectKey(project), mutate);
       const baseModel = section.get<string>("model", "") || "по умолчанию CLI";
       this.post({
         type: "info",
@@ -2072,7 +2386,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Быстрый выбор effort (глубины размышлений) по клику в статус-баре. */
-  async pickEffort(agent: AgentId, remote?: RemoteClient) {
+  async pickEffort(agent: AgentId, remote?: RemoteClient, _chatId?: string) {
     const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
     const current = section.get<string>("effort", "");
     type Item = vscode.QuickPickItem & { value: string };
@@ -2327,33 +2641,50 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Список сессий проекта: переключение по клику, удаление корзинкой. */
   /** Переключиться на сессию активного проекта (меню мобильного клиента). */
-  async applySession(id: string) {
-    const project = this.getActiveProject();
+  async applySession(id: string, chatId?: string) {
+    const slot = this.findChatSlot(chatId);
+    const project = slot
+      ? this.getProjects().find((entry) => projectKey(entry) === slot.projectPath)
+      : this.getActiveProject();
     if (!project) return;
-    if (this.runs.has(projectKey(project))) {
-      this.post({ type: "error", message: "В этом проекте идёт ход — дождитесь завершения." });
+    if (this.runs.has(chatId ?? projectKey(project))) {
+      const event = { type: "error", message: "В этом проекте идёт ход — дождитесь завершения." } as const;
+      if (slot) this.postScoped(slot.projectPath, event, chatId);
+      else this.post(event);
       return;
     }
     const store = this.getProjectStore(projectKey(project));
     if (!store.sessions.some((s) => s.id === id)) return;
-    store.activeId = id;
-    this.pruneEmptySessions(store);
-    await this.saveProjectStore(projectKey(project), store);
-    this.postFullState();
+    if (slot) {
+      await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId ? { ...entry, recordId: id } : entry));
+      await this.postMultiState(chatId);
+    } else {
+      store.activeId = id;
+      this.pruneEmptySessions(store);
+      await this.saveProjectStore(projectKey(project), store);
+      this.postFullState();
+    }
   }
 
-  async showSessions(remote?: RemoteClient) {
-    const project = this.getActiveProject();
+  async showSessions(remote?: RemoteClient, chatId?: string) {
+    const slot = this.findChatSlot(chatId);
+    const project = slot
+      ? this.getProjects().find((entry) => projectKey(entry) === slot.projectPath)
+      : this.getActiveProject();
     if (!project) return;
-    if (this.runs.has(projectKey(project))) {
-      this.post({ type: "error", message: "В этом проекте идёт ход — дождитесь завершения." });
+    if (this.runs.has(chatId ?? projectKey(project))) {
+      const event = { type: "error", message: "В этом проекте идёт ход — дождитесь завершения." } as const;
+      if (slot) this.postScoped(slot.projectPath, event, chatId);
+      else this.post(event);
       return;
     }
     const store = this.getProjectStore(projectKey(project));
-    this.pruneEmptySessions(store);
+    if (!slot) this.pruneEmptySessions(store);
     await this.saveProjectStore(projectKey(project), store);
     if (store.sessions.length === 0) {
-      this.post({ type: "info", text: "История сессий этого проекта пуста." });
+      const event = { type: "info", text: "История сессий этого проекта пуста." } as const;
+      if (slot) this.postScoped(slot.projectPath, event, chatId);
+      else this.post(event);
       return;
     }
 
@@ -2373,7 +2704,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               "без запусков"
             }`,
             value: s.id,
-            current: s.id === store.activeId,
+          current: s.id === (slot?.recordId ?? store.activeId),
           })),
       });
       return;
@@ -2396,7 +2727,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       [...store.sessions]
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .map((s) => ({
-          label: (s.id === store.activeId ? "$(circle-filled) " : "$(comment-discussion) ") + s.title,
+          label: (s.id === (slot?.recordId ?? store.activeId) ? "$(circle-filled) " : "$(comment-discussion) ") + s.title,
           description: format(s.updatedAt),
           detail:
             [s.agentIds.claude && "Claude", s.agentIds.codex && "Codex"]
@@ -2422,6 +2753,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         store.activeId = latest?.id ?? null;
       }
       await this.saveProjectStore(projectKey(project), store);
+      if (slot?.recordId === rec.id) {
+        const fallback = store.sessions.sort((a, b) => b.updatedAt - a.updatedAt)[0] ?? this.createRecord();
+        if (!store.sessions.some((entry) => entry.id === fallback.id)) store.sessions.push(fallback);
+        await this.saveProjectStore(slot.projectPath, store);
+        await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId ? { ...entry, recordId: fallback.id } : entry));
+      }
       this.postFullState();
       if (store.sessions.length === 0) {
         qp.hide();
@@ -2433,11 +2770,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     qp.onDidAccept(async () => {
       const picked = qp.selectedItems[0];
       if (picked) {
-        store.activeId = picked.sessionId;
-        // Уходя с пустой сессии — не оставляем её в истории.
-        this.pruneEmptySessions(store);
-        await this.saveProjectStore(projectKey(project), store);
-        this.postFullState();
+        if (slot) {
+          await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId ? { ...entry, recordId: picked.sessionId } : entry));
+          await this.postMultiState(chatId);
+        } else {
+          store.activeId = picked.sessionId;
+          // Уходя с пустой сессии — не оставляем её в истории.
+          this.pruneEmptySessions(store);
+          await this.saveProjectStore(projectKey(project), store);
+          this.postFullState();
+        }
       }
       qp.hide();
     });
@@ -2448,7 +2790,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // ---------- Управление сессиями ----------
 
-  newSession() {
+  async newSession(chatId?: string) {
+    const slot = this.findChatSlot(chatId);
+    if (slot) {
+      if (this.runs.has(chatId!)) {
+        this.postScoped(slot.projectPath, { type: "error", message: "Дождитесь окончания хода или остановите его перед созданием новой сессии." }, chatId);
+        return;
+      }
+      const store = this.getProjectStore(slot.projectPath);
+      const current = store.sessions.find((record) => record.id === slot.recordId);
+      let record: SessionRecord;
+      if (current && !hasUserContent(current.items)) {
+        current.items = [];
+        current.agentIds = { claude: null, codex: null };
+        current.title = "Новая сессия";
+        current.createdAt = Date.now();
+        current.updatedAt = Date.now();
+        current.context = {};
+        current.models = {};
+        current.chatLog = [];
+        current.chatSeen = {};
+        current.modelOverrides = {};
+        current.lastPrompts = {};
+        record = current;
+      } else {
+        record = this.createRecord();
+        store.sessions.push(record);
+      }
+      await this.saveProjectStore(slot.projectPath, store);
+      await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId
+        ? { ...entry, recordId: record.id } : entry));
+      await this.postMultiState();
+      this.postScoped(slot.projectPath, { type: "info", text: "Новая сессия." }, chatId);
+      return;
+    }
     const active = this.getActiveProject();
     if (active) {
       this.runs.get(projectKey(active))?.abort();
@@ -2498,12 +2873,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private post(msg: HostToWebview) {
     this.view?.webview.postMessage(msg);
     this.panel?.webview.postMessage(msg);
+    const chatEvents = new Set([
+      "projects", "transcript", "busy", "activity", "sessionInfo", "userMessage",
+      "textDelta", "assistantText", "toolUse", "turnResult", "info", "error", "reset",
+      "permissionRequest", "permissionResolved", "contextUsage", "modelInfo", "draftHandled",
+    ]);
+    if (!chatEvents.has(msg.type)) this.multiPanel?.webview.postMessage(msg);
     this.remote?.broadcast(msg);
   }
 
   /** Показать чат пользователю: вкладка приоритетнее сайдбара. */
   private revealUi() {
-    if (this.panel) this.panel.reveal(undefined, true);
+    if (this.multiPanel) this.multiPanel.reveal(undefined, true);
+    else if (this.panel) this.panel.reveal(undefined, true);
     else this.view?.show?.(true);
   }
 
@@ -2512,7 +2894,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * редактора и спрятать сайдбар; из вкладки (или повторный вызов командой) —
    * закрыть вкладку и вернуть чат в боковую панель, как было.
    */
-  async openFullView(from?: "view" | "panel") {
+  async openFullView(from?: "view" | "panel" | "multi-panel") {
     if (this.panel && from !== "view") {
       this.panel.dispose(); // onDidDispose обнулит this.panel
       await vscode.commands.executeCommand("agentHub.chat.focus");
@@ -2553,7 +2935,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     source: "vscode" | "remote" = "vscode",
     client?: RemoteClient,
     /** Поверхность VS Code, приславшая сообщение: боковая панель или вкладка. */
-    surface?: "view" | "panel",
+      surface?: "view" | "panel" | "multi-panel",
   ) {
     // Мобильный клиент: действия с нативными диалогами VS Code недоступны,
     // а пикеры модели/effort/сессий заменяются меню в самом webview.
@@ -2577,52 +2959,76 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     switch (msg.type) {
       case "ready":
-        this.postFullState();
+        if (surface === "multi-panel" && msg.chatId) void this.postMultiState(msg.chatId);
+        else if (surface === "multi-panel") void this.ensureMultiChats();
+        else this.postFullState();
+        break;
+      case "multiStateReady":
+        if (surface === "multi-panel") void this.postMultiState();
+        break;
+      case "createChat":
+        if (surface === "multi-panel") await this.createMultiChat(msg.projectPath);
+        break;
+      case "removeChat":
+        if (surface === "multi-panel") await this.removeMultiChat(msg.chatId);
+        break;
+      case "selectChatProject":
+        if (surface === "multi-panel") await this.selectMultiChatProject(msg.chatId, msg.projectPath);
+        break;
+      case "selectChatSession":
+        if (surface === "multi-panel") await this.selectMultiChatSession(msg.chatId, msg.recordId);
+        break;
+      case "selectChatAgent":
+        if (surface === "multi-panel") await this.selectMultiChatAgent(msg.chatId, msg.agent);
         break;
       case "stop": {
+        const slot = this.findChatSlot(msg.chatId);
         const requested = msg.path ?? this.getActiveProjectKey();
+        const target = msg.chatId ?? requested;
         // Ищем, что останавливать: запрошенный проект → единственный запуск.
-        const target =
-          requested && this.runs.has(requested)
-            ? requested
-            : !requested && this.runs.size === 1
+        const runTarget =
+          target && this.runs.has(target)
+            ? target
+            : !target && this.runs.size === 1
               ? [...this.runs.keys()][0]
               : undefined;
-        if (target) {
-          this.postScoped(target, { type: "activity", label: "Останавливаю…" });
-          this.runs.get(target)?.abort();
-          this.denyAllPending(target);
+        if (runTarget) {
+          this.postScoped(slot?.projectPath ?? requested ?? "", { type: "activity", label: "Останавливаю…" }, msg.chatId);
+          this.runs.get(runTarget)?.abort();
+          this.denyAllPending(slot?.projectPath ?? requested, msg.chatId);
           // Страховка: бэкенд не завершился за 6 с — принудительно чистим UI.
           setTimeout(() => {
-            if (this.runs.has(target)) {
-              this.runs.delete(target);
-              this.postScoped(target, { type: "busy", value: false });
-              this.postScoped(target, {
+            if (this.runs.has(runTarget)) {
+              this.runs.delete(runTarget);
+              this.postScoped(slot?.projectPath ?? requested ?? "", { type: "busy", value: false }, msg.chatId);
+              this.postScoped(slot?.projectPath ?? requested ?? "", {
                 type: "error",
                 message: "Ход остановлен принудительно: бэкенд не ответил на прерывание.",
-              });
+              }, msg.chatId);
             }
           }, 6000);
         } else if (requested) {
           // Запусков нет, а UI считает проект занятым (рассинхрон после
           // перезагрузки) — «Стоп» приводит панель в порядок.
-          this.denyAllPending(requested);
-          this.postScoped(requested, { type: "busy", value: false });
+          this.denyAllPending(requested, msg.chatId);
+          this.postScoped(slot?.projectPath ?? requested, { type: "busy", value: false }, msg.chatId);
         }
         break;
       }
       case "newSession":
-        this.newSession();
+        await this.newSession(msg.chatId);
         break;
       case "send":
-        await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], msg.path, true);
+        await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], msg.path, true, undefined, msg.chatId);
         break;
       case "steer": {
-        const target = msg.path ?? this.getActiveProjectKey();
-        const channel = target ? this.steers.get(target) : undefined;
-        if (!target || !this.runs.has(target) || !channel?.handler) {
+        const slot = this.findChatSlot(msg.chatId);
+        const target = slot?.projectPath ?? msg.path ?? this.getActiveProjectKey();
+        const runKey = msg.chatId ?? target ?? "";
+        const channel = target ? this.steers.get(runKey) : undefined;
+        if (!target || !this.runs.has(runKey) || !channel?.handler) {
           // Ход уже закончился или агент не принимает сообщения на лету — обычная отправка.
-          await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], msg.path, true);
+          await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], target, true, undefined, msg.chatId);
           break;
         }
         const project = this.getProjects().find((p) => projectKey(p) === target);
@@ -2633,29 +3039,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           type: "userMessage",
           text: msg.text,
           attachments: files.length > 0 ? files.map((a) => a.name) : undefined,
-        });
+        }, msg.chatId);
         try {
           await channel.handler(text, msg.mode);
-          const list = this.steerTexts.get(target) ?? [];
+          const list = this.steerTexts.get(runKey) ?? [];
           list.push(text);
-          this.steerTexts.set(target, list);
+          this.steerTexts.set(runKey, list);
           this.postScoped(target, {
             type: "info",
             text:
               msg.mode === "now"
                 ? "⚡ Сообщение отправлено агенту немедленно — текущий шаг прерывается."
                 : "↪ Сообщение докинуто в идущий ход — агент учтёт его на ближайшем шаге.",
-          });
+          }, msg.chatId);
         } catch (err) {
           this.postScoped(target, {
             type: "info",
             text: `Докинуть в идущий ход не удалось (${err instanceof Error ? err.message : err}) — сообщение уйдёт после завершения хода.`,
-          });
-          this.deferTurn(target, msg.agent, msg.text);
+          }, msg.chatId);
+          this.deferTurn(target, msg.agent, msg.text, undefined, msg.chatId);
         }
         break;
       }
       case "pickAttachment": {
+        const slot = this.findChatSlot(msg.chatId);
+        const target = slot?.projectPath ?? msg.path ?? this.getActiveProjectKey();
         const picked = await vscode.window.showOpenDialog({
           canSelectFiles: true,
           canSelectFolders: false,
@@ -2663,19 +3071,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           openLabel: "Прикрепить",
         });
         if (picked?.length) {
-          this.post({
+          const event: HostToWebview = {
             type: "attachmentAdded",
             files: picked.map((u) => ({ name: nodePath.basename(u.fsPath), path: u.fsPath })),
-            path: msg.path ?? this.getActiveProjectKey(),
-          });
+          };
+          if (target) this.postScoped(target, event, msg.chatId);
         }
         break;
       }
       case "saveAttachment":
-        await this.saveAttachment(msg.name, msg.dataBase64, msg.path);
+        await this.saveAttachment(msg.name, msg.dataBase64, msg.path, msg.chatId);
         break;
       case "finishSession":
-        await this.finishSession(msg.agent);
+        await this.finishSession(msg.agent, msg.chatId);
         break;
       case "selectProject":
         await this.setActivePath(msg.path);
@@ -2692,7 +3100,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case "saveTranscript": {
         const store = this.getProjectStore(msg.path);
-        const rec = store.sessions.find((s) => s.id === store.activeId);
+        const slot = this.findChatSlot(msg.chatId);
+        const rec = msg.chatId
+          ? (slot?.projectPath === msg.path && (!msg.recordId || slot.recordId === msg.recordId)
+            ? store.sessions.find((s) => s.id === slot.recordId) : undefined)
+          : store.sessions.find((s) => s.id === store.activeId);
         if (rec) {
           rec.items = msg.items.slice(-TRANSCRIPT_MAX_ITEMS);
           rec.updatedAt = Date.now();
@@ -2700,11 +3112,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             rec.title = deriveTitle(rec.items) ?? rec.title;
           }
           await this.saveProjectStore(msg.path, store);
+          if (msg.chatId) await this.postMultiState(msg.chatId);
         }
         break;
       }
       case "showSessions":
-        await this.showSessions();
+        await this.showSessions(undefined, msg.chatId);
+        break;
+      case "openMultiChat":
+        await this.openMultiChat();
+        break;
+      case "duplicateProject":
+        await this.duplicateProject(msg.path, msg.copyFolder);
         break;
       case "openFullView":
         await this.openFullView(surface);
@@ -2731,35 +3150,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.cycleSafety(msg.agent);
         break;
       case "pickModel":
-        await this.pickModel(msg.agent);
+        await this.pickModel(msg.agent, undefined, msg.chatId);
         break;
       case "pickEffort":
-        await this.pickEffort(msg.agent);
+        await this.pickEffort(msg.agent, undefined, msg.chatId);
         break;
       case "showContext":
-        await this.showContext(msg.agent);
+        await this.showContext(msg.agent, msg.chatId);
         break;
       case "manageSecretEnv":
-        await this.manageSecretEnv();
+        await this.manageSecretEnv(msg.chatId);
         break;
       case "sendSecretEnv":
-        await this.sendSecretEnvFromMessage(msg.text, msg.path);
+        await this.sendSecretEnvFromMessage(msg.text, msg.path, msg.chatId);
         break;
       case "openFile":
         await this.openFileFromChat(msg.path, msg.project);
         break;
       case "choose":
         if (msg.kind === "model") {
-          await this.applyModel(msg.agent ?? "claude", msg.value, msg.scope === "base");
+          await this.applyModel(msg.agent ?? "claude", msg.value, msg.scope === "base", msg.chatId);
         } else if (msg.kind === "effort") {
           await this.applyEffort(msg.agent ?? "claude", msg.value);
         } else {
-          await this.applySession(msg.value);
+          await this.applySession(msg.value, msg.chatId);
         }
         break;
       case "permission": {
         const pending = this.pendingPermissions.get(msg.requestId);
-        if (pending) {
+        if (pending && (!pending.chatId || pending.chatId === msg.chatId)) {
           this.pendingPermissions.delete(msg.requestId);
           await pending.resolve({ allow: msg.allow, answer: msg.answer });
         }
@@ -2774,9 +3193,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Сохранить вставленный/перетащенный файл в <проект>/.agent-hub/attachments/. */
-  private async saveAttachment(name: string, dataBase64: string, projectPath?: string) {
+  private async saveAttachment(name: string, dataBase64: string, projectPath?: string, chatId?: string) {
     // Проект — тот, чья лента прислала файл: «активный» хоста мог отличаться
     // (переключение, другое окно), и вложение уезжало в чужую папку.
+    const slot = this.findChatSlot(chatId);
+    if (chatId && !slot) return;
+    if (slot && projectPath && projectPath !== slot.projectPath) return;
+    projectPath = slot?.projectPath ?? projectPath;
     const project = projectPath
       ? this.getProjects().find((p) => projectKey(p) === projectPath)
       : this.getActiveProject();
@@ -2791,26 +3214,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const safeName = name.replace(/[^\wа-яА-ЯёЁ.\-]+/g, "_") || "file";
       const filePath = nodePath.join(dir, `${stamp}-${randomUUID()}-${safeName}`);
       await fs.promises.writeFile(filePath, Buffer.from(dataBase64, "base64"));
-      this.post({
+      this.postScoped(projectKey(project), {
         type: "attachmentAdded",
         files: [{ name: nodePath.basename(filePath), path: filePath }],
-        path: projectKey(project),
-      });
+      }, chatId);
     } catch (err) {
-      this.post({
+      const event: HostToWebview = {
         type: "error",
         message: `Не удалось сохранить вложение: ${err instanceof Error ? err.message : err}`,
-      });
+      };
+      if (project) this.postScoped(projectKey(project), event, chatId);
+      else this.post(event);
     }
   }
 
   /** Отклонить зависшие подтверждения: по проекту или все (path не задан). */
-  private denyAllPending(path?: string) {
+  private denyAllPending(path?: string, chatId?: string) {
     for (const [requestId, pending] of [...this.pendingPermissions]) {
       if (path && pending.path !== path) continue;
+      if (chatId && pending.chatId !== chatId) continue;
       pending.resolve({ allow: false });
       this.pendingPermissions.delete(requestId);
-      this.postScoped(pending.path, { type: "permissionResolved", requestId, allow: false });
+      this.postScoped(pending.path, { type: "permissionResolved", requestId, allow: false }, pending.chatId);
     }
   }
 
@@ -2850,31 +3275,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private isQuestionOriginCurrent(cwd: string, agent: AgentId, origin: QuestionOrigin): boolean {
     if (!this.getProjects().some((project) => projectKey(project) === cwd)) return false;
-    const current = this.getActiveRecord(cwd);
+    const slot = this.findChatSlot(origin.chatId);
+    const current = slot
+      ? slot.projectPath === cwd
+        ? this.getProjectStore(cwd).sessions.find((record) => record.id === slot.recordId) ?? null
+        : null
+      : this.getActiveRecord(cwd);
     return !!current && current.id === origin.recordId && current.createdAt === origin.createdAt &&
       current.agentIds[agent] === origin.sessionId;
   }
 
-  private reportExpiredQuestion(cwd: string) {
+  private reportExpiredQuestion(cwd: string, chatId?: string) {
     this.postScoped(cwd, {
       type: "info",
       text: "Ответ относится к прежней сессии или удалённому проекту и устарел. Он не отправлен; задайте сообщение в нужной сессии заново.",
-    });
+    }, chatId);
   }
 
   /** Ход после завершения текущего (или сразу, если проект свободен). */
-  private deferTurn(cwd: string, agent: AgentId, prompt: string, questionOrigin?: QuestionOrigin) {
+  private deferTurn(cwd: string, agent: AgentId, prompt: string, questionOrigin?: QuestionOrigin, chatId?: string) {
     if (questionOrigin && !this.isQuestionOriginCurrent(cwd, agent, questionOrigin)) {
-      this.reportExpiredQuestion(cwd);
+      this.reportExpiredQuestion(cwd, chatId);
       return false;
     }
-    if (this.runs.has(cwd)) {
-      const list = this.deferred.get(cwd) ?? [];
-      list.push({ prompt, agent, questionOrigin });
-      this.deferred.set(cwd, list);
+    const runKey = chatId ?? cwd;
+    if (this.runs.has(runKey)) {
+      const list = this.deferred.get(runKey) ?? [];
+      list.push({ prompt, agent, chatId, questionOrigin });
+      this.deferred.set(runKey, list);
       return true;
     }
-    void this.runTurn(prompt, agent, [], cwd, true, questionOrigin);
+    void this.runTurn(prompt, agent, [], cwd, true, questionOrigin, chatId);
     return true;
   }
 
@@ -3077,8 +3508,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     targetPath?: string,
     echoUser = false,
     expectedQuestionOrigin?: QuestionOrigin,
+    chatId?: string,
   ) {
-    const project = targetPath
+    const slot = this.findChatSlot(chatId);
+    if (chatId && (!slot || (targetPath && targetPath !== slot.projectPath))) {
+      this.multiPanel?.webview.postMessage({ type: "error", message: "Чат уже удалён или его проект изменился. Обновите мультичат.", chatId });
+      return;
+    }
+    const project = slot
+      ? (this.getProjects().find((p) => projectKey(p) === slot.projectPath) ?? null)
+      : targetPath
       ? (this.getProjects().find((p) => projectKey(p) === targetPath) ?? null)
       : this.getActiveProject();
     if (!project) {
@@ -3091,73 +3530,85 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const cwd = projectKey(project);
+    const runKey = chatId ?? cwd;
     const workingDir = project.path;
+    const emit = (msg: HostToWebview) => this.postScoped(cwd, msg, chatId);
     if (expectedQuestionOrigin && !this.isQuestionOriginCurrent(cwd, agent, expectedQuestionOrigin)) {
-      this.reportExpiredQuestion(cwd);
+      this.reportExpiredQuestion(cwd, chatId);
       return;
     }
-    if (this.runs.has(cwd)) {
-      this.postScoped(cwd, {
+    if (this.runs.has(runKey)) {
+      emit({
         type: "error",
-        message: `В проекте «${project.name}» агент ещё работает. Дождитесь ответа или нажмите «Стоп».`,
+        message: `В этом чате уже идёт ход. Дождитесь ответа или остановите его.`,
       });
       return;
     }
     if (!fs.existsSync(workingDir)) {
-      this.postScoped(cwd, { type: "error", message: `Папка проекта не найдена: ${workingDir}` });
+      emit({ type: "error", message: `Папка проекта не найдена: ${workingDir}` });
       return;
     }
 
     const directory = physicalDirectory(workingDir);
     const directoryRuns = (this.directoryRuns ??= new Map());
-    if (directoryRuns.has(directory)) {
-      this.postScoped(cwd, { type: "error", message: "В этой рабочей папке уже идёт ход другого профиля. Дождитесь его завершения или остановите тот ход." });
-      return;
-    }
+    const group = directoryRuns.get(directory) ?? { controllers: new Set<AbortController>(), overlapped: false };
+    if (group.controllers.size > 0) group.overlapped = true;
     const controller = new AbortController();
-    directoryRuns.set(directory, controller);
-    this.runs.set(cwd, controller);
+    group.controllers.add(controller);
+    directoryRuns.set(directory, group);
+    this.runs.set(runKey, controller);
     const releaseDirectory = () => {
-      if (directoryRuns.get(directory) === controller) directoryRuns.delete(directory);
+      const current = directoryRuns.get(directory);
+      current?.controllers.delete(controller);
+      if (current?.controllers.size === 0 && current === group) directoryRuns.delete(directory);
     };
+    let releaseWriter: () => void = () => {};
     try {
 
     // Изоляция проектов: вложение из папки ДРУГОГО проекта (старый дефект —
     // сохранялось в «активный» проект хоста) копируем сюда, чтобы агент не
     // ходил в чужую папку и не узнавал о другом проекте.
     attachments = await this.relocateAttachments(workingDir, attachments, cwd);
-    if (controller.signal.aborted || this.runs.get(cwd) !== controller ||
-        directoryRuns.get(directory) !== controller ||
+    if (controller.signal.aborted || this.runs.get(runKey) !== controller ||
+        !directoryRuns.get(directory)?.controllers.has(controller) ||
         (expectedQuestionOrigin && !this.isQuestionOriginCurrent(cwd, agent, expectedQuestionOrigin))) {
-      if (expectedQuestionOrigin) this.reportExpiredQuestion(cwd);
+      if (expectedQuestionOrigin) this.reportExpiredQuestion(cwd, chatId);
       return;
     }
 
     const discardStaleQuestion = () => {
       if (!expectedQuestionOrigin || (!controller.signal.aborted &&
-        this.runs.get(cwd) === controller &&
+        this.runs.get(runKey) === controller &&
         this.isQuestionOriginCurrent(cwd, agent, expectedQuestionOrigin))) return false;
-      if (this.runs.get(cwd) === controller) {
-        this.runs.delete(cwd);
-        this.postScoped(cwd, { type: "busy", value: false });
+      if (this.runs.get(runKey) === controller) {
+        this.runs.delete(runKey);
+        emit({ type: "busy", value: false });
       }
-      this.reportExpiredQuestion(cwd);
+      this.reportExpiredQuestion(cwd, chatId);
       return true;
     };
     if (echoUser && !expectedQuestionOrigin) {
       // Пузырь пользователя рассылает хост — обе поверхности видят одно и то же.
-      this.postScoped(cwd, {
+      emit({
         type: "userMessage",
         text: prompt,
         attachments: attachments.length ? attachments.map((a) => a.name) : undefined,
       });
     }
-    this.postScoped(cwd, { type: "busy", value: true });
-    this.postScoped(cwd, { type: "activity", label: "Запускается…" });
+    emit({ type: "busy", value: true });
+    emit({ type: "activity", label: "Запускается…" });
 
     // Перед изменениями — актуальная версия: подтягиваем новые коммиты,
     // чтобы агент (и журнал сессий) работали поверх свежего кода.
-    await this.autoPull(workingDir, cwd);
+    if (group.gitOperation) await group.gitOperation;
+    if (group.overlapped) {
+      emit({ type: "info", text: "В этой папке уже работает другой чат: автообновление Git пропущено." });
+    } else {
+      const operation = this.autoPull(workingDir, cwd, chatId);
+      group.gitOperation = operation;
+      await operation;
+      if (group.gitOperation === operation) group.gitOperation = undefined;
+    }
     if (discardStaleQuestion()) return;
 
     // Slash-команды: Claude Code исполняет их сам, но промпт обязан НАЧИНАТЬСЯ
@@ -3168,7 +3619,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const expanded = this.expandCodexPrompt(prompt);
       if (expanded !== null) {
         userText = expanded;
-        this.postScoped(cwd, {
+        emit({
           type: "info",
           text: `Команда развёрнута из ~/.codex/prompts.`,
         });
@@ -3186,7 +3637,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       : userText;
 
     // Новая сессия — карточка проекта + контекст из журнала (общая память).
-    const record = await this.ensureActiveRecord(cwd);
+    const store = this.getProjectStore(cwd);
+    let record = slot ? store.sessions.find((item) => item.id === slot.recordId) : null;
+    if (!record && slot) {
+      emit({ type: "error", message: "Сессия чата удалена из истории." });
+      return;
+    }
+    record ??= await this.ensureActiveRecord(cwd);
+    const writerKeys = [`record:${cwd}:${record.id}:${agent}`];
+    if (record.agentIds[agent]) writerKeys.push(`session:${agent}:${record.agentIds[agent]}`);
+    const conflictingWriter = writerKeys.find((key) => this.sessionWriters.has(key));
+    if (conflictingWriter) {
+      emit({ type: "error", message: "Эта CLI-сессия уже запущена в другом чате. Выберите отдельную сессию." });
+      return;
+    }
+    for (const key of writerKeys) this.sessionWriters.set(key, controller);
+    releaseWriter = () => {
+      for (const key of writerKeys) if (this.sessionWriters.get(key) === controller) this.sessionWriters.delete(key);
+    };
     if (discardStaleQuestion()) return;
     const sessions = record.agentIds;
 
@@ -3198,7 +3666,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const unseen = chatLog.slice(seenIdx).filter((e) => e.agent !== agent);
     const crossContext = isSlashCommand ? null : buildCrossContext(unseen);
     if (crossContext) {
-      this.postScoped(cwd, {
+      emit({
         type: "info",
         text: `В контекст добавлены сообщения другого агента из этой ленты: ${crossContext.count}.`,
       });
@@ -3224,7 +3692,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (discardStaleQuestion()) return;
       if (journalContext) {
         parts.push(journalContext);
-        this.postScoped(cwd, { type: "info", text: "В контекст добавлены записи журнала сессий." });
+        emit({ type: "info", text: "В контекст добавлены записи журнала сессий." });
       }
       if (crossContext) parts.push(crossContext.block);
       parts.push(`Задача пользователя:\n${promptWithAttachments}`);
@@ -3256,7 +3724,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.mutateRecord(cwd, record.id, (r) => {
         if (r.createdAt !== recordGen) return;
         if (questionPreparation && expectedQuestionOrigin && (controller.signal.aborted ||
-          this.runs.get(cwd) !== controller ||
+          this.runs.get(runKey) !== controller ||
           !this.isQuestionOriginCurrent(cwd, agent, expectedQuestionOrigin))) return;
         fn(r);
       });
@@ -3276,7 +3744,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (discardStaleQuestion()) return;
     try {
       if (echoUser && expectedQuestionOrigin) {
-        this.postScoped(cwd, {
+        emit({
           type: "userMessage", text: prompt,
           attachments: attachments.length ? attachments.map((a) => a.name) : undefined,
         });
@@ -3289,7 +3757,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           ? this.codexExec
           : this.backends[agent];
       const steer: SteerChannel = {};
-      this.steers.set(cwd, steer);
+      this.steers.set(runKey, steer);
       const events = backend.start(fullPrompt, {
         cwd: workingDir,
         resumeSessionId: sessions[agent] ?? undefined,
@@ -3300,7 +3768,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         extraEnv: serverEnv,
         config: this.buildAgentConfig(agent, record.modelOverrides?.[agent]),
         attachments: attachments.map((a) => ({ path: a.path, isImage: isImagePath(a.path) })),
-        confirmTool: (toolName, input) => this.confirmTool(toolName, input, cwd),
+        confirmTool: (toolName, input) => this.confirmTool(toolName, input, cwd, chatId, record.id),
       });
 
       // «Доставлено» — только содержательные события (сессия создана, текст,
@@ -3315,13 +3783,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             await mutateTurnRecord((r) => {
               r.agentIds[agent] = ev.sessionId;
             });
-            this.postScoped(cwd, { type: "sessionInfo", sessionId: ev.sessionId, agent });
+            emit({ type: "sessionInfo", sessionId: ev.sessionId, agent });
             break;
           case "activity":
-            this.postScoped(cwd, { type: "activity", label: ev.label });
+            emit({ type: "activity", label: ev.label });
             break;
           case "notice":
-            this.postScoped(cwd, { type: "info", text: ev.text });
+            emit({ type: "info", text: ev.text });
             break;
           case "commands":
             // Реальный список команд CLI — кэшируем и обновляем меню.
@@ -3338,12 +3806,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             // Настоящие request_user_input проходят только через confirmTool.
             delivered = true;
             const origin: QuestionOrigin = {
+              chatId: runKey,
               recordId: record.id, createdAt: recordGen, sessionId: currentSessionId,
             };
             const questionNonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
             for (const [i, q] of ev.questions.entries()) {
               const requestId = `codexq-${ev.id || "question"}-${questionNonce}-${i}`;
-              this.postScoped(cwd, {
+              emit({
                 type: "permissionRequest",
                 requestId,
                 toolName: "request_user_input",
@@ -3354,18 +3823,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               });
               this.pendingPermissions.set(requestId, {
                 path: cwd,
+                chatId,
+                recordId: record.id,
                 resolve: async (res) => {
                   if (!res.answer?.trim()) return;
                   if (!this.isQuestionOriginCurrent(cwd, agent, origin)) {
-                    this.reportExpiredQuestion(cwd);
+                    this.reportExpiredQuestion(cwd, chatId);
                     return;
                   }
                   const text = `Ответ на твой вопрос «${q.title.slice(0, 160)}»: ${res.answer}`;
-                  const handler = this.runs.get(cwd) === controller &&
-                    !controller.signal.aborted && this.steers.get(cwd) === steer ? steer.handler : undefined;
+                  const handler = this.runs.get(runKey) === controller &&
+                    !controller.signal.aborted && this.steers.get(runKey) === steer ? steer.handler : undefined;
                   if (!handler) {
-                    if (this.deferTurn(cwd, agent, text, origin)) {
-                      this.postScoped(cwd, { type: "info", text: "Живой канал исходного хода недоступен. Ответ отправится отдельным ходом в этой же сессии." });
+                    if (this.deferTurn(cwd, agent, text, origin, chatId)) {
+                      emit({ type: "info", text: "Живой канал исходного хода недоступен. Ответ отправится отдельным ходом в этой же сессии." });
                     }
                     return;
                   }
@@ -3377,11 +3848,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     // Только явный отказ до отправки допускает повторный ход.
                     // Неизвестная ошибка связи могла произойти уже после приёма.
                     if (/^ход уже заверш[её]н$/i.test(message) && !controller.signal.aborted) {
-                      if (this.deferTurn(cwd, agent, text, origin)) {
-                        this.postScoped(cwd, { type: "info", text: "Исходный ход уже завершён. Ответ отправится отдельным ходом в этой же сессии." });
+                      if (this.deferTurn(cwd, agent, text, origin, chatId)) {
+                        emit({ type: "info", text: "Исходный ход уже завершён. Ответ отправится отдельным ходом в этой же сессии." });
                       }
                     } else {
-                      this.postScoped(cwd, {
+                      emit({
                         type: "info",
                         text: "Доставка ответа не подтверждена. Автоматический повтор отключён, чтобы не отправить ответ дважды. При необходимости уточните у агента вручную.",
                       });
@@ -3389,8 +3860,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     return;
                   }
                   if (this.isQuestionOriginCurrent(cwd, agent, origin)) {
-                    this.postScoped(cwd, { type: "userMessage", text });
-                    this.postScoped(cwd, { type: "info", text: "Ответ передан агенту в текущий ход." });
+                    emit({ type: "userMessage", text });
+                    emit({ type: "info", text: "Ответ передан агенту в текущий ход." });
                   }
                   if (turnLogDone) {
                     // ACK мог прийти после финального лога и начала нового хода.
@@ -3406,45 +3877,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               });
               answerBuf = answerBuf ? `${answerBuf}\n\n${q.title}` : q.title;
             }
-            this.postScoped(cwd, {
+            emit({
               type: "info",
               text: "Агент задал вопрос и продолжает работу. Ответ будет передан в текущий ход, если транспорт принимает сообщения на лету; иначе — следующим ходом.",
             });
             this.revealUi();
-            this.notifyBackgroundPermission(cwd, "Codex задаёт вопрос");
+            this.notifyBackgroundPermission(cwd, "Codex задаёт вопрос", chatId);
             break;
           }
           case "contextUsage":
             await mutateTurnRecord((r) => {
               r.context = { ...r.context, [agent]: { used: ev.usedTokens, max: ev.maxTokens } };
             });
-            this.postScoped(cwd, { type: "contextUsage", agent, used: ev.usedTokens, max: ev.maxTokens });
+            emit({ type: "contextUsage", agent, used: ev.usedTokens, max: ev.maxTokens });
             break;
           case "model":
             await mutateTurnRecord((r) => {
               r.models = { ...r.models, [agent]: ev.model };
               r.modelFallbacks = { ...r.modelFallbacks, [agent]: ev.fallbackFrom ?? undefined };
             });
-            this.postScoped(cwd, { type: "modelInfo", agent, model: ev.model, fallbackFrom: ev.fallbackFrom });
+            emit({ type: "modelInfo", agent, model: ev.model, fallbackFrom: ev.fallbackFrom });
             break;
           case "textDelta":
             delivered = true;
             answerBuf += ev.text;
-            this.postScoped(cwd, { type: "textDelta", text: ev.text });
+            emit({ type: "textDelta", text: ev.text });
             break;
           case "assistantText":
             delivered = true;
             answerBuf = answerBuf ? `${answerBuf}\n\n${ev.text}` : ev.text;
-            this.postScoped(cwd, { type: "assistantText", text: ev.text });
+            emit({ type: "assistantText", text: ev.text });
             break;
           case "toolUse":
             delivered = true;
-            this.postScoped(cwd, { type: "toolUse", toolName: ev.toolName, summary: ev.summary });
+            emit({ type: "toolUse", toolName: ev.toolName, summary: ev.summary });
             break;
           case "result":
             turnSucceeded = ev.ok;
             if (ev.ok) delivered = true;
-            this.postScoped(cwd, {
+            emit({
               type: "turnResult",
               ok: ev.ok,
               costUsd: ev.costUsd,
@@ -3453,25 +3924,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             });
             break;
           case "error":
-            this.postScoped(cwd, { type: "error", message: ev.message });
+            emit({ type: "error", message: ev.message });
             break;
         }
       }
       // Ошибка подключения/восстановления не должна коммитить посторонние правки.
       if (turnSucceeded && !controller.signal.aborted) {
-        await this.autoCommit(workingDir, agent, prompt, cwd);
+        if (group.overlapped) {
+          emit({ type: "info", text: "В этой папке одновременно работали несколько чатов: автоcommit и автопуш пропущены. Проверьте общий diff после завершения всех запусков." });
+        } else {
+          const operation = this.autoCommit(workingDir, agent, prompt, cwd, chatId);
+          group.gitOperation = operation;
+          await operation;
+          if (group.gitOperation === operation) group.gitOperation = undefined;
+        }
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (!/abort/i.test(message)) {
-        this.postScoped(cwd, { type: "error", message });
+        emit({ type: "error", message });
       } else {
-        this.postScoped(cwd, { type: "info", text: "Остановлено." });
+        emit({ type: "info", text: "Остановлено." });
       }
     } finally {
-      this.steers.delete(cwd);
-      const steered = [...(this.steerTexts.get(cwd) ?? []), ...questionAnswers];
-      this.steerTexts.delete(cwd);
+      this.steers.delete(runKey);
+      const steered = [...(this.steerTexts.get(runKey) ?? []), ...questionAnswers];
+      this.steerTexts.delete(runKey);
       // Общий лог беседы — зеркало видимой ленты: из него другой агент получит
       // контекст. Отметку «видел до сих пор» двигаем, только если промпт реально
       // дошёл до агента; свои же сообщения агенту не пересылаются (фильтр выше).
@@ -3495,26 +3973,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         r.chatSeen = seen;
       });
       await turnLogDone;
-      if (this.runs.get(cwd) === controller) this.runs.delete(cwd);
+      if (this.runs.get(runKey) === controller) this.runs.delete(runKey);
       // Отложенный ход (ответ на вопрос Codex) — без промежуточного busy:false,
       // иначе очередь webview стартует параллельно и упрётся в «агент работает».
       for (;;) {
-        nextDeferred = this.deferred.get(cwd)?.shift();
+        nextDeferred = this.deferred.get(runKey)?.shift();
         if (!nextDeferred?.questionOrigin ||
           this.isQuestionOriginCurrent(cwd, nextDeferred.agent, nextDeferred.questionOrigin)) break;
-        this.reportExpiredQuestion(cwd);
+        this.reportExpiredQuestion(cwd, chatId);
       }
-      if (!nextDeferred) this.postScoped(cwd, { type: "busy", value: false });
+      if (!nextDeferred) emit({ type: "busy", value: false });
     }
     releaseDirectory();
     if (nextDeferred) {
-      await this.runTurn(nextDeferred.prompt, nextDeferred.agent, [], cwd, true, nextDeferred.questionOrigin);
+      // The queued answer resumes this CLI session, so release this turn's writer first.
+      releaseWriter();
+      await this.runTurn(nextDeferred.prompt, nextDeferred.agent, [], cwd, true, nextDeferred.questionOrigin, nextDeferred.chatId);
     }
     } finally {
+      releaseWriter();
       releaseDirectory();
-      if (this.runs.get(cwd) === controller) {
-        this.runs.delete(cwd);
-        this.postScoped(cwd, { type: "busy", value: false });
+      if (this.runs.get(runKey) === controller) {
+        this.runs.delete(runKey);
+        emit({ type: "busy", value: false });
       }
     }
   }
@@ -3524,31 +4005,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * затем session id сбрасываются — следующее сообщение начнёт новую сессию,
    * которая подхватит журнал. Лента чата при этом не очищается.
    */
-  private async finishSession(agent: AgentId) {
-    const project = this.getActiveProject();
+  private async finishSession(agent: AgentId, chatId?: string) {
+    const slot = this.findChatSlot(chatId);
+    const project = slot
+      ? this.getProjects().find((entry) => projectKey(entry) === slot.projectPath)
+      : this.getActiveProject();
     if (!project) return;
-    if (this.runs.has(projectKey(project)) || this.directoryRuns?.has(physicalDirectory(project.path))) {
-      this.post({ type: "error", message: "В этом проекте агент ещё работает. Дождитесь ответа или нажмите «Стоп»." });
+    const runKey = chatId ?? projectKey(project);
+    if (this.runs.has(runKey) || (this.directoryRuns?.get(physicalDirectory(project.path))?.controllers.size ?? 0) > 0) {
+      this.postScoped(projectKey(project), { type: "error", message: "В этой папке агент ещё работает. Дождитесь завершения всех чатов." }, chatId);
       return;
     }
 
     const cfg = vscode.workspace.getConfiguration("agentHub");
     const dir = cfg.get<string>("journalDir", "docs/journal");
 
-    this.post({ type: "info", text: "Записываю итоги сессии в журнал…" });
-    await this.runTurn(buildFinishPrompt(dir), agent);
+    this.postScoped(projectKey(project), { type: "info", text: "Записываю итоги сессии в журнал…" }, chatId);
+    await this.runTurn(buildFinishPrompt(dir), agent, [], projectKey(project), true, undefined, chatId);
 
-    await this.mutateActiveRecord(projectKey(project), (r) => {
+    const clearIds = (r: SessionRecord) => {
       r.agentIds = { claude: null, codex: null };
-    });
+    };
+    if (slot) await this.mutateRecord(slot.projectPath, slot.recordId, clearIds);
+    else await this.mutateActiveRecord(projectKey(project), clearIds);
     // Пользователь мог переключиться на другой проект за время хода —
     // адресуем завершение проекту, где писались итоги.
-    this.postScoped(projectKey(project), { type: "sessionInfo", sessionId: null, agent: "claude" });
-    this.postScoped(projectKey(project), { type: "sessionInfo", sessionId: null, agent: "codex" });
+    this.postScoped(projectKey(project), { type: "sessionInfo", sessionId: null, agent: "claude" }, chatId);
+    this.postScoped(projectKey(project), { type: "sessionInfo", sessionId: null, agent: "codex" }, chatId);
     this.postScoped(projectKey(project), {
       type: "info",
       text: "Итоги записаны. Следующее сообщение начнёт новую сессию с контекстом из журнала.",
-    });
+    }, chatId);
   }
 
   /**
@@ -3560,6 +4047,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     toolName: string,
     input: unknown,
     cwd: string,
+    chatId?: string,
+    recordId?: string,
   ): Promise<{ allow: boolean; answer?: string }> {
     const requestId = `perm-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
@@ -3577,12 +4066,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         options: (q?.options ?? [])
           .filter((o) => typeof o?.label === "string")
           .map((o) => ({ label: o.label as string, description: o.description })),
-      });
-      this.postScoped(cwd, { type: "activity", label: "Ждёт вашего ответа…" });
+      }, chatId);
+      this.postScoped(cwd, { type: "activity", label: "Ждёт вашего ответа…" }, chatId);
       this.revealUi();
-      this.notifyBackgroundPermission(cwd, "агент задаёт вопрос");
+      this.notifyBackgroundPermission(cwd, "агент задаёт вопрос", chatId);
       return new Promise((resolve) =>
-        this.pendingPermissions.set(requestId, { path: cwd, resolve }),
+        this.pendingPermissions.set(requestId, { path: cwd, chatId, recordId, resolve }),
       );
     }
 
@@ -3596,19 +4085,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       toolName,
       inputPreview: formatInputPreview(input),
       kind: "tool",
-    });
-    this.postScoped(cwd, { type: "activity", label: "Ждёт подтверждения…" });
+    }, chatId);
+    this.postScoped(cwd, { type: "activity", label: "Ждёт подтверждения…" }, chatId);
     // Панель может быть скрыта — покажем её, иначе агент будет ждать вечно.
     this.revealUi();
-    this.notifyBackgroundPermission(cwd, `нужно подтверждение: ${toolName}`);
+    this.notifyBackgroundPermission(cwd, `нужно подтверждение: ${toolName}`, chatId);
 
     return new Promise((resolve) =>
-      this.pendingPermissions.set(requestId, { path: cwd, resolve }),
+      this.pendingPermissions.set(requestId, { path: cwd, chatId, recordId, resolve }),
     );
   }
 
   /** Карточка ждёт в ФОНОВОМ проекте — иначе пользователь её не увидит. */
-  private notifyBackgroundPermission(cwd: string, what: string) {
+  private notifyBackgroundPermission(cwd: string, what: string, chatId?: string) {
+    if (chatId && this.multiPanel) return;
     if (this.getActiveProjectKey() === cwd) return;
     const name = this.getProjects().find((p) => projectKey(p) === cwd)?.name ?? nodePath.basename(cwd);
     void vscode.window
@@ -3646,7 +4136,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.runs.clear();
   }
 
-  private renderHtml(webview: vscode.Webview, surface: "view" | "panel"): string {
+  private renderHtml(webview: vscode.Webview, surface: "view" | "panel" | "multi-panel"): string {
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, "dist", "webview.js"),
     );
