@@ -40,7 +40,7 @@ const { ChatViewProvider } = await import(pathToFileURL(outfile).href);
 const key = (p) => p.id ?? p.path;
 function state(initial = {}) {
   const data = new Map(Object.entries(initial));
-  return { data, get: (k, fallback) => data.has(k) ? data.get(k) : fallback, update: async (k, value) => { if (value === undefined) data.delete(k); else data.set(k, value); } };
+  return { data, keys: () => [...data.keys()], get: (k, fallback) => data.has(k) ? data.get(k) : fallback, update: async (k, value) => { if (value === undefined) data.delete(k); else data.set(k, value); } };
 }
 function setup(projects = [], workspaceFolders = []) {
   const h = { settings: { projects }, workspaceFolders, pickedPath: folder, choices: [], errors: [], deleted: [], commands: [], journalDirs: [], serverTests: [] };

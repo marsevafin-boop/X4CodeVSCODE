@@ -12,6 +12,9 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewId, provider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
+    vscode.window.registerWebviewPanelSerializer(ChatViewProvider.multiViewId, {
+      deserializeWebviewPanel: (panel, state) => provider.restoreMultiChatPanel(panel, state),
+    }),
     vscode.commands.registerCommand("agentHub.newSession", () => provider.newSession()),
     vscode.commands.registerCommand("agentHub.addProject", () => provider.addProject()),
     vscode.commands.registerCommand("agentHub.setServerPassword", () =>

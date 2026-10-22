@@ -26,7 +26,10 @@ import {
   type ServerTestDraft, type ServerTestState,
 } from "./serverTestState";
 
-declare function acquireVsCodeApi(): { postMessage(msg: WebviewToHost): void };
+declare function acquireVsCodeApi(): {
+  postMessage(msg: WebviewToHost): void;
+  setState?(state: unknown): void;
+};
 const vscode = acquireVsCodeApi();
 /** Мобильный клиент (страница из remoteServer): без нативных диалогов VS Code. */
 const REMOTE = Boolean((window as unknown as { __AGENT_HUB_REMOTE__?: boolean }).__AGENT_HUB_REMOTE__);
@@ -2330,6 +2333,7 @@ function MultiChatBoard() {
   const [archivedProjects, setArchivedProjects] = useState<ProjectInfo[]>([]);
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [chats, setChats] = useState<MultiChatSlotView[]>([]);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent<HostToWebview>) => {
@@ -2337,6 +2341,9 @@ function MultiChatBoard() {
       setProjects(event.data.projects);
       setArchivedProjects(event.data.archivedProjects ?? []);
       setChats(event.data.chats);
+      setHasLoaded(true);
+      // Persist only host-confirmed bindings. Transcripts stay in the extension store.
+      vscode.setState?.({ version: 1, boardId: event.data.boardId, chats: event.data.chats.map(({ chatId, projectPath, recordId, agent }) => ({ chatId, projectPath, recordId, agent })) });
     };
     window.addEventListener("message", onMessage);
     vscode.postMessage({ type: "multiStateReady", chatIds: [] });
@@ -2361,7 +2368,7 @@ function MultiChatBoard() {
         </main>
       )}
       {chats.length === 0 ? (
-        !archiveOpen && <div className="empty">Загружаю чаты…</div>
+        !archiveOpen && <div className="empty">{hasLoaded ? "Нет открытых чатов. Нажмите «＋ Чат»." : "Загружаю чаты…"}</div>
       ) : (
         <main
           className="multi-chat-grid"

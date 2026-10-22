@@ -46,9 +46,12 @@ function setup() {
   current = h;
   const p = Object.create(ChatViewProvider.prototype);
   p.context = { globalState: {
+    keys: () => [...data.keys()],
     get: (key, fallback) => data.has(key) ? data.get(key) : fallback,
-    update: async (key, value) => { await h.beforeUpdate?.(key, value); h.writes.push(key); data.set(key, value); },
+    update: async (key, value) => { await h.beforeUpdate?.(key, value); h.writes.push(key); if (value === undefined) data.delete(key); else data.set(key, value); },
   } };
+  const workspaceData = new Map();
+  p.context.workspaceState = { get: (key, fallback) => workspaceData.has(key) ? workspaceData.get(key) : fallback, update: async (key, value) => { workspaceData.set(key, value); } };
   p.getAllProjects = () => projects; p.getProjects = () => projects; p.getActiveProject = () => projects[0];
   p.runs = new Map(); p.pendingPermissions = new Map(); p.deferred = new Map(); p.steers = new Map(); p.steerTexts = new Map();
   p.multiPanel = { webview: { postMessage: (message) => h.messages.push(message) } };
@@ -107,6 +110,18 @@ test("deleting a history entry rebinds every tile using it without closing tiles
   assert.equal(live.length, 4);
   assert.ok(live.every((slot) => slot.recordId !== h.records[0].id));
   assert.ok(live.every((slot) => h.p.getProjectStore(slot.projectPath).sessions.some((rec) => rec.id === slot.recordId)));
+});
+
+test("explicit history deletion cleans matching saved-board pins while preserving other projects and records", async () => {
+  const h = setup(); h.records[0].items = [{ role: "user", text: "delete this saved session" }];
+  const original = h.slots[0];
+  const otherProject = { ...original, projectPath: h.projects[1].id };
+  h.data.set("agentHub.multiBoard.board-old-snapshot", [original]);
+  h.data.set("agentHub.multiBoard.board-mixed-snapshot", [original, h.slots[1], otherProject]);
+  await h.p.showSessions(); await h.deleteItem({ item: { sessionId: original.recordId } });
+  assert.equal(h.data.has("agentHub.multiBoard.board-old-snapshot"), false);
+  assert.deepEqual(h.data.get("agentHub.multiBoard.board-mixed-snapshot"), [h.slots[1], otherProject]);
+  assert.equal(h.p.getProjectStore(original.projectPath).sessions.some((record) => record.id === original.recordId), false);
 });
 
 test("overlapping selections in different tiles preserve both requested projects", async () => {

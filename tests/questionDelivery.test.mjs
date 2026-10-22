@@ -40,9 +40,12 @@ function setup() {
   p.mutateRecord = async (_path, id, fn) => { const target = p.records.get(id); if (target) fn(target); };
   const state = new Map();
   p.context = { secrets: { get: async () => undefined }, globalState: {
+    keys: () => [...state.keys()],
     get: (key, fallback) => state.has(key) ? state.get(key) : fallback,
     update: async (key, value) => state.set(key, value),
   } };
+  const workspaceState = new Map();
+  p.context.workspaceState = { get: (key, fallback) => workspaceState.has(key) ? workspaceState.get(key) : fallback, update: async (key, value) => workspaceState.set(key, value) };
   p.getSecretEnv = async () => ({}); p.buildProjectCard = async () => "";
   p.runs = new Map(); p.steers = new Map(); p.steerTexts = new Map(); p.deferred = new Map(); p.pendingPermissions = new Map();
   p.directoryRuns = new Map(); p.sessionWriters = new Map();

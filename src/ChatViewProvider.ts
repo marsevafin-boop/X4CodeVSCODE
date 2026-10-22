@@ -36,6 +36,8 @@ const LEGACY_SESSIONS_KEY = "agentHub.sessions";
 const LEGACY_TRANSCRIPTS_KEY = "agentHub.transcripts";
 const STORE_KEY = "agentHub.sessionStore";
 const MULTI_CHATS_KEY = "agentHub.multiChats";
+const MULTI_BOARD_KEY_PREFIX = "agentHub.multiBoard.";
+const MULTI_BOARD_LAYOUT_KEY_PREFIX = "agentHub.multiBoardLayout.";
 const PROJECT_ORDER_KEY = "agentHub.projectOrder";
 const PROJECT_MOVE_KEY = "agentHub.pendingProjectMove";
 interface PendingProjectMove { plan: ProjectMovePlan; keys: string[]; nextProjects: ProjectInfo[]; }
@@ -308,6 +310,7 @@ interface DeferredTurn {
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewId = "agentHub.chat";
+  static readonly multiViewId = "agentHub.multiChat";
 
   private view?: vscode.WebviewView;
   /** Полноэкранный режим: тот же чат вкладкой редактора; работает синхронно с сайдбаром. */
@@ -317,6 +320,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private multiInit?: Promise<void>;
   /** A board belongs to this extension host; another window's persistence cannot replace it. */
   private chatSlots?: ChatSlot[];
+  private multiLayoutInitialized = false;
+  private multiLayoutNeedsMigration = false;
+  private multiLayoutPinned = false;
+  private multiBoardId?: string;
   private multiMutation?: Promise<void>;
   private readonly backends: Record<AgentId, AgentBackend> = {
     claude: new ClaudeBackend(),
@@ -2044,20 +2051,116 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private getChatSlots(): ChatSlot[] {
     const projects = new Set(this.getAllProjects().map(projectKey));
-    this.chatSlots ??= this.context.globalState.get<unknown[]>(MULTI_CHATS_KEY, []).flatMap((value) => {
-        if (!value || typeof value !== "object") return [];
-        const slot = value as Partial<ChatSlot>;
-        if (typeof slot.chatId !== "string" || !/^chat-[a-z0-9-]{8,80}$/i.test(slot.chatId) ||
-            typeof slot.projectPath !== "string" || typeof slot.recordId !== "string" ||
-            (slot.agent !== "claude" && slot.agent !== "codex")) return [];
-        return [{ chatId: slot.chatId, projectPath: slot.projectPath, recordId: slot.recordId, agent: slot.agent }];
-      });
+    if (!this.chatSlots) {
+      const workspace = this.context.workspaceState.get<unknown>(MULTI_CHATS_KEY);
+      const legacy = this.context.globalState.get<unknown>(MULTI_CHATS_KEY);
+      const saved = Array.isArray(workspace) ? workspace : Array.isArray(legacy) ? legacy : undefined;
+      this.multiLayoutInitialized = saved !== undefined;
+      this.multiLayoutNeedsMigration = !Array.isArray(workspace) && saved !== undefined;
+      this.chatSlots = this.normalizeChatSlots(saved ?? []);
+    }
     return this.chatSlots.filter((slot) => projects.has(slot.projectPath));
   }
 
+  /** Panel snapshots are untrusted metadata, never executable work or transcript data. */
+  private normalizeChatSlots(values: unknown[]): ChatSlot[] {
+    const seen = new Set<string>();
+    return values.flatMap((value) => {
+      if (!value || typeof value !== "object") return [];
+      const slot = value as Partial<ChatSlot>;
+      if (typeof slot.chatId !== "string" || !/^chat-[a-z0-9-]{8,80}$/i.test(slot.chatId) ||
+          typeof slot.projectPath !== "string" || slot.projectPath.length === 0 ||
+          typeof slot.recordId !== "string" || slot.recordId.length === 0 ||
+          (slot.agent !== "claude" && slot.agent !== "codex") || seen.has(slot.chatId)) return [];
+      seen.add(slot.chatId);
+      return [{ chatId: slot.chatId, projectPath: slot.projectPath, recordId: slot.recordId, agent: slot.agent }];
+    });
+  }
+
   private async saveChatSlots(slots: ChatSlot[]) {
+    // The window's workspace owns its layout; global state only seeds a new workspace.
+    const pinKey = `${MULTI_BOARD_KEY_PREFIX}${this.getMultiBoardId()}`;
+    const layoutKey = `${MULTI_BOARD_LAYOUT_KEY_PREFIX}${this.getMultiBoardId()}`;
+    const previous = this.getChatSlots();
+    const previousPins = this.context.globalState.get<unknown>(pinKey);
+    const previousLayout = this.context.globalState.get<unknown>(layoutKey);
+    const previousWorkspace = this.context.workspaceState.get<unknown>(MULTI_CHATS_KEY);
+    // Pin before changing the durable binding so another window cannot prune it in between.
+    await this.context.globalState.update(pinKey, [...(Array.isArray(previousPins) ? previousPins : []), ...previous, ...slots]);
+    try {
+      await this.context.workspaceState.update(MULTI_CHATS_KEY, slots);
+      // The exact committed board outranks a browser snapshot saved before the last host ACK.
+      await this.context.globalState.update(layoutKey, { version: 1, boardId: this.getMultiBoardId(), chats: slots });
+    } catch (error) {
+      const rollbacks = await Promise.allSettled([
+        this.context.workspaceState.update(MULTI_CHATS_KEY, previousWorkspace),
+        this.context.globalState.update(layoutKey, previousLayout),
+      ]);
+      for (const result of rollbacks) {
+        if (result.status === "rejected") console.warn("Agent Hub: could not roll back multichat persistence", result.reason);
+      }
+      // If either durable binding could still be new, retain the union protecting both.
+      if (rollbacks.every((result) => result.status === "fulfilled")) {
+        try {
+          await this.context.globalState.update(pinKey, previousPins);
+        } catch (rollbackError) {
+          console.warn("Agent Hub: could not restore multichat session references", rollbackError);
+        }
+      }
+      throw error;
+    }
     this.chatSlots = slots;
-    await this.context.globalState.update(MULTI_CHATS_KEY, slots);
+    this.multiLayoutInitialized = true;
+    this.multiLayoutNeedsMigration = false;
+    this.multiLayoutPinned = true;
+    try {
+      await this.context.globalState.update(pinKey, slots);
+    } catch (error) {
+      // The earlier union safely retains both layouts if cleanup fails.
+      console.warn("Agent Hub: could not trim multichat session references", error);
+    }
+    try {
+      await this.context.globalState.update(MULTI_CHATS_KEY, slots);
+    } catch (error) {
+      console.warn("Agent Hub: could not update the fallback multichat layout", error);
+    }
+  }
+
+  private getMultiBoardId(): string {
+    return this.multiBoardId ??= `board-${randomUUID()}`;
+  }
+
+  /** Closed workspaces still own their records, including empty chats with model overrides. */
+  private savedBoardRecordIds(projectPath: string): Set<string> {
+    const records = new Set(this.getChatSlots().filter((slot) => slot.projectPath === projectPath).map((slot) => slot.recordId));
+    for (const key of this.context.globalState.keys()) {
+      if (!key.startsWith(MULTI_BOARD_KEY_PREFIX)) continue;
+      const slots = this.context.globalState.get<unknown>(key);
+      if (!Array.isArray(slots)) continue;
+      // A pending write pins two records under the same chatId until its workspace commit.
+      for (const value of slots) {
+        const [slot] = this.normalizeChatSlots([value]);
+        if (slot?.projectPath === projectPath) records.add(slot.recordId);
+      }
+    }
+    return records;
+  }
+
+  /** Only an explicit history deletion proves an old board reference may be discarded. */
+  private async forgetSavedBoardRecord(projectPath: string, recordId: string) {
+    for (const key of this.context.globalState.keys()) {
+      if (!key.startsWith(MULTI_BOARD_KEY_PREFIX)) continue;
+      const slots = this.context.globalState.get<unknown>(key);
+      if (!Array.isArray(slots)) continue;
+      const remaining = slots.filter((value: unknown) => !value || typeof value !== "object" ||
+        (value as Partial<ChatSlot>).projectPath !== projectPath || (value as Partial<ChatSlot>).recordId !== recordId);
+      if (remaining.length === slots.length) continue;
+      try {
+        await this.context.globalState.update(key, remaining.length ? remaining : undefined);
+      } catch (error) {
+        console.warn("Agent Hub: could not clear a deleted multichat session reference", error);
+      }
+    }
   }
 
   /** Serialize layout read/modify/write operations, preserving the order of user clicks. */
@@ -2080,6 +2183,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!this.multiPanel) return;
     this.multiPanel.webview.postMessage({
       type: "multiState",
+      boardId: this.getMultiBoardId(),
       projects: this.getProjects(),
       archivedProjects: this.getArchivedProjects(),
       chats: this.getChatSlots().map((slot) => this.chatDescriptor(slot)),
@@ -2117,20 +2221,68 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const panel = vscode.window.createWebviewPanel(
-      "agentHub.multiChat",
+      ChatViewProvider.multiViewId,
       "Agent Hub — мультичат",
       vscode.ViewColumn.One,
       { enableScripts: true, retainContextWhenHidden: true,
         localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "dist")] },
     );
+    this.attachMultiChatPanel(panel);
+    await this.ensureMultiChats();
+  }
+
+  /** VS Code supplies the original tab and its own snapshot, even in a shared workspace. */
+  async restoreMultiChatPanel(panel: vscode.WebviewPanel, state: unknown): Promise<void> {
+    await this.serializeMultiMutation(async () => {
+      if (this.multiPanel === panel) return;
+      if (this.multiPanel) {
+        panel.dispose();
+        this.multiPanel.reveal();
+        return;
+      }
+      if (state && typeof state === "object" &&
+          (state as { version?: unknown }).version === 1 &&
+          Array.isArray((state as { chats?: unknown }).chats)) {
+        const previousBoardId = this.multiBoardId;
+        const boardId = (state as { boardId?: unknown }).boardId;
+        if (typeof boardId === "string" && /^board-[a-z0-9-]{8,80}$/i.test(boardId)) this.multiBoardId = boardId;
+        const committed = this.multiBoardId
+          ? this.context.globalState.get<{ version?: unknown; boardId?: unknown; chats?: unknown }>(`${MULTI_BOARD_LAYOUT_KEY_PREFIX}${this.multiBoardId}`)
+          : undefined;
+        const saved = committed && committed.version === 1 && committed.boardId === this.multiBoardId && Array.isArray(committed.chats)
+          ? committed.chats : (state as { chats: unknown[] }).chats;
+        const projects = new Set(this.getAllProjects().map(projectKey));
+        const slots = this.normalizeChatSlots(saved)
+          .filter((slot) => projects.has(slot.projectPath));
+        try {
+          await this.saveChatSlots(slots);
+        } catch (error) {
+          // A later manual open must not claim the unsuccessfully restored tab's identity.
+          this.multiBoardId = previousBoardId;
+          throw error;
+        }
+      }
+      this.attachMultiChatPanel(panel);
+      await this.ensureMultiChats();
+    });
+  }
+
+  private attachMultiChatPanel(panel: vscode.WebviewPanel) {
+    this.multiPanel = panel;
+    panel.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "dist")],
+    };
     panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, "media", "icon.svg");
-    panel.webview.html = this.renderHtml(panel.webview, "multi-panel");
-    panel.webview.onDidReceiveMessage((msg: WebviewToHost) =>
+    const messages = panel.webview.onDidReceiveMessage((msg: WebviewToHost) =>
       this.onMessage(msg, "vscode", undefined, "multi-panel"),
     );
-    panel.onDidDispose(() => { if (this.multiPanel === panel) this.multiPanel = null; });
-    this.multiPanel = panel;
-    await this.ensureMultiChats();
+    const disposed = panel.onDidDispose(() => {
+      messages.dispose();
+      disposed.dispose();
+      if (this.multiPanel === panel) this.multiPanel = null;
+    });
+    panel.webview.html = this.renderHtml(panel.webview, "multi-panel");
   }
 
   private async createMultiChat(projectPath?: string) {
@@ -2236,7 +2388,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async initializeMultiChats() {
     let slots = this.getChatSlots();
-    if (slots.length === 0) {
+    if (!this.multiLayoutInitialized) {
       const project = this.getActiveProject() ?? this.getProjects()[0];
       if (!project) return;
       const key = projectKey(project);
@@ -2251,6 +2403,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this.saveChatSlots(created);
       slots = created;
     }
+    if (this.multiLayoutNeedsMigration || !this.multiLayoutPinned) await this.saveChatSlots(slots);
     // Old versions could prune an empty record while its tile still existed.
     // Restore those tiles with fresh sessions instead of silently closing them.
     let repaired = false;
@@ -2354,7 +2507,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Выкинуть из истории пустые сессии (кроме активной). */
   private pruneEmptySessions(store: ProjectStore, projectPath: string) {
-    const displayed = new Set(this.getChatSlots().filter((slot) => slot.projectPath === projectPath).map((slot) => slot.recordId));
+    const displayed = this.savedBoardRecordIds(projectPath);
     store.sessions = store.sessions.filter(
       (s) => s.id === store.activeId || displayed.has(s.id) || hasUserContent(s.items),
     );
@@ -3221,6 +3374,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await this.saveChatSlots(this.getChatSlots().map((entry) => replacements.has(entry.chatId)
             ? { ...entry, recordId: replacements.get(entry.chatId)! } : entry));
         }
+        await this.forgetSavedBoardRecord(key, rec.id);
         this.postFullState();
       });
       if (store.sessions.length === 0) {
@@ -3289,7 +3443,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (active) {
       const store = this.getProjectStore(projectKey(active));
       const current = store.sessions.find((s) => s.id === store.activeId);
-      if (current && !hasUserContent(current.items)) {
+      const displayed = this.savedBoardRecordIds(projectKey(active));
+      if (current && !hasUserContent(current.items) && !displayed.has(current.id)) {
         // Пустую активную не сохраняем в историю — обнуляем и переиспользуем.
         current.items = [];
         current.agentIds = { claude: null, codex: null };
@@ -3310,7 +3465,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       this.pruneEmptySessions(store, projectKey(active));
       // Кап истории: держим самые свежие.
-      const displayed = new Set(this.getChatSlots().filter((slot) => slot.projectPath === projectKey(active)).map((slot) => slot.recordId));
       store.sessions = [...store.sessions]
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .filter((record, index) => index < MAX_SESSIONS_PER_PROJECT || displayed.has(record.id) || record.id === store.activeId);

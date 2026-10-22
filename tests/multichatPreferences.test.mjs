@@ -44,7 +44,10 @@ function setup() {
   };
   current = h;
   const p = Object.create(ChatViewProvider.prototype);
-  p.context = { globalState: { get: (key, fallback) => data.has(key) ? data.get(key) : fallback, update: async (key, value) => { data.set(key, value); } } };
+  p.context = { globalState: { keys: () => [...data.keys()], get: (key, fallback) => data.has(key) ? data.get(key) : fallback, update: async (key, value) => { data.set(key, value); } } };
+  const workspaceData = new Map();
+  h.workspaceData = workspaceData;
+  p.context.workspaceState = { get: (key, fallback) => workspaceData.has(key) ? workspaceData.get(key) : fallback, update: async (key, value) => { workspaceData.set(key, value); } };
   p.getAllProjects = () => projects; p.getProjects = () => projects; p.getActiveProject = () => projects[0];
   p.runs = new Map(); p.pendingPermissions = new Map();
   p.multiPanel = { webview: { postMessage: (message) => h.messages.push(message) } };
@@ -131,7 +134,7 @@ test("new tiles inherit the last chosen provider without changing other tiles", 
   assert.equal(live.find((slot) => slot.chatId === h.slots[1].chatId).agent, "claude");
   assert.equal(live.at(-1).agent, "codex");
   assert.equal(h.data.get("agentHub.multiPreferredAgent"), "codex");
-  h.data.set(CHATS, []); h.p.chatSlots = undefined;
+  h.data.delete(CHATS); h.workspaceData.delete(CHATS); h.p.chatSlots = undefined;
   await h.p.ensureMultiChats();
   assert.equal(h.p.getChatSlots().length, 4);
   assert.ok(h.p.getChatSlots().every((slot) => slot.agent === "codex"));

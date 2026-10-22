@@ -36,7 +36,7 @@ await build({
 const { ChatViewProvider } = await import(pathToFileURL(outfile).href);
 function state(initial = {}) {
   const data = new Map(Object.entries(initial));
-  return { data, get: (k, fallback) => data.has(k) ? data.get(k) : fallback, update: async (k, value) => { if (value === undefined) data.delete(k); else data.set(k, value); } };
+  return { data, keys: () => [...data.keys()], get: (k, fallback) => data.has(k) ? data.get(k) : fallback, update: async (k, value) => { if (value === undefined) data.delete(k); else data.set(k, value); } };
 }
 async function setup({ profiles = 1, workspace = false } = {}) {
   const parent = await mkdtemp(join(temp, "fixture-"));
