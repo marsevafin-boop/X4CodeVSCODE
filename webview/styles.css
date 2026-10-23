@@ -43,6 +43,49 @@ body {
   padding: 3px 6px;
 }
 
+.project-selector-row {
+  display: flex;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.project-selector-row .project-select {
+  flex: 1 1 220px;
+}
+
+.server-address {
+  display: inline-flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 7px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 2px 8px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  background: var(--vscode-editor-background, #1e1e1e);
+  color: var(--vscode-textLink-foreground, #4daafc);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: calc(var(--vscode-font-size, 13px) * 1.25);
+  font-weight: 800;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.server-address-label {
+  font-family: var(--vscode-font-family, sans-serif);
+  font-size: 0.65em;
+  font-weight: 600;
+}
+
+.server-address bdi {
+  min-width: 0;
+}
+
 .agent-select {
   background: var(--vscode-dropdown-background);
   color: var(--vscode-dropdown-foreground);
@@ -1205,10 +1248,25 @@ body.resizing-composer {
   font-size: 0.85em;
 }
 
-.multi-chat-tile-header > span {
+.multi-chat-tile-heading {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-width: 0;
+}
+
+.multi-chat-tile-title {
+  min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.multi-chat-tile-header > button {
+  flex: 0 0 auto;
 }
 
 .multi-chat-tile-body {

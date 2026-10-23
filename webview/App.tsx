@@ -60,6 +60,16 @@ interface MultiChatSlotView {
   title: string;
 }
 
+function ServerAddress({ host }: { host?: string }) {
+  const address = host?.trim();
+  return address ? (
+    <strong className="server-address" title={`Сервер: ${address}`}>
+      <span className="server-address-label">сервер:</span>
+      <bdi>{address}</bdi>
+    </strong>
+  ) : null;
+}
+
 function ProjectArchiveList({
   projects,
   onRestore,
@@ -1656,35 +1666,39 @@ function ChatTile({
   return (
     <div className="app" inert={projectSwitching} aria-busy={projectSwitching}>
       <header className="topbar">
-        <select
-          className="project-select"
-          value={activePath}
-          disabled={busy || projectSwitching}
-          onChange={(e) => onProjectChange(e.target.value)}
-          title={
-            activeProject
-              ? [
-                  activeProject.path,
-                  activeProject.githubRepo,
-                  activeProject.branch && `ветка: ${activeProject.branch}`,
-                  activeProject.serverHost &&
-                    `сервер: ${(activeProject.serverProtocol ?? "ssh").toUpperCase()} ${activeProject.serverUser ? activeProject.serverUser + "@" : ""}${activeProject.serverHost}${activeProject.serverPort ? ":" + activeProject.serverPort : ""}`,
-                ]
-                  .filter(Boolean)
-                  .join("\n")
-              : ""
-          }
-        >
-          {projects.length === 0 && <option value="">нет проектов</option>}
-          {projects.map((p) => (
-            <option key={projectKey(p)} value={projectKey(p)}>
-              {attentionBy[projectKey(p)] ? "⚠️ " : busyBy[projectKey(p)] ? "⏳ " : "📁 "}
-              {p.name}
-            </option>
-          ))}
-          <option value="__add__" hidden={REMOTE}>＋ Добавить проект…</option>
-          <option value="__manage__" hidden={REMOTE}>🗂 Все проекты: переключить / удалить…</option>
-        </select>
+        <div className="project-selector-row">
+          <select
+            className="project-select"
+            aria-label="Проект"
+            value={activePath}
+            disabled={busy || projectSwitching}
+            onChange={(e) => onProjectChange(e.target.value)}
+            title={
+              activeProject
+                ? [
+                    activeProject.path,
+                    activeProject.githubRepo,
+                    activeProject.branch && `ветка: ${activeProject.branch}`,
+                    activeProject.serverHost &&
+                      `сервер: ${(activeProject.serverProtocol ?? "ssh").toUpperCase()} ${activeProject.serverUser ? activeProject.serverUser + "@" : ""}${activeProject.serverHost}${activeProject.serverPort ? ":" + activeProject.serverPort : ""}`,
+                  ]
+                    .filter(Boolean)
+                    .join("\n")
+                : ""
+            }
+          >
+            {projects.length === 0 && <option value="">нет проектов</option>}
+            {projects.map((p) => (
+              <option key={projectKey(p)} value={projectKey(p)}>
+                {attentionBy[projectKey(p)] ? "⚠️ " : busyBy[projectKey(p)] ? "⏳ " : "📁 "}
+                {p.name}
+              </option>
+            ))}
+            <option value="__add__" hidden={REMOTE}>＋ Добавить проект…</option>
+            <option value="__manage__" hidden={REMOTE}>🗂 Все проекты: переключить / удалить…</option>
+          </select>
+          <ServerAddress host={activeProject?.serverHost} />
+        </div>
         <select
           className="agent-select"
           value={agent}
@@ -2381,9 +2395,12 @@ function MultiChatBoard() {
             return (
               <section className="multi-chat-tile" key={slot.chatId}>
                 <header className="multi-chat-tile-header">
-                  <span title={`${project?.name ?? "Проект"} · ${slot.title}`}>
-                    {project?.name ?? "Проект"} · {slot.agent === "claude" ? "Claude" : "GPT (Codex)"}
-                  </span>
+                  <div className="multi-chat-tile-heading">
+                    <span className="multi-chat-tile-title" title={`${project?.name ?? "Проект"} · ${slot.title}`}>
+                      {project?.name ?? "Проект"} · {slot.agent === "claude" ? "Claude" : "GPT (Codex)"}
+                    </span>
+                    <ServerAddress host={project?.serverHost} />
+                  </div>
                   <button
                     className="finish-btn"
                     title="Убрать чат с доски"
