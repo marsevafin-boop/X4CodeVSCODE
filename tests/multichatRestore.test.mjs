@@ -19,7 +19,7 @@ await build({
     b.onResolve({ filter: /^(vscode|qrcode|node:child_process)$|^\.\/agents\/|^\.\/remoteServer$|^\.\/journal$/ }, ({ path }) => ({ path, namespace: "stub" }));
     b.onLoad({ filter: /.*/, namespace: "stub" }, ({ path }) => {
       const h = 'globalThis[Symbol.for("agent-hub-multichat-restore-tests")].current';
-      if (path === "vscode") return { contents: `export const workspace={getConfiguration:()=>({get:(_key,fallback)=>fallback})};export const window={createWebviewPanel:()=>${h}.createPanel()};export const Uri={joinPath:(...parts)=>parts.join("/")},commands={},ViewColumn={One:1},ConfigurationTarget={},ProgressLocation={},env={};export class ThemeIcon{};` };
+      if (path === "vscode") return { contents: `export const workspace={getConfiguration:()=>({get:(_key,fallback)=>fallback})};export const window={createWebviewPanel:()=>${h}.createPanel()};export const Uri={joinPath:(...parts)=>parts.join("/")},commands={executeCommand:async()=>{}},ViewColumn={One:1},ConfigurationTarget={},ProgressLocation={},env={};export class ThemeIcon{};` };
       if (path === "node:child_process") return { contents: 'export const spawn=()=>{throw new Error("unexpected external process")};' };
       if (path === "./journal") return { contents: 'export const readJournalContext=async()=>"";export const buildFinishPrompt=()=>"";' };
       if (path === "./remoteServer") return { contents: 'export class RemoteServer{};export const enableTailscaleFunnel=()=>{};export const generateToken=()=>"";export const lanAddresses=()=>[];export const tailscaleInfo=()=>{};' };
@@ -146,8 +146,7 @@ test("an explicit empty serialized panel remains empty even if workspace has fou
   const h = setup(); h.workspace.set(CHATS, h.slots);
   const panel = panelFixture(); await h.p.restoreMultiChatPanel(panel, { version: 1, chats: [] });
   assert.deepEqual(h.p.getChatSlots(), []);
-  assert.equal(panel.messages.at(-1).type, "multiState");
-  assert.deepEqual(panel.messages.at(-1).chats, []);
+  assert.deepEqual(panel.messages.filter((message) => message.type === "multiState").at(-1)?.chats, []);
 });
 
 test("malformed serializer state falls back safely to the existing workspace", async () => {

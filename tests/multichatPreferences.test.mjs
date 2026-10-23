@@ -19,7 +19,7 @@ await build({
     b.onResolve({ filter: /^(vscode|qrcode|node:child_process)$|^\.\/agents\/|^\.\/remoteServer$|^\.\/journal$/ }, ({ path }) => ({ path, namespace: "stub" }));
     b.onLoad({ filter: /.*/, namespace: "stub" }, ({ path }) => {
       const h = 'globalThis[Symbol.for("agent-hub-multichat-preferences-tests")].current';
-      if (path === "vscode") return { contents: `export const workspace={getConfiguration:(section)=>${h}.configuration(section)};export const window={showWarningMessage:async()=>"Включить"};export const Uri={},commands={},ViewColumn={},ConfigurationTarget={Global:1},ProgressLocation={},env={}; export class ThemeIcon{};` };
+      if (path === "vscode") return { contents: `export const workspace={getConfiguration:(section)=>${h}.configuration(section)};export const window={showWarningMessage:async()=>"Включить"};export const Uri={},commands={executeCommand:async()=>{}},ViewColumn={},ConfigurationTarget={Global:1},ProgressLocation={},env={}; export class ThemeIcon{};` };
       if (path === "node:child_process") return { contents: 'export const spawn=()=>{throw new Error("unexpected external process")};' };
       if (path === "./journal") return { contents: 'export const readJournalContext=async()=>""; export const buildFinishPrompt=()=>"";' };
       if (path === "./remoteServer") return { contents: 'export class RemoteServer{};export const enableTailscaleFunnel=()=>{};export const generateToken=()=>"";export const lanAddresses=()=>[];export const tailscaleInfo=()=>{};' };

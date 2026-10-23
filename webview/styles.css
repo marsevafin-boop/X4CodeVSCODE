@@ -1202,6 +1202,7 @@ body.resizing-composer {
 
 .multi-chat-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   flex: 0 0 auto;
@@ -1356,4 +1357,162 @@ body.resizing-composer {
 .proj-order[hidden],
 .proj-actions[hidden] {
   display: none;
+}
+
+.compact-mode-button {
+  min-height: 24px;
+}
+
+.compact-mode-button[aria-pressed="true"] {
+  color: var(--vscode-textLink-foreground);
+  border-color: var(--vscode-focusBorder);
+}
+
+.compact-mode-error {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  color: var(--vscode-errorForeground);
+  overflow-wrap: anywhere;
+}
+
+/* Dense spacing stays inside this board; fonts, sessions and manual input sizes remain intact. */
+.multi-chat-board.is-compact .multi-chat-toolbar {
+  flex-wrap: wrap;
+  padding: 1px 4px;
+  gap: 3px 5px;
+}
+
+.multi-chat-board.is-compact .multi-chat-grid {
+  padding: 0;
+  gap: 1px;
+}
+
+.multi-chat-board.is-compact .multi-chat-tile {
+  border-radius: 0;
+}
+
+.multi-chat-board.is-compact .multi-chat-tile-header {
+  padding: 1px 4px;
+  gap: 4px;
+}
+
+.multi-chat-board.is-compact .multi-chat-tile-heading {
+  gap: 2px 6px;
+}
+
+.multi-chat-board.is-compact .topbar {
+  padding: 1px 4px;
+  gap: 2px 4px;
+}
+
+.multi-chat-board.is-compact .project-selector-row {
+  gap: 4px;
+}
+
+.multi-chat-board.is-compact .project-select,
+.multi-chat-board.is-compact .agent-select {
+  padding: 1px 4px;
+}
+
+.multi-chat-board.is-compact .server-address {
+  padding: 0 4px;
+  gap: 2px 5px;
+}
+
+.multi-chat-board.is-compact .finish-btn {
+  padding: 1px 5px;
+}
+
+.multi-chat-board.is-compact .statusbar {
+  padding: 1px 4px;
+  gap: 5px;
+}
+
+.multi-chat-board.is-compact .safety-btn {
+  padding: 1px 4px;
+}
+
+.multi-chat-board.is-compact .feed {
+  padding: 3px 4px;
+  gap: 4px;
+}
+
+.multi-chat-board.is-compact .msg {
+  padding: 4px 6px;
+  border-radius: 3px;
+}
+
+.multi-chat-board.is-compact .md p {
+  margin-bottom: 4px;
+}
+
+.multi-chat-board.is-compact .md :is(h1, h2, h3, h4) {
+  margin: 6px 0 3px;
+}
+
+.multi-chat-board.is-compact .md > :is(h1, h2, h3):first-child {
+  margin-top: 0;
+}
+
+.multi-chat-board.is-compact .md > :last-child {
+  margin-bottom: 0;
+}
+
+.multi-chat-board.is-compact .composer {
+  padding: 3px 4px;
+  gap: 3px;
+}
+
+.multi-chat-board.is-compact .actions {
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+.multi-chat-board.is-compact .actions-left {
+  gap: 3px;
+}
+
+.multi-chat-board.is-compact .actions button {
+  min-height: 24px;
+  padding: 2px 6px;
+}
+
+.multi-chat-board.is-compact .actions .mode-seg .mode-seg-btn {
+  padding: 2px 5px;
+}
+
+.multi-chat-board.is-compact .empty {
+  padding: 6px 4px;
+}
+
+.multi-chat-board.is-compact :is(.tool-group, .tool-group-list, .q-options, .perm-card) {
+  gap: 3px;
+}
+
+.multi-chat-board.is-compact :is(.tool-group-header, .tool-chip, .tool-detail, .perm-input) {
+  padding: 3px 5px;
+}
+
+.multi-chat-board.is-compact :is(.perm-card, .q-option, .settings section) {
+  padding: 4px 6px;
+}
+
+.multi-chat-board.is-compact .settings section,
+.multi-chat-board.is-compact .set-row,
+.multi-chat-board.is-compact .proj-row {
+  gap: 4px;
+}
+
+.multi-chat-board.is-compact .set-actions {
+  gap: 4px;
+  padding-bottom: 4px;
+}
+
+.multi-chat-board.is-compact .activity {
+  padding: 2px 0;
+  gap: 4px;
+}
+
+.multi-chat-board.is-compact .msg-time {
+  margin-top: 2px;
 }

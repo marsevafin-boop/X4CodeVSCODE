@@ -47,6 +47,7 @@ export interface SlashCommandInfo {
 export type WebviewToHost =
   | { type: "ready"; chatId?: string }
   | { type: "openMultiChat" }
+  | { type: "setCompactMode"; enabled: boolean }
   | { type: "multiStateReady"; chatIds: string[] }
   | { type: "createChat"; projectPath?: string }
   | { type: "removeChat"; chatId: string }
@@ -199,6 +200,7 @@ export type HostToWebview =
   | { type: "projects"; projects: ProjectInfo[]; archivedProjects?: ProjectInfo[]; activePath: string; chatId?: string }
   | { type: "transcript"; path: string; items: unknown[]; chatId?: string; recordId?: string }
   | { type: "multiState"; boardId?: string; projects: ProjectInfo[]; archivedProjects?: ProjectInfo[]; chats: { chatId: string; projectPath: string; recordId: string; agent: AgentId; title: string }[] }
+  | { type: "compactMode"; enabled: boolean; pending?: boolean; error?: string }
   | { type: "contextUsage"; agent: AgentId; used: number; max: number; path?: string; chatId?: string }
   | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string; path?: string; chatId?: string }
   | { type: "slashCommands"; agent: AgentId; commands: SlashCommandInfo[] }

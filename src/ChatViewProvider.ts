@@ -22,6 +22,7 @@ import { buildServerEnvironment, formatSshCommand, testServerConnection } from "
 import { isProjectId, projectKey } from "./shared/projectIdentity";
 import { directoriesOverlap, executeProjectMove, normalizeProjectArchive, pathEntryExists, planProjectMove, type ProjectMovePlan } from "./projectArchive";
 import { applyActiveProjectOrder, moveInProjectOrder, reconcileProjectOrder } from "./shared/projectOrder";
+import { CompactModeController } from "./compactMode";
 import * as QRCode from "qrcode";
 import {
   RemoteServer,
@@ -43,6 +44,7 @@ const PROJECT_MOVE_KEY = "agentHub.pendingProjectMove";
 interface PendingProjectMove { plan: ProjectMovePlan; keys: string[]; nextProjects: ProjectInfo[]; }
 const MULTI_PREFERRED_AGENT_KEY = "agentHub.multiPreferredAgent";
 const ACTIVE_PROJECT_KEY = "agentHub.activeProject";
+const COMPACT_MODE_KEY = "agentHub.compactMode";
 const CLAUDE_COMMANDS_KEY = "agentHub.claudeCommands";
 const CLAUDE_MODELS_KEY = "agentHub.claudeModels";
 const CLAUDE_MODELS_AT_KEY = "agentHub.claudeModelsAt";
@@ -66,6 +68,7 @@ const VSCODE_ONLY_ACTIONS = new Set<string>([
   "applyConfigJson",
   "openFullView",
   "openMultiChat",
+  "setCompactMode",
   "duplicateProject",
   "pickAttachment",
   "sendSecretEnv",
@@ -325,6 +328,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private multiLayoutPinned = false;
   private multiBoardId?: string;
   private multiMutation?: Promise<void>;
+  private compactMode?: CompactModeController;
   private readonly backends: Record<AgentId, AgentBackend> = {
     claude: new ClaudeBackend(),
     // app-server: корректировка на лету, стриминг, синхронные вопросы.
@@ -2179,6 +2183,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return { ...slot, title: record?.title ?? "Новая сессия" };
   }
 
+  private compactModeController(): CompactModeController {
+    return this.compactMode ??= new CompactModeController({
+      readEnabled: () => this.context.workspaceState.get<boolean>(COMPACT_MODE_KEY, false),
+      writeEnabled: (enabled) => this.context.workspaceState.update(COMPACT_MODE_KEY, enabled),
+      executeCommand: (command) => vscode.commands.executeCommand(command),
+      centersLayout: () => vscode.workspace.getConfiguration("zenMode").get<boolean>("centerLayout", true),
+      publish: (state) => this.postCompactModeState(state),
+    });
+  }
+
+  /** Layout state is separate from chat hydration, so toggles never replay messages. */
+  private postCompactModeState(state = this.compactModeController().state) {
+    void vscode.commands.executeCommand("setContext", COMPACT_MODE_KEY, !!this.multiPanel && state.enabled)
+      .then(undefined, (error: unknown) => console.warn("Agent Hub: could not update compact mode context", error));
+    this.multiPanel?.webview.postMessage({ type: "compactMode", ...state } satisfies HostToWebview);
+    if (state.error && !this.multiPanel) void vscode.window.showErrorMessage(`Agent Hub: не удалось восстановить интерфейс VS Code: ${state.error}`);
+  }
+
+  async setCompactMode(enabled: boolean): Promise<void> {
+    if (typeof enabled !== "boolean") return;
+    if (enabled && !this.multiPanel) {
+      const opening = this.openMultiChat();
+      const requestedPanel = this.multiPanel;
+      await opening;
+      if (!requestedPanel || this.multiPanel !== requestedPanel) return;
+    }
+    await this.compactModeController().setEnabled(enabled);
+  }
+
+  async toggleCompactMode(): Promise<void> {
+    if (!this.multiPanel && !this.compactModeController().state.enabled) {
+      const opening = this.openMultiChat();
+      const requestedPanel = this.multiPanel;
+      await opening;
+      if (!requestedPanel || this.multiPanel !== requestedPanel) return;
+    }
+    await this.compactModeController().toggle();
+  }
+
+  async exitCompactMode(): Promise<void> {
+    await this.setCompactMode(false);
+  }
+
   private postMultiBoardState() {
     if (!this.multiPanel) return;
     this.multiPanel.webview.postMessage({
@@ -2275,14 +2322,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
     panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, "media", "icon.svg");
     const messages = panel.webview.onDidReceiveMessage((msg: WebviewToHost) =>
-      this.onMessage(msg, "vscode", undefined, "multi-panel"),
+      this.multiPanel === panel ? this.onMessage(msg, "vscode", undefined, "multi-panel") : undefined,
     );
     const disposed = panel.onDidDispose(() => {
       messages.dispose();
       disposed.dispose();
-      if (this.multiPanel === panel) this.multiPanel = null;
+      if (this.multiPanel === panel) {
+        this.multiPanel = null;
+        void this.compactModeController().detach(panel);
+      }
     });
     panel.webview.html = this.renderHtml(panel.webview, "multi-panel");
+    void this.compactModeController().attach(panel);
   }
 
   private async createMultiChat(projectPath?: string) {
@@ -3580,9 +3631,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (surface === "multi-panel" && msg.chatId) await this.postMultiState(msg.chatId);
         else if (surface === "multi-panel") await this.ensureMultiChats();
         else this.postFullState();
+        if (surface === "multi-panel") this.postCompactModeState();
         break;
       case "multiStateReady":
-        if (surface === "multi-panel") await this.ensureMultiChats();
+        if (surface === "multi-panel") {
+          await this.ensureMultiChats();
+          this.postCompactModeState();
+        }
+        break;
+      case "setCompactMode":
+        if (surface === "multi-panel" && typeof msg.enabled === "boolean") await this.setCompactMode(msg.enabled);
         break;
       case "createChat":
         if (surface === "multi-panel") await this.createMultiChat(msg.projectPath);

@@ -2348,9 +2348,18 @@ function MultiChatBoard() {
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [chats, setChats] = useState<MultiChatSlotView[]>([]);
   const [hasLoaded, setHasLoaded] = useState(false);
+  const [compactMode, setCompactMode] = useState(false);
+  const [compactPending, setCompactPending] = useState(false);
+  const [compactError, setCompactError] = useState<string | null>(null);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent<HostToWebview>) => {
+      if (event.data.type === "compactMode") {
+        setCompactMode(event.data.enabled);
+        setCompactPending(event.data.pending ?? false);
+        setCompactError(event.data.error ?? null);
+        return;
+      }
       if (event.data.type !== "multiState") return;
       setProjects(event.data.projects);
       setArchivedProjects(event.data.archivedProjects ?? []);
@@ -2365,10 +2374,28 @@ function MultiChatBoard() {
   }, []);
 
   return (
-    <div className="multi-chat-board">
+    <div className={`multi-chat-board${compactMode ? " is-compact" : ""}`}>
       <header className="multi-chat-toolbar">
         <strong>Agent Hub · мультичат</strong>
         <span className="session">{chats.length} чатов</span>
+        <button
+          className="finish-btn compact-mode-button"
+          hidden={REMOTE}
+          aria-label={compactMode ? "Выключить компактный режим" : "Включить компактный режим"}
+          aria-pressed={compactMode}
+          aria-busy={compactPending}
+          disabled={compactPending}
+          title={compactMode
+            ? "Вернуть обычный вид. Также можно нажать Esc два раза"
+            : "Уменьшить отступы и освободить место под чаты через Zen Mode VS Code"}
+          onClick={() => {
+            setCompactPending(true);
+            setCompactError(null);
+            vscode.postMessage({ type: "setCompactMode", enabled: !compactMode });
+          }}
+        >
+          {compactMode ? "⤡ Обычный вид" : "⤢ Больше места"}
+        </button>
         <button className="finish-btn" onClick={() => setArchiveOpen((open) => !open)}>
           {archiveOpen ? "← К чатам" : `📦 Архив${archivedProjects.length ? ` (${archivedProjects.length})` : ""}`}
         </button>
@@ -2376,6 +2403,7 @@ function MultiChatBoard() {
           ＋ Чат
         </button>
       </header>
+      {compactError && <div className="compact-mode-error" role="alert">{compactError}</div>}
       {archiveOpen && (
         <main className="feed settings">
           <ProjectArchiveList projects={archivedProjects} onRestore={(path) => vscode.postMessage({ type: "restoreProject", path })} />
