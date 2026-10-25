@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.61",
+  "version": "0.0.62",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -397,6 +397,127 @@
             "ls"
           ],
           "description": "Префиксы bash-команд, которые разрешаются без подтверждения. Точное совпадение или префикс до пробела: «git status» разрешит «git status -s», но не «git statusx»."
+        },
+        "agentHub.agentDefaults": {
+          "type": "object",
+          "default": {
+            "provider": "lastUsed",
+            "startup": {
+              "mode": "preserve"
+            },
+            "newProject": {
+              "mode": "default"
+            },
+            "newChat": {
+              "mode": "default"
+            }
+          },
+          "description": "Провайдер, модель и effort для новых чатов: общий выбор и отдельные правила запуска, нового проекта и новой сессии. Сохранённые чаты сохраняют свои настройки.",
+          "properties": {
+            "provider": {
+              "type": "string",
+              "enum": [
+                "lastUsed",
+                "claude",
+                "codex"
+              ],
+              "default": "lastUsed"
+            },
+            "startup": {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "type": "string",
+                  "enum": [
+                    "preserve",
+                    "default",
+                    "custom"
+                  ]
+                },
+                "agent": {
+                  "type": "string",
+                  "enum": [
+                    "claude",
+                    "codex"
+                  ]
+                },
+                "model": {
+                  "type": "string"
+                },
+                "effort": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "additionalProperties": false,
+              "description": "Начальный профиль чата без сохранённой сессии."
+            },
+            "newProject": {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "type": "string",
+                  "enum": [
+                    "preserve",
+                    "default",
+                    "custom"
+                  ]
+                },
+                "agent": {
+                  "type": "string",
+                  "enum": [
+                    "claude",
+                    "codex"
+                  ]
+                },
+                "model": {
+                  "type": "string"
+                },
+                "effort": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "additionalProperties": false,
+              "description": "Профиль первого чата нового проекта."
+            },
+            "newChat": {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "type": "string",
+                  "enum": [
+                    "preserve",
+                    "default",
+                    "custom"
+                  ]
+                },
+                "agent": {
+                  "type": "string",
+                  "enum": [
+                    "claude",
+                    "codex"
+                  ]
+                },
+                "model": {
+                  "type": "string"
+                },
+                "effort": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "additionalProperties": false,
+              "description": "Профиль новой сессии или новой плитки мультичата."
+            }
+          },
+          "additionalProperties": false
         }
       }
     }

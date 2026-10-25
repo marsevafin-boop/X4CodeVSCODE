@@ -20,6 +20,7 @@ import type {
 } from "../src/shared/protocol";
 
 import { projectKey } from "../src/shared/projectIdentity";
+import { AgentDefaultsSettings } from "./AgentDefaultsSettings";
 
 import {
   beginServerTest, finishServerTest, idleServerTest, reconcileServerTest, serverTestFingerprint,
@@ -50,6 +51,7 @@ const CHAT_EVENT_TYPES = new Set([
   "draftHandled", "choices", "attachmentAdded", "ask", "permissionResolved", "toolUse",
   "toolResult", "assistantText", "textDelta", "error", "info", "meta", "turnResult",
   "permissionRequest", "reset", "settings", "configJson", "openSettingsScreen", "chatProjectRejected",
+  "agentInfo", "effortInfo",
 ]);
 
 interface MultiChatSlotView {
@@ -262,10 +264,11 @@ function ChatTile({
     claude: [],
     codex: [],
   });
-  const [efforts, setEfforts] = useState<Record<AgentId, string>>({ claude: "", codex: "" });
+  const [effortsBy, setEffortsBy] = useState<Record<string, Partial<Record<AgentId, string>>>>({});
   const [slashIdx, setSlashIdx] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
   const [agent, setAgent] = useState<AgentId>(initialAgent ?? "claude");
+  const [agentReady, setAgentReady] = useState(initialAgent !== undefined);
   const [draft, setDraft] = useState("");
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -370,6 +373,7 @@ function ChatTile({
   const bindingRef = useRef({ projectPath: initialProjectPath ?? "", recordId: initialRecordId });
   const pendingProjectRef = useRef<string | null>(null);
   const pendingAgentRef = useRef<AgentId | null>(null);
+  const pendingSessionRef = useRef<string | null>(null);
   const itemRecordsRef = useRef(new WeakMap<ChatItem[], string>());
 
   // Производные значения активного проекта.
@@ -379,6 +383,7 @@ function ChatTile({
   const sessions = sessionsBy[activePath] ?? NO_SESSIONS;
   const contextUsage = ctxBy[activePath] ?? NO_CTX;
   const models = modelsBy[activePath] ?? NO_MODELS;
+  const efforts = effortsBy[activePath] ?? {};
   const queue = queueBy[activePath] ?? [];
   const sessionId = sessions[agent];
   const activeProject = projects.find((p) => projectKey(p) === activePath);
@@ -547,6 +552,7 @@ function ChatTile({
           activeRef.current = msg.projectPath;
           setActivePath(msg.projectPath);
           setAgent(msg.agent);
+          if (!pendingSessionRef.current) setAgentReady(true);
           mutateItems(msg.projectPath, (items) => [...items, { id: nextId++, role: "error", text: msg.message }]);
           break;
         }
@@ -563,6 +569,7 @@ function ChatTile({
             pendingAgentRef.current = null;
             setAgentSwitching(false);
             setAgent(slot.agent);
+            if (!pendingSessionRef.current) setAgentReady(true);
           }
           break;
         }
@@ -591,7 +598,15 @@ function ChatTile({
           if (!chatId || (msg.chatId === chatId &&
               msg.activePath === bindingRef.current.projectPath &&
               (!pendingProjectRef.current || msg.activePath === pendingProjectRef.current))) {
-            if (msg.activePath !== activeRef.current) clearServerTest();
+            if (msg.activePath !== activeRef.current) {
+              clearServerTest();
+              if (!chatId) {
+                pendingAgentRef.current = null;
+                pendingSessionRef.current = null;
+                setAgentSwitching(false);
+                setAgentReady(false);
+              }
+            }
             activeRef.current = msg.activePath;
             setActivePath(msg.activePath);
           }
@@ -611,6 +626,7 @@ function ChatTile({
           setSessionsBy(prune);
           setCtxBy(prune);
           setModelsBy(prune);
+          setEffortsBy(prune);
           break;
         }
         case "transcript": {
@@ -665,8 +681,23 @@ function ChatTile({
         case "slashCommands":
           setSlashCmds((prev) => ({ ...prev, [msg.agent]: msg.commands }));
           break;
+        case "agentInfo": {
+          if (p !== activeRef.current) break;
+          if (msg.contextRequestId ? pendingSessionRef.current !== msg.contextRequestId : pendingSessionRef.current) break;
+          if (chatId && msg.recordId && msg.recordId !== bindingRef.current.recordId) break;
+          const pending = pendingAgentRef.current;
+          if (pending && (msg.requestedAgent ? msg.requestedAgent !== pending : msg.agent !== pending)) break;
+          pendingAgentRef.current = null;
+          pendingSessionRef.current = null;
+          setAgentSwitching(false);
+          setAgentReady(true);
+          setAgent(msg.agent);
+          if (msg.error) mutateItems(p, (items) => [...items, { id: nextId++, role: "error", text: msg.error! }]);
+          break;
+        }
         case "effortInfo":
-          setEfforts((prev) => ({ ...prev, [msg.agent]: msg.effort }));
+          if (chatId && msg.recordId && msg.recordId !== bindingRef.current.recordId) break;
+          setEffortsBy((prev) => ({ ...prev, [p]: { ...prev[p], [msg.agent]: msg.effort } }));
           break;
         case "autoScrollMode":
           setAutoScrollMode(msg.mode);
@@ -924,7 +955,7 @@ function ChatTile({
   };
 
   const send = () => {
-    if (pendingProjectRef.current) return;
+    if (pendingProjectRef.current || pendingAgentRef.current || pendingSessionRef.current || !agentReady) return;
     const text = draft.trim();
     if (!text && pending.length === 0) return;
     const finalText = text || "Посмотри приложенные файлы.";
@@ -985,10 +1016,13 @@ function ChatTile({
     }
     if (value === activeRef.current) return;
     clearServerTest();
+    pendingAgentRef.current = null;
+    pendingSessionRef.current = null;
+    setAgentSwitching(false);
     if (chatId) {
       pendingProjectRef.current = value;
       setProjectSwitching(true);
-    }
+    } else setAgentReady(false);
     activeRef.current = value;
     setActivePath(value);
     post(chatId
@@ -1337,29 +1371,20 @@ function ChatTile({
                 </section>
               )}
 
+              <AgentDefaultsSettings
+                value={form.agentDefaults}
+                profiles={{ claude: form.claude, codex: form.codex }}
+                catalog={form.agentCatalog}
+                activeAgent={agent}
+                onChange={(defaults) => up((next) => { next.agentDefaults = defaults; })}
+                onProfileChange={(provider, profile) => up((next) => {
+                  next[provider].model = profile.model;
+                  next[provider].effort = profile.effort;
+                })}
+              />
+
               <section>
                 <h3>Claude</h3>
-                <label className="set-row">
-                  <span>Модель</span>
-                  <input
-                    value={form.claude.model}
-                    placeholder="пусто — как в CLI (напр. claude-opus-5)"
-                    onChange={(e) => up((f) => (f.claude.model = e.target.value))}
-                  />
-                </label>
-                <label className="set-row">
-                  <span>Effort</span>
-                  <select
-                    value={form.claude.effort}
-                    onChange={(e) => up((f) => (f.claude.effort = e.target.value))}
-                  >
-                    {["", "low", "medium", "high", "xhigh", "max"].map((v) => (
-                      <option key={v} value={v}>
-                        {v || "по умолчанию"}
-                      </option>
-                    ))}
-                  </select>
-                </label>
                 <label className="set-row">
                   <span>Разрешения</span>
                   <select
@@ -1400,27 +1425,6 @@ function ChatTile({
 
               <section>
                 <h3>GPT (Codex)</h3>
-                <label className="set-row">
-                  <span>Модель</span>
-                  <input
-                    value={form.codex.model}
-                    placeholder="пусто — из ~/.codex/config.toml"
-                    onChange={(e) => up((f) => (f.codex.model = e.target.value))}
-                  />
-                </label>
-                <label className="set-row">
-                  <span>Effort</span>
-                  <select
-                    value={form.codex.effort}
-                    onChange={(e) => up((f) => (f.codex.effort = e.target.value))}
-                  >
-                    {["", "minimal", "low", "medium", "high", "xhigh", "ultra"].map((v) => (
-                      <option key={v} value={v}>
-                        {v || "по умолчанию"}
-                      </option>
-                    ))}
-                  </select>
-                </label>
                 <label className="set-row">
                   <span>Песочница</span>
                   <select
@@ -1701,33 +1705,41 @@ function ChatTile({
         </div>
         <select
           className="agent-select"
-          value={agent}
+          aria-label="Провайдер чата"
+          value={agentReady ? agent : ""}
           onChange={(e) => {
             const nextAgent = e.target.value as AgentId;
-            if (chatId) {
-              pendingAgentRef.current = nextAgent;
-              setAgentSwitching(true);
-            }
+            pendingAgentRef.current = nextAgent;
+            setAgentSwitching(true);
             setAgent(nextAgent);
             if (chatId) post({ type: "selectChatAgent", chatId, agent: nextAgent });
+            else post({ type: "selectAgent", agent: nextAgent, path: activePath });
           }}
-          disabled={busy || agentSwitching}
+          disabled={busy || agentSwitching || !agentReady}
         >
+          {!agentReady && <option value="" disabled>Загрузка провайдера…</option>}
           <option value="claude">Claude</option>
           <option value="codex">GPT (Codex)</option>
         </select>
         <button
           className="finish-btn"
           title="Новая сессия (текущая непустая сохранится в истории 🕘)"
-          disabled={busy}
-          onClick={() => post({ type: "newSession" })}
+          disabled={busy || agentSwitching || !agentReady}
+          onClick={() => {
+            const requestId = `session-${Date.now()}-${nextId++}`;
+            pendingSessionRef.current = requestId;
+            pendingAgentRef.current = null;
+            setAgentSwitching(false);
+            setAgentReady(false);
+            post({ type: "newSession", requestId });
+          }}
         >
           ＋ Новая
         </button>
         <button
           className="finish-btn"
           title="История сессий проекта: вернуться к старой или удалить"
-          disabled={busy}
+          disabled={busy || !agentReady || agentSwitching}
           onClick={() => post({ type: "showSessions" })}
         >
           🕘 История
@@ -1755,7 +1767,7 @@ function ChatTile({
         <button
           className="finish-btn"
           title="Записать итоги сессии в журнал (docs/journal) и начать новую"
-          disabled={busy || !sessionId}
+          disabled={busy || !sessionId || !agentReady || agentSwitching}
           onClick={() => post({ type: "finishSession", agent })}
         >
           ✍ Итоги
@@ -1794,9 +1806,10 @@ function ChatTile({
               ? `Сработал фоллбэк: фактически отвечает ${models[agent].model}, хотя сессия начиналась на ${models[agent].fallbackFrom}. `
               : "") +
             (chatId
-              ? "Клик — выбрать модель этой плитки: сохранится при смене проекта и новой сессии; либо изменить базовую модель"
-              : "Клик — выбрать модель: только для этого чата или базовую для новых чатов (применится со следующего хода)")
+              ? "Клик — выбрать модель этой плитки или общую модель. Новая сессия использует правила по умолчанию"
+              : "Клик — выбрать модель этой сессии или общую модель провайдера (применится со следующего хода)")
           }
+          disabled={!agentReady || agentSwitching}
           onClick={() => post({ type: "pickModel", agent })}
         >
           {models[agent].fallbackFrom
@@ -1805,7 +1818,8 @@ function ChatTile({
         </button>
         <button
           className="safety-btn"
-          title="Effort — глубина размышлений выбранного агента. Клик — выбрать (применится со следующего хода)"
+          title="Effort этой сессии — глубина размышлений выбранного агента. Клик — выбрать (применится со следующего хода)"
+          disabled={!agentReady || agentSwitching}
           onClick={() => post({ type: "pickEffort", agent })}
         >
           ⚡ {efforts[agent] || "effort: авто"}
@@ -1813,6 +1827,7 @@ function ChatTile({
         <button
           className={`safety-btn ${safety[agent]?.dangerous ? "safety-danger" : ""}`}
           title="Режим разрешений выбранного агента — клик переключает (Claude: подтверждения → правки без спроса → YOLO; Codex: песочница ↔ YOLO)"
+          disabled={!agentReady || agentSwitching}
           onClick={() => post({ type: "cycleSafety", agent })}
         >
           {safety[agent]?.label ?? "🔒"}
@@ -1861,6 +1876,7 @@ function ChatTile({
           className="safety-btn"
           hidden={REMOTE}
           title="Показать контекст агента: что он получит из базы проекта со следующим сообщением (карточка проекта, журнал, лента другого агента) и точный промпт последнего хода"
+          disabled={!agentReady || agentSwitching}
           onClick={() => post({ type: "showContext", agent })}
         >
           🧠
@@ -2274,7 +2290,7 @@ function ChatTile({
                       : "Сообщение отправится автоматически после ответа агента"
                 }
                 onClick={send}
-                disabled={!draft.trim() && pending.length === 0}
+                disabled={!agentReady || agentSwitching || (!draft.trim() && pending.length === 0)}
               >
                 {sendMode === "now" ? "⚡ Сразу" : sendMode === "next" ? "↪ Докинуть" : "⏳ В очередь"}
               </button>
@@ -2290,7 +2306,7 @@ function ChatTile({
               </button>
             </>
           ) : (
-            <button className="send" onClick={send} disabled={!draft.trim() && pending.length === 0}>
+            <button className="send" onClick={send} disabled={!agentReady || agentSwitching || (!draft.trim() && pending.length === 0)}>
               Отправить
             </button>
           )}

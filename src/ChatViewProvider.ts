@@ -23,6 +23,7 @@ import { isProjectId, projectKey } from "./shared/projectIdentity";
 import { directoriesOverlap, executeProjectMove, normalizeProjectArchive, pathEntryExists, planProjectMove, type ProjectMovePlan } from "./projectArchive";
 import { applyActiveProjectOrder, moveInProjectOrder, reconcileProjectOrder } from "./shared/projectOrder";
 import { CompactModeController } from "./compactMode";
+import { agentEffortLevels, normalizeAgentChoice, normalizeAgentDefaults, resolveAgentChoice, type AgentChoice, type AgentDefaultEvent } from "./shared/agentDefaults";
 import * as QRCode from "qrcode";
 import {
   RemoteServer,
@@ -43,6 +44,7 @@ const PROJECT_ORDER_KEY = "agentHub.projectOrder";
 const PROJECT_MOVE_KEY = "agentHub.pendingProjectMove";
 interface PendingProjectMove { plan: ProjectMovePlan; keys: string[]; nextProjects: ProjectInfo[]; }
 const MULTI_PREFERRED_AGENT_KEY = "agentHub.multiPreferredAgent";
+const LAST_AGENT_CHOICE_KEY = "agentHub.lastAgentChoice";
 const ACTIVE_PROJECT_KEY = "agentHub.activeProject";
 const COMPACT_MODE_KEY = "agentHub.compactMode";
 const CLAUDE_COMMANDS_KEY = "agentHub.claudeCommands";
@@ -150,6 +152,9 @@ interface SessionRecord {
   lastPrompts?: Partial<Record<AgentId, string>>;
   /** Модель, выбранная ТОЛЬКО для этого чата (пусто — базовая из настроек). */
   modelOverrides?: Partial<Record<AgentId, string>>;
+  /** Provider and reasoning selected for this saved conversation. */
+  preferredAgent?: AgentId;
+  effortOverrides?: Partial<Record<AgentId, string>>;
   /** Последняя известная занятость контекста по агентам. */
   context?: Partial<Record<AgentId, { used: number; max: number }>>;
   /** Последняя известная модель по агентам. */
@@ -161,6 +166,12 @@ interface SessionRecord {
 interface ProjectStore {
   activeId: string | null;
   sessions: SessionRecord[];
+}
+
+interface AgentRecordBinding {
+  projectPath: string;
+  recordId?: string;
+  createdAt?: number;
 }
 
 interface ChatSlot {
@@ -536,6 +547,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await this.serializeMultiMutation(async () => {
             if (!this.getProjects().some((entry) => projectKey(entry) === picked.path)) return;
             await this.setActivePath(picked.path);
+            await this.ensureActiveRecord(picked.path!);
+            await this.rememberVisibleChoice(this.recordAgentChoice(this.getActiveRecord(picked.path!)));
             this.postFullState();
           });
         }
@@ -719,6 +732,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     if (!fs.existsSync(path) || !fs.statSync(path).isDirectory()) throw new Error("Выбранная папка больше недоступна. Откройте выбор папки заново.");
     const projects = this.getProjects();
+    const previousProject = this.getActiveProject();
+    const previousRecord = previousProject ? this.getActiveRecord(projectKey(previousProject)) : null;
+    const choice = this.defaultAgentChoice("newProject", previousRecord ? this.recordAgentChoice(previousRecord) : undefined);
     // Явно добавленная папка workspace больше не считается скрытой.
     await this.setProjectHidden(path, false);
 
@@ -740,6 +756,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     list.push(fresh);
     await cfg.update("projects", list, vscode.ConfigurationTarget.Global);
     await this.setActivePath(projectKey(fresh));
+    const record = this.createRecord();
+    this.applyAgentChoice(record, choice);
+    await this.saveProjectStore(projectKey(fresh), { activeId: record.id, sessions: [record] });
+    await this.rememberVisibleChoice(choice);
     this.postFullState();
     await this.postSettings();
     // Открываем экран настроек панели: название, GitHub, ветка, сервер,
@@ -804,6 +824,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         let name = baseName;
         for (let suffix = 2; names.has(name); suffix++) name = `${baseName} ${suffix}`;
         const profile: ProjectInfo = { ...current, id: `project-${randomUUID()}`, name, path: targetPath };
+        const sourceRecord = this.getActiveRecord(path);
+        const choice = this.defaultAgentChoice("newProject", sourceRecord ? this.recordAgentChoice(sourceRecord) : undefined);
         targetKey = projectKey(profile);
         const password = await this.context.secrets.get(this.passwordKey(path));
         const env = await this.context.secrets.get(this.secretEnvKey(path));
@@ -814,6 +836,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await cfg.update("projects", configured, vscode.ConfigurationTarget.Global);
         profilePersisted = true;
         await this.setActivePath(targetKey);
+        const record = this.createRecord();
+        this.applyAgentChoice(record, choice);
+        await this.saveProjectStore(targetKey, { activeId: record.id, sessions: [record] });
+        await this.rememberVisibleChoice(choice);
         this.postFullState();
         await this.postSettings();
         this.post({ type: "info", text: `Копия проекта «${profile.name}» создана и выбрана.` });
@@ -1537,6 +1563,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private collectAllSettings() {
     const cfg = vscode.workspace.getConfiguration("agentHub");
     return {
+      agentDefaults: this.agentDefaults(),
       claude: {
         model: cfg.get<string>("claude.model", ""),
         effort: cfg.get<string>("claude.effort", ""),
@@ -1599,6 +1626,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (Array.isArray(settings.autoAllowBash)) {
       await cfg.update("autoAllowBash", settings.autoAllowBash, g);
     }
+    if (settings.agentDefaults !== undefined) await cfg.update("agentDefaults", this.normalizedAgentDefaults(settings.agentDefaults), g);
   }
 
   /** A stale settings/export snapshot cannot change a completed filesystem move. */
@@ -1664,6 +1692,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.abortOrphanRuns();
     }
 
+    const active = this.getActiveProject();
+    if (active) await this.ensureActiveRecord(projectKey(active));
     this.postFullState();
     await this.postSettings();
     this.post({
@@ -1772,6 +1802,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    const active = this.getActiveProject();
+    if (active) await this.ensureActiveRecord(projectKey(active));
     this.postFullState();
     await this.postSettings();
     void vscode.window.showInformationMessage(
@@ -2249,6 +2281,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const record = this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId);
       if (!record) continue;
       this.postScoped(slot.projectPath, { type: "projects", projects, archivedProjects, activePath: slot.projectPath }, slot.chatId);
+      this.postScoped(slot.projectPath, { type: "agentInfo", agent: slot.agent, recordId: slot.recordId }, slot.chatId);
+      this.postRecordEfforts(slot.projectPath, record, slot.chatId);
       this.postScoped(slot.projectPath, { type: "transcript", path: slot.projectPath, items: record.items, recordId: record.id }, slot.chatId);
       this.postScoped(slot.projectPath, { type: "busy", value: this.runs.has(slot.chatId) }, slot.chatId);
       for (const agent of ["claude", "codex"] as const) {
@@ -2372,7 +2406,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const store = this.getProjectStore(projectPath);
         const record = this.createRecord();
         const previous = this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId);
-        record.modelOverrides = { ...previous?.modelOverrides };
+        this.applyAgentChoice(record, this.recordAgentChoice(previous, slot.agent));
         store.sessions.push(record);
         await this.saveProjectStore(projectPath, store);
         await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId
@@ -2395,15 +2429,56 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async selectMultiChatAgent(chatId: string, agent: AgentId) {
     const slot = this.findChatSlot(chatId);
-    if (!slot) return;
+    if (!slot || (agent !== "claude" && agent !== "codex")) return;
+    let error: string | undefined;
     try {
       await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId
         ? { ...entry, agent } : entry));
-      await this.context.globalState.update(MULTI_PREFERRED_AGENT_KEY, agent);
+      const record = this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId);
+      if (record) {
+        await this.mutateRecord(slot.projectPath, record.id, (entry) => { entry.preferredAgent = agent; });
+        await this.rememberAgentChoice(this.recordAgentChoice(record, agent));
+      }
     } catch {
-      this.postScoped(slot.projectPath, { type: "error", message: "Не удалось сохранить выбор провайдера для следующего открытия." }, chatId);
+      error = "Не удалось сохранить выбор провайдера для следующего открытия.";
     } finally {
+      const actual = this.findChatSlot(chatId);
+      if (actual) {
+        const record = this.getProjectStore(actual.projectPath).sessions.find((entry) => entry.id === actual.recordId) ?? null;
+        this.postScoped(actual.projectPath, { type: "agentInfo", agent: actual.agent, recordId: actual.recordId, requestedAgent: agent, ...(error ? { error } : {}) }, chatId);
+      }
       await this.postMultiState(chatId);
+    }
+  }
+
+  private async selectAgent(agent: AgentId, path?: string) {
+    if (agent !== "claude" && agent !== "codex") return;
+    const project = this.getActiveProject();
+    if (!project) {
+      this.post({ type: "agentInfo", agent: this.defaultAgentChoice("startup").agent, requestedAgent: agent });
+      return;
+    }
+    const key = projectKey(project);
+    let record = this.getActiveRecord(key);
+    let previousAgent = record?.preferredAgent;
+    let saved = false;
+    if ((path && path !== key) || this.runs.has(key)) {
+      this.postRecordAgent(key, record, undefined, agent, "Дождитесь завершения хода перед сменой провайдера.");
+      return;
+    }
+    try {
+      record ??= await this.ensureActiveRecord(key);
+      previousAgent = record.preferredAgent;
+      await this.mutateRecord(key, record.id, (entry) => { entry.preferredAgent = agent; });
+      saved = true;
+      await this.rememberAgentChoice(this.recordAgentChoice(record, agent));
+      this.postRecordAgent(key, record, undefined, agent);
+    } catch {
+      if (record && !saved) {
+        if (previousAgent) record.preferredAgent = previousAgent;
+        else delete record.preferredAgent;
+      }
+      this.postRecordAgent(key, this.getActiveRecord(key), undefined, agent, "Не удалось сохранить выбор провайдера. Повторите переключение.");
     }
   }
 
@@ -2415,15 +2490,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const key = projectKey(project);
     const store = this.getProjectStore(key);
     const record = this.createRecord();
+    const choice = this.defaultAgentChoice("newChat");
+    this.applyAgentChoice(record, choice);
     store.sessions.push(record);
     await this.saveProjectStore(key, store);
     const slot: ChatSlot = {
       chatId: `chat-${randomUUID()}`,
       projectPath: key,
       recordId: record.id,
-      agent: this.preferredMultiAgent(),
+      agent: choice.agent,
     };
     await this.saveChatSlots([...this.getChatSlots(), slot]);
+    await this.rememberVisibleChoice(choice);
     return slot;
   }
 
@@ -2445,13 +2523,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const key = projectKey(project);
       const store = this.getProjectStore(key);
       const created: ChatSlot[] = [];
+      const choice = this.defaultAgentChoice("startup");
       for (let i = 0; i < 4; i++) {
         const record = this.createRecord();
+        this.applyAgentChoice(record, choice);
         store.sessions.push(record);
-        created.push({ chatId: `chat-${randomUUID()}`, projectPath: key, recordId: record.id, agent: this.preferredMultiAgent() });
+        created.push({ chatId: `chat-${randomUUID()}`, projectPath: key, recordId: record.id, agent: choice.agent });
       }
       await this.saveProjectStore(key, store);
       await this.saveChatSlots(created);
+      await this.rememberVisibleChoice(choice);
       slots = created;
     }
     if (this.multiLayoutNeedsMigration || !this.multiLayoutPinned) await this.saveChatSlots(slots);
@@ -2462,6 +2543,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const store = this.getProjectStore(slot.projectPath);
       if (store.sessions.some((record) => record.id === slot.recordId)) continue;
       const record = this.createRecord();
+      this.applyAgentChoice(record, this.recordAgentChoice(null, slot.agent));
       store.sessions.push(record);
       await this.saveProjectStore(slot.projectPath, store);
       slot.recordId = record.id;
@@ -2472,7 +2554,98 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private preferredMultiAgent(): AgentId {
-    return this.context.globalState.get<string>(MULTI_PREFERRED_AGENT_KEY) === "codex" ? "codex" : "claude";
+    return this.defaultAgentChoice("newChat").agent;
+  }
+
+  private agentDefaults() {
+    return this.normalizedAgentDefaults(vscode.workspace.getConfiguration("agentHub").get<unknown>("agentDefaults"));
+  }
+
+  private modelEfforts(agent: AgentId, model: string): readonly string[] | undefined {
+    if (agent === "claude") return this.listClaudeModels().find((entry) => entry.value === model)?.supportedEffortLevels;
+    return this.codexEffortLevels(model)?.map((entry) => entry.effort);
+  }
+
+  private effectiveEffort(agent: AgentId, model: string, override?: string): string {
+    const base = vscode.workspace.getConfiguration(`agentHub.${agent}`).get<string>("effort", "");
+    const known = this.modelEfforts(agent, model || (agent === "codex" ? codexDefaultModel() ?? "" : ""));
+    const allowed = known ?? agentEffortLevels(agent);
+    const desired = override || base;
+    if (!desired || allowed.includes(desired)) return desired;
+    return override && base && allowed.includes(base) ? base : "";
+  }
+
+  private normalizedAgentDefaults(value: unknown) {
+    const defaults = normalizeAgentDefaults(value);
+    for (const event of ["startup", "newProject", "newChat"] as const) {
+      const rule = defaults[event];
+      if (rule.mode !== "custom" || !rule.effort) continue;
+      const model = rule.model || vscode.workspace.getConfiguration(`agentHub.${rule.agent}`).get<string>("model", "") ||
+        (rule.agent === "codex" ? codexDefaultModel() ?? "" : "");
+      const levels = this.modelEfforts(rule.agent, model);
+      if (levels && !levels.includes(rule.effort)) rule.effort = "";
+    }
+    return defaults;
+  }
+
+  private lastAgentChoice(): AgentChoice | undefined {
+    const saved = normalizeAgentChoice(this.context.workspaceState.get<unknown>(LAST_AGENT_CHOICE_KEY));
+    if (saved) return saved;
+    const legacy = this.context.globalState.get<unknown>(MULTI_PREFERRED_AGENT_KEY);
+    return legacy === "claude" || legacy === "codex" ? { agent: legacy } : undefined;
+  }
+
+  private recordAgentChoice(record?: SessionRecord | null, agent?: AgentId): AgentChoice {
+    return {
+      agent: agent ?? record?.preferredAgent ?? this.lastAgentChoice()?.agent ?? "claude",
+      modelOverrides: { ...record?.modelOverrides },
+      effortOverrides: { ...record?.effortOverrides },
+    };
+  }
+
+  private defaultAgentChoice(event: AgentDefaultEvent, current?: AgentChoice): AgentChoice {
+    return resolveAgentChoice(event, this.agentDefaults(), { current, lastUsed: this.lastAgentChoice() });
+  }
+
+  private applyAgentChoice(record: SessionRecord, choice: AgentChoice) {
+    record.preferredAgent = choice.agent;
+    record.modelOverrides = { ...choice.modelOverrides };
+    record.effortOverrides = { ...choice.effortOverrides };
+  }
+
+  private async rememberAgentChoice(choice: AgentChoice) {
+    const normalized = normalizeAgentChoice(choice);
+    if (!normalized) return;
+    await this.context.workspaceState.update(LAST_AGENT_CHOICE_KEY, normalized);
+    // Existing installations and new workspaces still have this migration fallback.
+    try {
+      await this.context.globalState.update(MULTI_PREFERRED_AGENT_KEY, normalized.agent);
+    } catch (error) {
+      console.warn("Agent Hub: could not update the legacy provider preference", error);
+    }
+  }
+
+  /** The conversation is already durable; an ancillary preference must not suppress its hydration. */
+  private async rememberVisibleChoice(choice: AgentChoice) {
+    try { await this.rememberAgentChoice(choice); }
+    catch (error) {
+      void vscode.window.showErrorMessage(`Чат сохранён, но не удалось запомнить последний профиль: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private postRecordAgent(projectPath: string, record: SessionRecord | null, chatId?: string, requestedAgent?: AgentId, error?: string) {
+    this.postScoped(projectPath, { type: "agentInfo", agent: (record ? this.recordAgentChoice(record) : this.defaultAgentChoice("startup")).agent,
+      ...(record ? { recordId: record.id } : {}), ...(requestedAgent ? { requestedAgent } : {}), ...(error ? { error } : {}) }, chatId);
+  }
+
+  private selectedEffort(record: SessionRecord | null | undefined, agent: AgentId): string {
+    return this.effectiveEffort(agent, this.selectedModel(record, agent), record?.effortOverrides?.[agent]);
+  }
+
+  private postRecordEfforts(projectPath: string, record: SessionRecord | null | undefined, chatId?: string) {
+    for (const agent of ["claude", "codex"] as const) {
+      this.postScoped(projectPath, { type: "effortInfo", agent, effort: this.selectedEffort(record, agent), ...(record ? { recordId: record.id } : {}) }, chatId);
+    }
   }
 
   private selectedModel(record: SessionRecord | null | undefined, agent: AgentId): string {
@@ -2549,9 +2722,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let rec = store.sessions.find((s) => s.id === store.activeId) ?? null;
     if (!rec) {
       rec = this.createRecord();
+      this.applyAgentChoice(rec, this.defaultAgentChoice("startup"));
       store.sessions.push(rec);
       store.activeId = rec.id;
       await this.saveProjectStore(projectPath, store);
+      await this.rememberVisibleChoice(this.recordAgentChoice(rec));
     }
     return rec;
   }
@@ -2595,6 +2770,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: "projects", projects, archivedProjects: this.getArchivedProjects(), activePath: active ? projectKey(active) : "" });
     if (active) {
       const rec = this.getActiveRecord(projectKey(active));
+      this.postRecordAgent(projectKey(active), rec);
       this.post({ type: "transcript", path: projectKey(active), items: rec?.items ?? [] });
       // Скоуп обязателен: burst идёт до ре-рендера webview, и фолбэк на
       // activeRef разложил бы состояние под старым проектом (баг из ревью).
@@ -2618,6 +2794,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
         this.postRecordModel(projectKey(active), rec, a);
       }
+    } else {
+      this.post({ type: "agentInfo", agent: this.defaultAgentChoice("startup").agent });
     }
     this.postRuntimeSettings();
     if (this.multiPanel) void this.postMultiState();
@@ -2627,13 +2805,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private buildAgentConfig(
     agent: AgentId,
     modelOverride?: string,
+    effortOverride?: string,
   ): import("./agents/types").AgentRunConfig {
     const cfg = vscode.workspace.getConfiguration(`agentHub.${agent}`);
     if (agent === "claude") {
       const cw = cfg.get<number>("contextWindow", 0);
       return {
         model: modelOverride || cfg.get<string>("model") || undefined,
-        effort: cfg.get<string>("effort") || undefined,
+        effort: this.effectiveEffort(agent, modelOverride || cfg.get<string>("model", ""), effortOverride) || undefined,
         permissionMode: cfg.get<string>("permissionMode") || "default",
         maxTurns: cfg.get<number>("maxTurns") || 0,
         // 200000 — старый дефолт до v0.0.14, трактуем как «авто по модели».
@@ -2643,7 +2822,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const cw = cfg.get<number>("contextWindow", 0);
     return {
       model: modelOverride || cfg.get<string>("model") || undefined,
-      effort: cfg.get<string>("effort") || undefined,
+      effort: this.effectiveEffort(agent, modelOverride || cfg.get<string>("model", ""), effortOverride) || undefined,
       sandbox: cfg.get<string>("sandbox") || "workspace-write",
       yolo: cfg.get<boolean>("yolo") || false,
       contextWindow: cw === 400000 ? 0 : cw,
@@ -2663,6 +2842,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this.context.secrets.get(this.passwordKey(projectKey(project))),
     ).AGENT_HUB_SERVER_PASSWORD) : false;
     return {
+      agentDefaults: this.agentDefaults(),
+      agentCatalog: {
+        claude: this.listClaudeModels().map((model) => ({ value: model.value, label: model.displayName ?? model.value, efforts: model.supportedEffortLevels ?? [...agentEffortLevels("claude")].filter(Boolean) })),
+        codex: this.listCodexModels().map((model) => ({ value: model.slug, label: model.slug, efforts: this.codexEffortLevels(model.slug)?.map((level) => level.effort) ?? [...agentEffortLevels("codex")].filter(Boolean) })),
+      },
       claude: {
         model: cfg.get<string>("claude.model", ""),
         effort: cfg.get<string>("claude.effort", ""),
@@ -2729,6 +2913,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await cfg.update("autoPush", s.autoPush, g);
     await cfg.update("autoPull", s.autoPull, g);
     await cfg.update("autoScrollMode", s.autoScrollMode, g);
+    if (s.agentDefaults !== undefined) await cfg.update("agentDefaults", this.normalizedAgentDefaults(s.agentDefaults), g);
 
     if (s.project) {
       const list = [...(cfg.get<ProjectInfo[]>("projects", []) ?? [])];
@@ -2789,7 +2974,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   async pickModel(agent: AgentId, remote?: RemoteClient, chatId?: string) {
     const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
     const slot = this.findChatSlot(chatId);
-    const record = slot ? this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId) : null;
+    if (chatId && !slot) return;
+    const project = slot ? this.getProjects().find((entry) => projectKey(entry) === slot.projectPath) : this.getActiveProject();
+    const record = slot ? this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId)
+      : project ? this.getActiveRecord(projectKey(project)) : null;
+    const origin = project ? { projectPath: projectKey(project), recordId: record?.id, createdAt: record?.createdAt } : undefined;
     const current = this.selectedModel(record, agent);
     const CUSTOM = "__custom__";
     const REFRESH = "__refresh__";
@@ -2897,12 +3086,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     );
     if (!scope) return;
-    await this.applyModel(agent, value, scope.base, chatId);
+    await this.applyModel(agent, value, scope.base, chatId, false, origin);
   }
 
   /** Применить выбор модели: только в этот чат или как базовую для новых. */
-  async applyModel(agent: AgentId, value: string, base: boolean, chatId?: string, serialized = false): Promise<void> {
-    if (!serialized) return this.serializeMultiMutation(() => this.applyModel(agent, value, base, chatId, true));
+  async applyModel(agent: AgentId, value: string, base: boolean, chatId?: string, serialized = false, origin?: AgentRecordBinding): Promise<void> {
+    if ((agent !== "claude" && agent !== "codex") || typeof value !== "string" || typeof base !== "boolean") return;
+    if (!serialized) return this.serializeMultiMutation(() => this.applyModel(agent, value, base, chatId, true, origin));
     const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
     const agentName = agent === "claude" ? "Claude" : "Codex";
     const slot = this.findChatSlot(chatId);
@@ -2910,9 +3100,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const project = slot
       ? this.getProjects().find((entry) => projectKey(entry) === slot.projectPath)
       : this.getActiveProject();
-    const record = project ? slot
+    let record = project ? slot
       ? this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId)
-      : await this.ensureActiveRecord(projectKey(project)) : null;
+      : this.getActiveRecord(projectKey(project)) : null;
+    const currentBinding = !origin || (project && projectKey(project) === origin.projectPath &&
+      record?.id === origin.recordId && record?.createdAt === origin.createdAt);
+    if (!currentBinding && !base) return;
+    // A stale global-model intent can update the base without clearing the replacement chat's override.
+    if (!currentBinding) record = null;
+    else if (!record && project) record = await this.ensureActiveRecord(projectKey(project));
     const updateRecord = async (mutate: (record: SessionRecord) => void) => {
       if (!project || !record) return;
       await this.mutateRecord(projectKey(project), record.id, (current) => {
@@ -2957,8 +3153,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           : `Свой выбор модели ${agentName} в этом чате снят — действует базовая (${baseModel}).`,
       });
     }
-    if (project && record) this.postRecordModel(projectKey(project), record, agent, chatId);
-    if (base) this.postMultiModels();
+    if (project && record) {
+      this.postRecordModel(projectKey(project), record, agent, chatId);
+      this.postRecordEfforts(projectKey(project), record, chatId);
+    }
+    if (record) await this.rememberVisibleChoice(this.recordAgentChoice(record, slot?.agent ?? record.preferredAgent ?? agent));
+    if (base) { this.postMultiModels(); this.postEfforts(); }
     await this.postSettings(chatId);
   }
 
@@ -3009,7 +3209,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Модели Claude: кэш supportedModels CLI; до первого хода — статический список. */
   private listClaudeModels(): ClaudeModelInfo[] {
-    const cached = this.context.globalState.get<ClaudeModelInfo[]>(CLAUDE_MODELS_KEY, []);
+    const raw = this.context.globalState.get<unknown>(CLAUDE_MODELS_KEY);
+    const seen = new Set<string>();
+    const cached: ClaudeModelInfo[] = [];
+    for (const value of Array.isArray(raw) ? raw : []) {
+      if (!value || typeof value !== "object") continue;
+      const entry = value as Partial<ClaudeModelInfo>;
+      if (typeof entry.value !== "string" || !entry.value.trim() || seen.has(entry.value.trim())) continue;
+      const model = entry.value.trim(); seen.add(model);
+      cached.push({ value: model,
+        ...(typeof entry.displayName === "string" ? { displayName: entry.displayName } : {}),
+        ...(typeof entry.description === "string" ? { description: entry.description } : {}),
+        ...(Array.isArray(entry.supportedEffortLevels) ? { supportedEffortLevels: [...new Set(entry.supportedEffortLevels.filter((level) => typeof level === "string" && agentEffortLevels("claude").includes(level) && level !== ""))] } : {}),
+      });
+    }
     if (cached.length > 0) return cached;
     return [
       { value: "claude-fable-5-1", description: "новейшая, максимальные способности" },
@@ -3024,22 +3237,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Текущий effort обоих агентов — для кнопки в статус-баре чата. */
   private postEfforts() {
-    for (const a of ["claude", "codex"] as const) {
-      this.post({
-        type: "effortInfo",
-        agent: a,
-        effort: vscode.workspace.getConfiguration(`agentHub.${a}`).get<string>("effort", ""),
-      });
+    const project = this.getActiveProject();
+    if (project) this.postRecordEfforts(projectKey(project), this.getActiveRecord(projectKey(project)));
+    else {
+      for (const agent of ["claude", "codex"] as const) this.post({ type: "effortInfo", agent, effort: this.selectedEffort(null, agent) });
+    }
+    for (const slot of this.getChatSlots()) {
+      const record = this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId);
+      if (record) this.postRecordEfforts(slot.projectPath, record, slot.chatId);
     }
   }
 
   /** Быстрый выбор effort (глубины размышлений) по клику в статус-баре. */
   async pickEffort(agent: AgentId, remote?: RemoteClient, chatId?: string) {
-    const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
-    const current = section.get<string>("effort", "");
     const slot = this.findChatSlot(chatId);
     if (chatId && !slot) return;
-    const record = slot ? this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId) : null;
+    const project = this.getActiveProject();
+    const record = slot ? this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId)
+      : project ? this.getActiveRecord(projectKey(project)) : null;
+    const current = this.selectedEffort(record, agent);
+    const originalRecordId = record?.id;
+    const originalRecordGeneration = record?.createdAt;
+    const origin = slot || project ? { projectPath: slot?.projectPath ?? projectKey(project!), recordId: originalRecordId, createdAt: originalRecordGeneration } : undefined;
     type Item = vscode.QuickPickItem & { value: string };
     let base: Item[];
     let subject = "Claude";
@@ -3048,9 +3267,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // модель не выбрана или неизвестна — полный набор SDK.
       const model = this.selectedModel(record, agent);
       const info = model ? this.listClaudeModels().find((m) => m.value === model) : undefined;
-      const levels = info?.supportedEffortLevels?.length
-        ? info.supportedEffortLevels
-        : ["low", "medium", "high", "xhigh", "max"];
+      const levels = info?.supportedEffortLevels ?? ["low", "medium", "high", "xhigh", "max"];
       const hints: Record<string, string> = {
         low: "быстрые ответы, лёгкие размышления",
         medium: "баланс скорости и глубины",
@@ -3102,20 +3319,55 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     );
     if (!pick) return;
-    await this.applyEffort(agent, pick.value);
+    if (slot && this.findChatSlot(chatId)?.recordId !== slot.recordId) return;
+    if (!slot && project && this.getActiveProjectKey() !== projectKey(project)) return;
+    if (!slot && project) {
+      const actual = this.getActiveRecord(projectKey(project));
+      if (actual?.id !== originalRecordId || actual?.createdAt !== originalRecordGeneration) return;
+    }
+    await this.applyEffort(agent, pick.value, chatId, false, origin);
   }
 
-  /** Применить effort агента (глобальная настройка). */
-  async applyEffort(agent: AgentId, value: string) {
-    const section = vscode.workspace.getConfiguration(`agentHub.${agent}`);
-    await section.update("effort", value, vscode.ConfigurationTarget.Global);
-    await this.postSettings();
-    this.postEfforts();
-    this.post({
-      type: "info",
-      text: value
-        ? `Effort ${agent === "claude" ? "Claude" : "Codex"} со следующего хода: ${value}.`
-        : `Effort ${agent === "claude" ? "Claude" : "Codex"}: по умолчанию.`,
+  /** Manual choices belong to the requesting conversation; base settings remain explicit. */
+  async applyEffort(agent: AgentId, value: string, chatId?: string, base = false, origin?: AgentRecordBinding): Promise<void> {
+    if ((agent !== "claude" && agent !== "codex") || typeof value !== "string" || !agentEffortLevels(agent).includes(value)) return;
+    await this.serializeMultiMutation(async () => {
+      const slot = this.findChatSlot(chatId);
+      if (chatId && !slot) return;
+      const project = slot ? this.getProjects().find((entry) => projectKey(entry) === slot.projectPath) : this.getActiveProject();
+      if (base) {
+        await vscode.workspace.getConfiguration(`agentHub.${agent}`).update("effort", value, vscode.ConfigurationTarget.Global);
+        this.postEfforts();
+      } else {
+        if (!project) return;
+        const key = projectKey(project);
+        let record = slot ? this.getProjectStore(key).sessions.find((entry) => entry.id === slot.recordId) : this.getActiveRecord(key);
+        if (origin && (key !== origin.projectPath || record?.id !== origin.recordId || record?.createdAt !== origin.createdAt)) return;
+        record ??= await this.ensureActiveRecord(key);
+        if (!record) return;
+        const levels = this.modelEfforts(agent, this.selectedModel(record, agent));
+        if (value && levels && !levels.includes(value)) {
+          this.postScoped(key, { type: "info", text: "Этот effort недоступен для выбранной модели. Выберите один из предложенных уровней." }, chatId);
+          this.postRecordEfforts(key, record, chatId);
+          return;
+        }
+        const previous = record.effortOverrides;
+        let persisted = false;
+        try {
+          await this.mutateRecord(key, record.id, (entry) => {
+            const overrides = { ...entry.effortOverrides };
+            if (value) overrides[agent] = value; else delete overrides[agent];
+            entry.effortOverrides = overrides;
+          });
+          persisted = true;
+          await this.rememberAgentChoice(this.recordAgentChoice(record, slot?.agent ?? record.preferredAgent ?? agent));
+        } catch {
+          if (!persisted) record.effortOverrides = previous;
+          this.postScoped(key, { type: "error", message: "Не удалось сохранить effort. Повторите выбор." }, chatId);
+        }
+        this.postRecordEfforts(key, record, chatId);
+      }
+      await this.postSettings(chatId);
     });
   }
 
@@ -3124,50 +3376,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     model: string,
   ): { effort: string; description?: string }[] | null {
     if (!model) return null;
+    const entry = this.cachedCodexModels().find((value) => value && typeof value === "object" &&
+      typeof (value as { slug?: unknown }).slug === "string" && (value as { slug: string }).slug.trim() === model) as
+      { supported_reasoning_levels?: unknown } | undefined;
+    if (!Array.isArray(entry?.supported_reasoning_levels)) return null;
+    const levels: { effort: string; description?: string }[] = [];
+    const supported = new Set(agentEffortLevels("codex"));
+    for (const value of entry.supported_reasoning_levels) {
+      if (!value || typeof value !== "object") continue;
+      const level = value as { effort?: unknown; description?: unknown };
+      if (typeof level.effort !== "string" || !supported.has(level.effort) || levels.some((known) => known.effort === level.effort)) continue;
+      levels.push({ effort: level.effort, ...(typeof level.description === "string" ? { description: level.description } : {}) });
+    }
+    return levels;
+  }
+
+  private cachedCodexModels(): unknown[] {
     try {
       const raw = fs.readFileSync(
         nodePath.join(os.homedir(), ".codex", "models_cache.json"),
         "utf8",
       );
-      const parsed = JSON.parse(raw) as {
-        models?: {
-          slug?: string;
-          supported_reasoning_levels?: { effort?: string; description?: string }[];
-        }[];
-      };
-      const entry = (parsed.models ?? []).find((m) => m.slug === model);
-      const levels: { effort: string; description?: string }[] = [];
-      for (const l of entry?.supported_reasoning_levels ?? []) {
-        if (typeof l.effort === "string") {
-          levels.push({ effort: l.effort, description: l.description });
-        }
-      }
-      return levels.length > 0 ? levels : null;
+      const parsed: unknown = JSON.parse(raw);
+      const models = parsed && typeof parsed === "object" ? (parsed as { models?: unknown }).models : undefined;
+      return Array.isArray(models) ? models : [];
     } catch {
-      return null;
+      return [];
     }
   }
 
   /** Модели Codex из кэша CLI (~/.codex/models_cache.json). */
   private listCodexModels(): { slug: string; description?: string }[] {
-    try {
-      const raw = fs.readFileSync(
-        nodePath.join(os.homedir(), ".codex", "models_cache.json"),
-        "utf8",
-      );
-      const parsed = JSON.parse(raw) as {
-        models?: { slug?: string; description?: string; visibility?: string }[];
-      };
-      const out: { slug: string; description?: string }[] = [];
-      for (const m of parsed.models ?? []) {
-        if (typeof m.slug === "string" && m.visibility !== "hide") {
-          out.push({ slug: m.slug, description: m.description });
-        }
-      }
-      return out;
-    } catch {
-      return [];
+    const out: { slug: string; description?: string }[] = [];
+    for (const value of this.cachedCodexModels()) {
+      if (!value || typeof value !== "object") continue;
+      const model = value as { slug?: unknown; description?: unknown; visibility?: unknown };
+      if (typeof model.slug !== "string" || !model.slug.trim() || model.visibility === "hide") continue;
+      const slug = model.slug.trim();
+      if (out.some((known) => known.slug === slug)) continue;
+      out.push({ slug, ...(typeof model.description === "string" ? { description: model.description } : {}) });
     }
+    return out;
   }
 
   // ---------- Slash-команды CLI ----------
@@ -3465,20 +3714,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   async newSession(chatId?: string, serialized = false): Promise<void> {
     if (!serialized) return this.serializeMultiMutation(() => this.newSession(chatId, true));
     const slot = this.findChatSlot(chatId);
+    if (chatId && !slot) return;
     if (slot) {
       if (this.runs.has(chatId!)) {
         this.postScoped(slot.projectPath, { type: "error", message: "Дождитесь окончания хода или остановите его перед созданием новой сессии." }, chatId);
         return;
       }
-      const store = this.getProjectStore(slot.projectPath);
+      const previousStore = this.getProjectStore(slot.projectPath);
+      const store = { ...previousStore, sessions: [...previousStore.sessions] };
       // A fresh identity prevents a delayed save from the old view entering the new session.
       const record = this.createRecord();
       const previous = store.sessions.find((entry) => entry.id === slot.recordId);
-      record.modelOverrides = { ...previous?.modelOverrides };
+      const choice = this.defaultAgentChoice("newChat", this.recordAgentChoice(previous, slot.agent));
+      this.applyAgentChoice(record, choice);
       store.sessions.push(record);
       await this.saveProjectStore(slot.projectPath, store);
       await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId
-        ? { ...entry, recordId: record.id } : entry));
+        ? { ...entry, recordId: record.id, agent: choice.agent } : entry));
+      await this.rememberVisibleChoice(choice);
       this.pruneEmptySessions(store, slot.projectPath);
       await this.saveProjectStore(slot.projectPath, store);
       await this.postMultiState(chatId);
@@ -3492,10 +3745,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     let keptPrevious = false;
     if (active) {
-      const store = this.getProjectStore(projectKey(active));
-      const current = store.sessions.find((s) => s.id === store.activeId);
+      const previousStore = this.getProjectStore(projectKey(active));
+      const store = { ...previousStore, sessions: [...previousStore.sessions] };
+      let current = store.sessions.find((s) => s.id === store.activeId);
+      const choice = this.defaultAgentChoice("newChat", current ? this.recordAgentChoice(current) : undefined);
       const displayed = this.savedBoardRecordIds(projectKey(active));
       if (current && !hasUserContent(current.items) && !displayed.has(current.id)) {
+        current = { ...current };
+        store.sessions[store.sessions.findIndex((record) => record.id === current!.id)] = current;
         // Пустую активную не сохраняем в историю — обнуляем и переиспользуем.
         current.items = [];
         current.agentIds = { claude: null, codex: null };
@@ -3507,10 +3764,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         current.chatLog = [];
         current.chatSeen = {};
         current.modelOverrides = {};
+        this.applyAgentChoice(current, choice);
         current.lastPrompts = {};
       } else {
         keptPrevious = !!current;
         const rec = this.createRecord();
+        this.applyAgentChoice(rec, choice);
         store.sessions.push(rec);
         store.activeId = rec.id;
       }
@@ -3520,6 +3779,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .filter((record, index) => index < MAX_SESSIONS_PER_PROJECT || displayed.has(record.id) || record.id === store.activeId);
       await this.saveProjectStore(projectKey(active), store);
+      await this.rememberVisibleChoice(choice);
     }
     this.postFullState();
     if (active) {
@@ -3538,7 +3798,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const chatEvents = new Set([
       "projects", "transcript", "busy", "activity", "sessionInfo", "userMessage",
       "textDelta", "assistantText", "toolUse", "turnResult", "info", "error", "reset",
-      "permissionRequest", "permissionResolved", "contextUsage", "modelInfo", "draftHandled",
+      "permissionRequest", "permissionResolved", "contextUsage", "modelInfo", "effortInfo", "agentInfo", "draftHandled",
     ]);
     if (!chatEvents.has(msg.type)) this.multiPanel?.webview.postMessage(msg);
     this.remote?.broadcast(msg);
@@ -3601,8 +3861,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     serialized = false,
   ): Promise<void> {
     if (!serialized && (
-      ["selectProject", "moveProject", "reorderProjects", "openMultiChat", "createChat", "removeChat", "selectChatProject", "selectChatSession", "selectChatAgent", "newSession", "saveTranscript"].includes(msg.type) ||
-      (surface === "multi-panel" && (msg.type === "ready" || msg.type === "multiStateReady"))
+      ["selectAgent", "selectProject", "moveProject", "reorderProjects", "openMultiChat", "createChat", "removeChat", "selectChatProject", "selectChatSession", "selectChatAgent", "newSession", "saveTranscript"].includes(msg.type) ||
+      msg.type === "ready" || (surface === "multi-panel" && msg.type === "multiStateReady")
     )) {
       return this.serializeMultiMutation(() => this.onMessage(msg, source, client, surface, true));
     }
@@ -3630,7 +3890,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "ready":
         if (surface === "multi-panel" && msg.chatId) await this.postMultiState(msg.chatId);
         else if (surface === "multi-panel") await this.ensureMultiChats();
-        else this.postFullState();
+        else {
+          const project = this.getActiveProject();
+          if (project) await this.ensureActiveRecord(projectKey(project));
+          this.postFullState();
+        }
         if (surface === "multi-panel") this.postCompactModeState();
         break;
       case "multiStateReady":
@@ -3656,6 +3920,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case "selectChatAgent":
         if (surface === "multi-panel") await this.selectMultiChatAgent(msg.chatId, msg.agent);
+        break;
+      case "selectAgent":
+        if (surface !== "multi-panel") await this.selectAgent(msg.agent, msg.path);
         break;
       case "stop": {
         const slot = this.findChatSlot(msg.chatId);
@@ -3692,7 +3959,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       }
       case "newSession":
-        await this.newSession(msg.chatId, true);
+        {
+          const contextRequestId = typeof msg.requestId === "string" && msg.requestId.length > 0 && msg.requestId.length <= 160 ? msg.requestId : undefined;
+          const initialSlot = this.findChatSlot(msg.chatId);
+          let error = msg.chatId && (!initialSlot || this.runs.has(msg.chatId)) ? "Чат недоступен или в нём ещё выполняется ход." : undefined;
+          try {
+            if (!error) await this.newSession(msg.chatId, true);
+          } catch {
+            error = "Не удалось создать новую сессию. Повторите попытку.";
+          } finally {
+            if (contextRequestId) {
+              const actual = this.findChatSlot(msg.chatId);
+              const project = msg.chatId ? this.getAllProjects().find((entry) => projectKey(entry) === actual?.projectPath) : this.getActiveProject();
+              const record = project ? actual ? this.getProjectStore(actual.projectPath).sessions.find((entry) => entry.id === actual.recordId)
+                : this.getActiveRecord(projectKey(project)) : null;
+              const message: HostToWebview = { type: "agentInfo", agent: actual?.agent ?? (record ? this.recordAgentChoice(record).agent : this.defaultAgentChoice("newChat").agent),
+                contextRequestId, ...(record ? { recordId: record.id } : {}), ...(error ? { error } : {}) };
+              if (project) {
+                if (error && msg.chatId) await this.postMultiState(msg.chatId);
+                this.postScoped(projectKey(project), message, msg.chatId);
+              } else if (msg.chatId) this.multiPanel?.webview.postMessage({ ...message, chatId: msg.chatId });
+              else this.post(message);
+            }
+          }
+        }
         break;
       case "send":
         await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], msg.path, true, undefined, msg.chatId);
@@ -3762,7 +4052,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.finishSession(msg.agent, msg.chatId);
         break;
       case "selectProject":
-        await this.setActivePath(msg.path);
+        if (this.getProjects().some((project) => projectKey(project) === msg.path)) {
+          await this.setActivePath(msg.path);
+          const record = await this.ensureActiveRecord(msg.path);
+          await this.rememberVisibleChoice(this.recordAgentChoice(record));
+        }
         this.postFullState();
         break;
       case "addProject":
@@ -3863,7 +4157,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (msg.kind === "model") {
           await this.applyModel(msg.agent ?? "claude", msg.value, msg.scope === "base", msg.chatId);
         } else if (msg.kind === "effort") {
-          await this.applyEffort(msg.agent ?? "claude", msg.value);
+          await this.applyEffort(msg.agent ?? "claude", msg.value, msg.chatId);
         } else {
           await this.applySession(msg.value, msg.chatId);
         }
@@ -4476,7 +4770,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         refreshModels: agent === "claude" && this.claudeModelsStale(),
         cliPath: agent === "claude" ? this.resolveClaudeCli() : undefined,
         extraEnv: serverEnv,
-        config: this.buildAgentConfig(agent, record.modelOverrides?.[agent]),
+        config: this.buildAgentConfig(agent, record.modelOverrides?.[agent], record.effortOverrides?.[agent]),
         attachments: attachments.map((a) => ({ path: a.path, isImage: isImagePath(a.path) })),
         confirmTool: (toolName, input) => this.confirmTool(toolName, input, cwd, chatId, record.id),
       });

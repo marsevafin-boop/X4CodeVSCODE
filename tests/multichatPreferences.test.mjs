@@ -153,9 +153,9 @@ test("a base model change refreshes following tiles while preserving another til
   assert.equal(h.model(h.slots[1].chatId, "codex").model, "other-tile-model");
 });
 
-test("effort and permissions remain persisted and hydrate again after reopening", async () => {
+test("common effort and permissions remain persisted and hydrate again after reopening", async () => {
   const h = setup();
-  await h.p.applyEffort("codex", "high");
+  await h.p.applyEffort("codex", "high", undefined, true);
   await h.p.cycleSafety("codex");
   h.messages.length = 0;
   await h.send({ type: "multiStateReady", chatIds: [] });

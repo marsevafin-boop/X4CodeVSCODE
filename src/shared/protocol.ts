@@ -3,8 +3,18 @@
  * Единственный файл, который импортируют обе стороны.
  */
 
+import type { AgentDefaults } from "./agentDefaults";
+
 /** Какие агенты доступны в переключателе. */
 export type AgentId = "claude" | "codex";
+
+export interface AgentModelOption {
+  value: string;
+  label?: string;
+  efforts?: string[];
+}
+
+export type AgentModelCatalog = Record<AgentId, AgentModelOption[]>;
 
 /** Проект: папка, репозиторий, сервер (раздел 1 ai-dev-environment.md). */
 export interface ProjectInfo {
@@ -54,6 +64,7 @@ export type WebviewToHost =
   | { type: "selectChatProject"; chatId: string; projectPath: string }
   | { type: "selectChatSession"; chatId: string; recordId: string }
   | { type: "selectChatAgent"; chatId: string; agent: AgentId }
+  | { type: "selectAgent"; agent: AgentId; path?: string }
   | { type: "duplicateProject"; path: string; copyFolder: boolean }
   | { type: "archiveProject"; path: string }
   | { type: "restoreProject"; path: string }
@@ -92,7 +103,7 @@ export type WebviewToHost =
       chatId?: string;
     }
   | { type: "stop"; path?: string; chatId?: string }
-  | { type: "newSession"; chatId?: string }
+  | { type: "newSession"; chatId?: string; requestId?: string }
   | { type: "finishSession"; agent: AgentId; chatId?: string }
   | { type: "permission"; requestId: string; allow: boolean; answer?: string; chatId?: string }
   | { type: "selectProject"; path: string }
@@ -201,12 +212,13 @@ export type HostToWebview =
   | { type: "transcript"; path: string; items: unknown[]; chatId?: string; recordId?: string }
   | { type: "multiState"; boardId?: string; projects: ProjectInfo[]; archivedProjects?: ProjectInfo[]; chats: { chatId: string; projectPath: string; recordId: string; agent: AgentId; title: string }[] }
   | { type: "compactMode"; enabled: boolean; pending?: boolean; error?: string }
+  | { type: "agentInfo"; agent: AgentId; path?: string; chatId?: string; recordId?: string; requestedAgent?: AgentId; contextRequestId?: string; error?: string }
   | { type: "contextUsage"; agent: AgentId; used: number; max: number; path?: string; chatId?: string }
   | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string; path?: string; chatId?: string }
   | { type: "slashCommands"; agent: AgentId; commands: SlashCommandInfo[] }
   | { type: "settings"; settings: SettingsSnapshot; chatId?: string }
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }
-  | { type: "effortInfo"; agent: AgentId; effort: string }
+  | { type: "effortInfo"; agent: AgentId; effort: string; path?: string; chatId?: string; recordId?: string }
   | { type: "autoScrollMode"; mode: string }
   | {
       /** Меню выбора для мобильного клиента (модель / effort / сессия). */
@@ -229,6 +241,10 @@ export type HostToWebview =
 
 /** Снимок всех настроек для экрана настроек внутри панели. */
 export interface SettingsSnapshot {
+  /** Rules apply when creating a context; saved sessions retain their own choices. */
+  agentDefaults?: AgentDefaults;
+  /** Read-only choices supplied from the installed providers' model catalogs. */
+  agentCatalog?: AgentModelCatalog;
   claude: {
     model: string;
     effort: string;

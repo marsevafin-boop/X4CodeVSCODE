@@ -94,6 +94,38 @@ body {
   padding: 2px 6px;
 }
 
+.agent-default-profiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.agent-profile-editor,
+.agent-default-rule {
+  min-width: 0;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agent-profile-editor {
+  flex: 1 1 260px;
+}
+
+.agent-profile-editor legend,
+.agent-default-rule legend {
+  padding: 0 4px;
+}
+
+.agent-defaults-settings h4 {
+  margin: 4px 0 0;
+  font-size: 1em;
+}
+
 .finish-btn {
   background: transparent;
   color: var(--vscode-foreground);
@@ -150,6 +182,11 @@ body {
 
 .model-badge:hover {
   text-decoration: underline;
+}
+
+.statusbar button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .model-badge.model-fallback {
@@ -1515,4 +1552,9 @@ body.resizing-composer {
 
 .multi-chat-board.is-compact .msg-time {
   margin-top: 2px;
+}
+
+.multi-chat-board.is-compact :is(.agent-profile-editor, .agent-default-rule) {
+  padding: 4px;
+  gap: 4px;
 }

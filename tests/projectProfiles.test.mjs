@@ -75,7 +75,8 @@ test("adding the same folder twice creates two fresh uniquely named profiles", a
   assert.notEqual(projects[0].name, projects[1].name);
   assert.equal(p.getActivePathRaw(), projects[1].id);
   assert.equal(secrets.size, 0);
-  assert.equal(p.getProjectStore(projects[1].id).sessions.length, 0);
+  assert.equal(p.getProjectStore(projects[1].id).sessions.length, 1);
+  assert.deepEqual(p.getActiveRecord(projects[1].id).items, []);
 });
 
 test("adding a workspace folder preserves its implicit legacy profile, history and secrets", async () => {
@@ -89,7 +90,8 @@ test("adding a workspace folder preserves its implicit legacy profile, history a
   assert.strictEqual(p.getProjectStore(folder).sessions[0], legacy);
   const fresh = projects.find((project) => project.id);
   assert.ok(fresh);
-  assert.equal(p.getProjectStore(fresh.id).sessions.length, 0);
+  assert.equal(p.getProjectStore(fresh.id).sessions.length, 1);
+  assert.deepEqual(p.getActiveRecord(fresh.id).items, []);
   assert.equal(secrets.get(`agentHub.serverPassword:${fresh.id}`), undefined);
   assert.equal((await p.buildSettingsSnapshot()).projectHasPassword, false);
   assert.deepEqual(await p.getSecretEnv(fresh.id), {});
