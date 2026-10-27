@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.62",
+  "version": "0.0.63",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -156,7 +156,7 @@
             "type": "string"
           },
           "default": [],
-          "description": "Имена инструментов, которые разрешаются без подтверждения (например WebSearch, WebFetch)."
+          "description": "Имена инструментов, которые разрешаются без подтверждения (например WebSearch, WebFetch). Bash всегда проверяется отдельно по autoAllowBash."
         },
         "agentHub.projects": {
           "type": "array",
@@ -396,7 +396,7 @@
             "git log",
             "ls"
           ],
-          "description": "Префиксы bash-команд, которые разрешаются без подтверждения. Точное совпадение или префикс до пробела: «git status» разрешит «git status -s», но не «git statusx»."
+          "description": "Правила для одной команды без shell-операторов. Базовые git status, git diff, git log и ls допускают только поддержанные параметры; остальные правила требуют точного совпадения аргументов. Составные команды, кавычки, подстановки и неизвестные параметры требуют подтверждения. Bash в autoAllowTools эту проверку не отменяет."
         },
         "agentHub.agentDefaults": {
           "type": "object",
@@ -526,9 +526,9 @@
     "vscode:prepublish": "npm run build",
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
-    "test": "node --test tests/*.test.mjs",
+    "test": "node --test \"tests/*.test.mjs\"",
     "typecheck": "tsc --noEmit",
-    "package": "vsce package --allow-missing-repository"
+    "package": "vsce package --allow-missing-repository --skip-license"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.280",
@@ -546,7 +546,13 @@
     "@types/react-dom": "^19.2.4",
     "@types/vscode": "^1.125.0",
     "@types/ws": "^8.18.1",
+    "@vscode/vsce": "4.0.0",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2"
+  },
+  "overrides": {
+    "@azure/identity@4.14.0": {
+      "@azure/msal-node": "7.1.1"
+    }
   }
 }

@@ -1,0 +1,53 @@
+name: Extension checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extension-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  extension:
+    name: Extension / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+      - name: Detect package platform
+        id: platform
+        shell: bash
+        run: node -e "require('node:fs').appendFileSync(process.env.GITHUB_OUTPUT, 'target=' + process.platform + '-' + process.arch + '\n')"
+
+      # vsce runs vscode:prepublish (npm run build) before packaging.
+      - name: Build and package VSIX
+        run: npm run package -- --target ${{ steps.platform.outputs.target }} --out agent-hub-${{ steps.platform.outputs.target }}.vsix
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: agent-hub-${{ steps.platform.outputs.target }}
+          path: agent-hub-${{ steps.platform.outputs.target }}.vsix
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

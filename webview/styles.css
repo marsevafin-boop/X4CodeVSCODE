@@ -1412,6 +1412,125 @@ body.resizing-composer {
   overflow-wrap: anywhere;
 }
 
+/* User notes stay compact when four chats share a board. */
+.task-checkpoint {
+  flex: 0 1 auto;
+  min-height: 32px;
+  min-width: 0;
+  overflow-y: auto;
+  border-top: 1px solid var(--vscode-panel-border);
+  border-bottom: 1px solid var(--vscode-panel-border);
+  font-size: 0.9em;
+}
+
+.task-checkpoint summary {
+  padding: 5px 10px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.task-checkpoint summary:focus-visible,
+.task-checkpoint button:focus-visible,
+.task-checkpoint textarea:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.task-checkpoint-preview {
+  display: inline-block;
+  max-width: 50%;
+  margin-left: 8px;
+  vertical-align: bottom;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.7;
+}
+
+.task-checkpoint-dirty {
+  margin-left: 5px;
+  color: var(--vscode-textLink-foreground);
+}
+
+.task-checkpoint-body {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-height: min(40vh, 340px);
+  padding: 4px 10px 8px;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+.task-checkpoint-hint,
+.task-checkpoint-conflict p {
+  margin: 0;
+  opacity: 0.8;
+  overflow-wrap: anywhere;
+}
+
+.task-checkpoint-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.task-checkpoint textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  max-height: 140px;
+  resize: vertical;
+  padding: 4px 6px;
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 3px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  font: inherit;
+}
+
+.task-checkpoint-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.task-checkpoint button {
+  min-height: 24px;
+  max-width: 100%;
+  padding: 3px 7px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  cursor: pointer;
+}
+
+.task-checkpoint button:disabled,
+.task-checkpoint textarea:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.task-checkpoint-error {
+  padding: 4px 10px;
+  color: var(--vscode-errorForeground);
+  overflow-wrap: anywhere;
+}
+
+.task-checkpoint-conflict {
+  padding: 6px;
+  border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-panel-border));
+}
+
+.task-checkpoint-conflict dl { margin: 4px 0; }
+.task-checkpoint-conflict dt { font-weight: 600; }
+.task-checkpoint-conflict dd { margin: 2px 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.multi-chat-board.is-compact .task-checkpoint summary { padding: 2px 4px; }
+.multi-chat-board.is-compact .task-checkpoint-body { padding: 3px 4px; gap: 4px; }
+
 /* Dense spacing stays inside this board; fonts, sessions and manual input sizes remain intact. */
 .multi-chat-board.is-compact .multi-chat-toolbar {
   flex-wrap: wrap;

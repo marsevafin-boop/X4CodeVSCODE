@@ -24,6 +24,8 @@ import { directoriesOverlap, executeProjectMove, normalizeProjectArchive, pathEn
 import { applyActiveProjectOrder, moveInProjectOrder, reconcileProjectOrder } from "./shared/projectOrder";
 import { CompactModeController } from "./compactMode";
 import { agentEffortLevels, normalizeAgentChoice, normalizeAgentDefaults, resolveAgentChoice, type AgentChoice, type AgentDefaultEvent } from "./shared/agentDefaults";
+import { shouldPreserveTask, isTaskIdentity, isTaskState, validateTaskFields, type TaskState } from "./shared/taskState";
+import { isBashAutoAllowed } from "./bashApproval";
 import * as QRCode from "qrcode";
 import {
   RemoteServer,
@@ -161,6 +163,8 @@ interface SessionRecord {
   models?: Partial<Record<AgentId, string>>;
   /** Если модель понижена фоллбэком — с какой (по агентам). */
   modelFallbacks?: Partial<Record<AgentId, string>>;
+  /** User-authored checkpoint; never automatically sent to a provider. */
+  task?: TaskState;
 }
 
 interface ProjectStore {
@@ -339,6 +343,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private multiLayoutPinned = false;
   private multiBoardId?: string;
   private multiMutation?: Promise<void>;
+  /** Short persistence operations only; an agent run never holds this queue. */
+  private recordWrite?: Promise<void>;
+  /** Hide Memento's uncommitted cache while a write or its rollback is unresolved. */
+  private committedStoreView?: Record<string, ProjectStore>;
+  private storeRecoveryError?: string;
   private compactMode?: CompactModeController;
   private readonly backends: Record<AgentId, AgentBackend> = {
     claude: new ClaudeBackend(),
@@ -758,7 +767,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await this.setActivePath(projectKey(fresh));
     const record = this.createRecord();
     this.applyAgentChoice(record, choice);
-    await this.saveProjectStore(projectKey(fresh), { activeId: record.id, sessions: [record] });
+    await this.mutateProjectStore(projectKey(fresh), store => { store.activeId = record.id; store.sessions.push(record); });
     await this.rememberVisibleChoice(choice);
     this.postFullState();
     await this.postSettings();
@@ -838,7 +847,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.setActivePath(targetKey);
         const record = this.createRecord();
         this.applyAgentChoice(record, choice);
-        await this.saveProjectStore(targetKey, { activeId: record.id, sessions: [record] });
+        await this.mutateProjectStore(targetKey, store => { store.activeId = record.id; store.sessions.push(record); });
         await this.rememberVisibleChoice(choice);
         this.postFullState();
         await this.postSettings();
@@ -1191,9 +1200,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // Пароль, доступы и историю сессий вычищаем вместе с папкой.
         await this.context.secrets.delete(this.passwordKey(path));
         await this.context.secrets.delete(this.secretEnvKey(path));
-        const all = { ...this.getStoreAll() };
-        delete all[path];
-        await this.context.globalState.update(STORE_KEY, all);
+        await this.serializeRecordWrite(async () => {
+          const previous = structuredClone(this.getStoreAll());
+          const all = { ...previous };
+          delete all[path];
+          await this.persistStoreAll(all, previous);
+        });
         try {
           // Registry/secrets writes above yield: another profile may have been
           // created since confirmation. Keep its shared files intact.
@@ -2076,13 +2088,52 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // ---------- История сессий (globalState, переживает перезапуски) ----------
 
   private getStoreAll(): Record<string, ProjectStore> {
-    return this.context.globalState.get<Record<string, ProjectStore>>(STORE_KEY, {});
+    return this.committedStoreView ?? this.context.globalState.get<Record<string, ProjectStore>>(STORE_KEY, {});
   }
 
-  private async saveProjectStore(projectPath: string, store: ProjectStore) {
+  private serializeRecordWrite<T>(operation: () => Promise<T>): Promise<T> {
+    const pending = (this.recordWrite ?? Promise.resolve()).then(operation);
+    this.recordWrite = pending.then(() => {}, () => {});
+    return pending;
+  }
+
+  /** Read and mutate only after earlier agent writes finish. Return false to skip an obsolete write. */
+  private mutateProjectStore<T>(projectPath: string, mutate: (store: ProjectStore) => T): Promise<T> {
+    return this.serializeRecordWrite(async () => {
+      const previous = structuredClone(this.getStoreAll());
+      const store = this.getProjectStore(projectPath, false);
+      const next = { ...store, sessions: [...store.sessions] };
+      const result = mutate(next);
+      if (result !== false || (!previous[projectPath] && next.sessions.length > 0)) await this.saveProjectStore(projectPath, next, previous);
+      return result;
+    });
+  }
+
+  /** Internal callers own the short write queue before reaching this persistence boundary. */
+  private async saveProjectStore(projectPath: string, store: ProjectStore, previous = structuredClone(this.getStoreAll())): Promise<void> {
     const all = { ...this.getStoreAll() };
     all[projectPath] = store;
-    await this.context.globalState.update(STORE_KEY, all);
+    await this.persistStoreAll(all, previous);
+  }
+
+  private async persistStoreAll(next: Record<string, ProjectStore>, previous: Record<string, ProjectStore>) {
+    this.committedStoreView = previous;
+    try {
+      await this.context.globalState.update(STORE_KEY, next);
+      this.committedStoreView = undefined;
+      this.storeRecoveryError = undefined;
+    } catch (error) {
+      try {
+        // Memento clones before awaiting disk. Roll back through the same API.
+        await this.context.globalState.update(STORE_KEY, previous);
+        this.committedStoreView = undefined;
+        this.storeRecoveryError = undefined;
+      } catch {
+        this.committedStoreView = previous;
+        this.storeRecoveryError = "Сохранение и откат не подтверждены. Пока показана последняя сохранённая версия; повторите сохранение. После перезапуска состояние хранилища может отличаться.";
+      }
+      throw error;
+    }
   }
 
   private getChatSlots(): ChatSlot[] {
@@ -2284,6 +2335,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.postScoped(slot.projectPath, { type: "agentInfo", agent: slot.agent, recordId: slot.recordId }, slot.chatId);
       this.postRecordEfforts(slot.projectPath, record, slot.chatId);
       this.postScoped(slot.projectPath, { type: "transcript", path: slot.projectPath, items: record.items, recordId: record.id }, slot.chatId);
+      this.postTaskState(slot.projectPath, record, slot.chatId);
       this.postScoped(slot.projectPath, { type: "busy", value: this.runs.has(slot.chatId) }, slot.chatId);
       for (const agent of ["claude", "codex"] as const) {
         this.postScoped(slot.projectPath, { type: "sessionInfo", sessionId: record.agentIds[agent], agent }, slot.chatId);
@@ -2403,12 +2455,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     try {
       if (slot.projectPath !== projectPath) {
-        const store = this.getProjectStore(projectPath);
         const record = this.createRecord();
         const previous = this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId);
         this.applyAgentChoice(record, this.recordAgentChoice(previous, slot.agent));
-        store.sessions.push(record);
-        await this.saveProjectStore(projectPath, store);
+        await this.mutateProjectStore(projectPath, store => { store.sessions.push(record); });
         await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId
           ? { ...entry, projectPath, recordId: record.id } : entry));
       }
@@ -2437,7 +2487,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const record = this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId);
       if (record) {
         await this.mutateRecord(slot.projectPath, record.id, (entry) => { entry.preferredAgent = agent; });
-        await this.rememberAgentChoice(this.recordAgentChoice(record, agent));
+        const saved = this.getProjectStore(slot.projectPath).sessions.find(entry => entry.id === record.id);
+        await this.rememberAgentChoice(this.recordAgentChoice(saved, agent));
       }
     } catch {
       error = "Не удалось сохранить выбор провайдера для следующего открытия.";
@@ -2469,7 +2520,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     try {
       record ??= await this.ensureActiveRecord(key);
       previousAgent = record.preferredAgent;
-      await this.mutateRecord(key, record.id, (entry) => { entry.preferredAgent = agent; });
+      const recordId = record.id;
+      await this.mutateRecord(key, recordId, (entry) => { entry.preferredAgent = agent; });
+      record = this.getProjectStore(key).sessions.find(entry => entry.id === recordId) ?? null;
       saved = true;
       await this.rememberAgentChoice(this.recordAgentChoice(record, agent));
       this.postRecordAgent(key, record, undefined, agent);
@@ -2488,12 +2541,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       : this.getActiveProject();
     if (!project) return null;
     const key = projectKey(project);
-    const store = this.getProjectStore(key);
     const record = this.createRecord();
     const choice = this.defaultAgentChoice("newChat");
     this.applyAgentChoice(record, choice);
-    store.sessions.push(record);
-    await this.saveProjectStore(key, store);
+    await this.mutateProjectStore(key, store => { store.sessions.push(record); });
     const slot: ChatSlot = {
       chatId: `chat-${randomUUID()}`,
       projectPath: key,
@@ -2521,16 +2572,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const project = this.getActiveProject() ?? this.getProjects()[0];
       if (!project) return;
       const key = projectKey(project);
-      const store = this.getProjectStore(key);
       const created: ChatSlot[] = [];
       const choice = this.defaultAgentChoice("startup");
-      for (let i = 0; i < 4; i++) {
-        const record = this.createRecord();
-        this.applyAgentChoice(record, choice);
-        store.sessions.push(record);
-        created.push({ chatId: `chat-${randomUUID()}`, projectPath: key, recordId: record.id, agent: choice.agent });
-      }
-      await this.saveProjectStore(key, store);
+      await this.mutateProjectStore(key, store => {
+        for (let i = 0; i < 4; i++) {
+          const record = this.createRecord();
+          this.applyAgentChoice(record, choice);
+          store.sessions.push(record);
+          created.push({ chatId: `chat-${randomUUID()}`, projectPath: key, recordId: record.id, agent: choice.agent });
+        }
+      });
       await this.saveChatSlots(created);
       await this.rememberVisibleChoice(choice);
       slots = created;
@@ -2540,12 +2591,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Restore those tiles with fresh sessions instead of silently closing them.
     let repaired = false;
     for (const slot of slots) {
-      const store = this.getProjectStore(slot.projectPath);
-      if (store.sessions.some((record) => record.id === slot.recordId)) continue;
-      const record = this.createRecord();
-      this.applyAgentChoice(record, this.recordAgentChoice(null, slot.agent));
-      store.sessions.push(record);
-      await this.saveProjectStore(slot.projectPath, store);
+      const record = await this.mutateProjectStore(slot.projectPath, store => {
+        if (store.sessions.some((record) => record.id === slot.recordId)) return false;
+        const replacement = this.createRecord();
+        this.applyAgentChoice(replacement, this.recordAgentChoice(null, slot.agent));
+        store.sessions.push(replacement);
+        return replacement;
+      });
+      if (!record) continue;
       slot.recordId = record.id;
       repaired = true;
     }
@@ -2676,7 +2729,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Хранилище проекта; при первом обращении мигрирует данные v0.0.2–0.0.3. */
-  private getProjectStore(projectPath: string): ProjectStore {
+  private getProjectStore(projectPath: string, migrate = true): ProjectStore {
     const existing = this.getStoreAll()[projectPath];
     if (existing) return existing;
 
@@ -2691,7 +2744,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (legacyItems.length > 0 || legacyIds) {
       const rec = this.createRecord(legacyItems, legacyIds ?? { claude: null, codex: null });
       const store: ProjectStore = { activeId: rec.id, sessions: [rec] };
-      void this.saveProjectStore(projectPath, store);
+      if (migrate) void this.serializeRecordWrite(async () => {
+        if (!this.getStoreAll()[projectPath]) await this.saveProjectStore(projectPath, store);
+      });
       return store;
     }
     return { activeId: null, sessions: [] };
@@ -2718,34 +2773,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Активная запись; создаётся при первом сообщении. */
   private async ensureActiveRecord(projectPath: string): Promise<SessionRecord> {
-    const store = this.getProjectStore(projectPath);
-    let rec = store.sessions.find((s) => s.id === store.activeId) ?? null;
-    if (!rec) {
-      rec = this.createRecord();
-      this.applyAgentChoice(rec, this.defaultAgentChoice("startup"));
-      store.sessions.push(rec);
-      store.activeId = rec.id;
-      await this.saveProjectStore(projectPath, store);
-      await this.rememberVisibleChoice(this.recordAgentChoice(rec));
-    }
-    return rec;
+    let record!: SessionRecord;
+    const created = await this.mutateProjectStore(projectPath, store => {
+      const current = store.sessions.find((s) => s.id === store.activeId);
+      if (current) { record = current; return false; }
+      record = this.createRecord();
+      this.applyAgentChoice(record, this.defaultAgentChoice("startup"));
+      store.sessions.push(record);
+      store.activeId = record.id;
+      return true;
+    });
+    if (created) await this.rememberVisibleChoice(this.recordAgentChoice(record));
+    return record;
   }
 
   /** Выкинуть из истории пустые сессии (кроме активной). */
   private pruneEmptySessions(store: ProjectStore, projectPath: string) {
     const displayed = this.savedBoardRecordIds(projectPath);
     store.sessions = store.sessions.filter(
-      (s) => s.id === store.activeId || displayed.has(s.id) || hasUserContent(s.items),
+      (s) => s.id === store.activeId || displayed.has(s.id) || hasUserContent(s.items) || shouldPreserveTask(s.task),
     );
   }
 
   private async mutateActiveRecord(projectPath: string, fn: (rec: SessionRecord) => void) {
-    const store = this.getProjectStore(projectPath);
-    const rec = store.sessions.find((s) => s.id === store.activeId);
-    if (!rec) return;
-    fn(rec);
-    rec.updatedAt = Date.now();
-    await this.saveProjectStore(projectPath, store);
+    await this.mutateProjectStore(projectPath, store => {
+      const rec = store.sessions.find((s) => s.id === store.activeId);
+      if (!rec) return false;
+      fn(rec);
+      rec.updatedAt = Date.now();
+    });
   }
 
   /** Мутация конкретной записи по id — не «активной»: пока ход шёл, пользователь
@@ -2755,12 +2811,80 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     recordId: string,
     fn: (rec: SessionRecord) => void,
   ) {
-    const store = this.getProjectStore(projectPath);
-    const rec = store.sessions.find((s) => s.id === recordId);
-    if (!rec) return;
-    fn(rec);
-    rec.updatedAt = Date.now();
-    await this.saveProjectStore(projectPath, store);
+    await this.mutateProjectStore(projectPath, store => {
+      const rec = store.sessions.find((s) => s.id === recordId);
+      if (!rec) return false;
+      fn(rec);
+      rec.updatedAt = Date.now();
+    });
+  }
+
+  private postTaskState(projectPath: string, record: SessionRecord | null | undefined, chatId?: string, requestId?: string, error?: string) {
+    const task = isTaskState(record?.task) ? record.task : undefined;
+    const invalidSavedTask = record?.task !== undefined && !task;
+    this.postScoped(projectPath, {
+      type: "taskState", identity: record ? { projectKey: projectPath, recordId: record.id, createdAt: record.createdAt } : null,
+      revision: task?.revision ?? 0, ...(task ? { task } : {}), ...(requestId ? { requestId } : {}),
+      ...(error || this.storeRecoveryError || invalidSavedTask
+        ? { error: error ?? this.storeRecoveryError ?? "Сохранённые заметки имеют неподдерживаемый формат." } : {}),
+    }, chatId);
+  }
+
+  /** Recheck identity and revision inside the write queue; no model or prompt operations. */
+  private async saveTaskState(msg: Extract<WebviewToHost, { type: "saveTaskState" }>, source: "vscode" | "remote", surface?: string) {
+    await this.serializeRecordWrite(async () => {
+      const validChatId = msg.chatId === undefined || (typeof msg.chatId === "string" && msg.chatId.length > 0 && msg.chatId.length <= 160);
+      const requestId = typeof msg.requestId === "string" && msg.requestId.length > 0 && msg.requestId.length <= 160 ? msg.requestId : undefined;
+      const boardSurface = source === "vscode" && surface === "multi-panel";
+      // A renderer may only address records owned by its actual surface. Remote clients use the ordinary active chat.
+      if ((boardSurface && (!validChatId || msg.chatId === undefined)) || (!boardSurface && msg.chatId !== undefined)) {
+        const error = "Запрос заметок не соответствует открытому чату. Обновите представление.";
+        if (boardSurface) this.multiPanel?.webview.postMessage({ type: "taskState", identity: null, revision: 0, requestId, error } satisfies HostToWebview);
+        else {
+          const active = this.getActiveProject();
+          const key = active ? projectKey(active) : "";
+          this.postTaskState(key, key ? this.getActiveRecord(key) : null, undefined, requestId, error);
+        }
+        return;
+      }
+      const chatId = validChatId ? msg.chatId : undefined;
+      const slot = this.findChatSlot(chatId);
+      const project = chatId ? this.getProjects().find(entry => projectKey(entry) === slot?.projectPath) : this.getActiveProject();
+      const key = project ? projectKey(project) : "";
+      const store = key ? this.getProjectStore(key) : null;
+      const record = store?.sessions.find(entry => entry.id === (chatId ? slot?.recordId : store.activeId));
+      const reject = (error: string) => this.postTaskState(key, record, chatId, requestId, error);
+      if (!validChatId || !requestId || !isTaskIdentity(msg.identity) ||
+          !Number.isSafeInteger(msg.revision) || msg.revision < 0 || msg.revision >= Number.MAX_SAFE_INTEGER) {
+        reject("Некорректный запрос сохранения заметок. Обновите чат."); return;
+      }
+      if ((surface === "multi-panel" && !chatId) || !record || key !== msg.identity.projectKey ||
+          record.id !== msg.identity.recordId || record.createdAt !== msg.identity.createdAt) {
+        reject("Сессия изменилась. Заметки не сохранены; откройте нужный чат."); return;
+      }
+      const fieldError = validateTaskFields(msg.fields);
+      if (fieldError) { reject(fieldError); return; }
+      if (record.task !== undefined && !isTaskState(record.task)) {
+        reject("Сохранённые заметки имеют неподдерживаемый формат; запись не изменена."); return;
+      }
+      if ((record.task?.revision ?? 0) !== msg.revision) {
+        reject("Заметки изменены в другом представлении чата. Сверьте сохранённую версию перед повтором."); return;
+      }
+      const updatedAt = Date.now();
+      const next: SessionRecord = { ...record, updatedAt, task: { ...msg.fields, schemaVersion: 1, revision: msg.revision + 1, updatedAt } };
+      const nextStore = { ...store!, sessions: store!.sessions.map(entry => entry === record ? next : entry) };
+      try {
+        await this.saveProjectStore(key, nextStore);
+      } catch {
+        reject(this.storeRecoveryError ?? "Не удалось сохранить заметки. Ваш текст остаётся в карточке; повторите попытку."); return;
+      }
+      this.postTaskState(key, next, chatId, requestId);
+      // Other surfaces displaying the same logical conversation share these notes.
+      if (chatId && this.getActiveRecord(key)?.id === next.id) this.postTaskState(key, next);
+      for (const other of this.getChatSlots()) {
+        if (other.chatId !== chatId && other.projectPath === key && other.recordId === next.id) this.postTaskState(key, next, other.chatId);
+      }
+    });
   }
 
   /** Полное состояние для webview: проекты, лента активной сессии, session id. */
@@ -2772,6 +2896,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const rec = this.getActiveRecord(projectKey(active));
       this.postRecordAgent(projectKey(active), rec);
       this.post({ type: "transcript", path: projectKey(active), items: rec?.items ?? [] });
+      this.postTaskState(projectKey(active), rec);
       // Скоуп обязателен: burst идёт до ре-рендера webview, и фолбэк на
       // activeRef разложил бы состояние под старым проектом (баг из ревью).
       this.postScoped(projectKey(active), {
@@ -3154,6 +3279,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
     }
     if (project && record) {
+      const recordId = record.id;
+      record = this.getProjectStore(projectKey(project)).sessions.find(entry => entry.id === recordId) ?? null;
+    }
+    if (project && record) {
       this.postRecordModel(projectKey(project), record, agent, chatId);
       this.postRecordEfforts(projectKey(project), record, chatId);
     }
@@ -3352,14 +3481,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           return;
         }
         const previous = record.effortOverrides;
+        const recordId = record.id;
         let persisted = false;
         try {
-          await this.mutateRecord(key, record.id, (entry) => {
+          await this.mutateRecord(key, recordId, (entry) => {
             const overrides = { ...entry.effortOverrides };
             if (value) overrides[agent] = value; else delete overrides[agent];
             entry.effortOverrides = overrides;
           });
           persisted = true;
+          record = this.getProjectStore(key).sessions.find(entry => entry.id === recordId) ?? record;
           await this.rememberAgentChoice(this.recordAgentChoice(record, slot?.agent ?? record.preferredAgent ?? agent));
         } catch {
           if (!persisted) record.effortOverrides = previous;
@@ -3560,9 +3691,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId ? { ...entry, recordId: id } : entry));
       await this.postMultiState(chatId);
     } else {
-      store.activeId = id;
-      this.pruneEmptySessions(store, projectKey(project));
-      await this.saveProjectStore(projectKey(project), store);
+      await this.mutateProjectStore(projectKey(project), current => {
+        if (!current.sessions.some(entry => entry.id === id)) return false;
+        current.activeId = id;
+        this.pruneEmptySessions(current, projectKey(project));
+      });
       this.postFullState();
     }
   }
@@ -3580,9 +3713,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       else this.post(event);
       return;
     }
-    let store = this.getProjectStore(projectKey(project));
-    if (!slot) this.pruneEmptySessions(store, projectKey(project));
-    await this.saveProjectStore(projectKey(project), store);
+    let store = await this.mutateProjectStore(projectKey(project), current => {
+      if (!slot) this.pruneEmptySessions(current, projectKey(project));
+      return current;
+    });
     if (store.sessions.length === 0) {
       const event = { type: "info", text: "История сессий этого проекта пуста." } as const;
       if (slot) this.postScoped(slot.projectPath, event, chatId);
@@ -3651,7 +3785,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (choice !== "Удалить") return;
       await this.serializeMultiMutation(async () => {
         const key = projectKey(project);
-        store = this.getProjectStore(key);
         const affected = this.getChatSlots().filter((entry) => entry.projectPath === key && entry.recordId === rec.id);
         if (this.runs.has(key) || affected.some((entry) => this.runs.has(entry.chatId))) {
           const event = { type: "error", message: "Эта сессия используется работающим чатом — сначала остановите его." } as const;
@@ -3659,17 +3792,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           else this.post(event);
           return;
         }
-        store.sessions = store.sessions.filter((entry) => entry.id !== rec.id);
-        if (store.activeId === rec.id) {
-          const latest = [...store.sessions].sort((a, b) => b.updatedAt - a.updatedAt)[0];
-          store.activeId = latest?.id ?? null;
-        }
-        const replacements = new Map(affected.map((entry) => {
-          const replacement = this.createRecord();
-          store.sessions.push(replacement);
-          return [entry.chatId, replacement.id];
-        }));
-        await this.saveProjectStore(key, store);
+        const replacements = await this.mutateProjectStore(key, current => {
+          store = current;
+          store.sessions = store.sessions.filter((entry) => entry.id !== rec.id);
+          if (store.activeId === rec.id) {
+            const latest = [...store.sessions].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+            store.activeId = latest?.id ?? null;
+          }
+          return new Map(affected.map((entry) => {
+            const replacement = this.createRecord();
+            store.sessions.push(replacement);
+            return [entry.chatId, replacement.id];
+          }));
+        });
         if (replacements.size) {
           await this.saveChatSlots(this.getChatSlots().map((entry) => replacements.has(entry.chatId)
             ? { ...entry, recordId: replacements.get(entry.chatId)! } : entry));
@@ -3695,9 +3830,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId ? { ...entry, recordId: picked.sessionId } : entry));
             await this.postMultiState(chatId);
           } else {
-            store.activeId = picked.sessionId;
-            this.pruneEmptySessions(store, projectKey(project));
-            await this.saveProjectStore(projectKey(project), store);
+            await this.mutateProjectStore(projectKey(project), current => {
+              if (!current.sessions.some(entry => entry.id === picked.sessionId)) return false;
+              store = current;
+              store.activeId = picked.sessionId;
+              this.pruneEmptySessions(store, projectKey(project));
+            });
             this.postFullState();
           }
         });
@@ -3720,20 +3858,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.postScoped(slot.projectPath, { type: "error", message: "Дождитесь окончания хода или остановите его перед созданием новой сессии." }, chatId);
         return;
       }
-      const previousStore = this.getProjectStore(slot.projectPath);
-      const store = { ...previousStore, sessions: [...previousStore.sessions] };
       // A fresh identity prevents a delayed save from the old view entering the new session.
       const record = this.createRecord();
-      const previous = store.sessions.find((entry) => entry.id === slot.recordId);
-      const choice = this.defaultAgentChoice("newChat", this.recordAgentChoice(previous, slot.agent));
-      this.applyAgentChoice(record, choice);
-      store.sessions.push(record);
-      await this.saveProjectStore(slot.projectPath, store);
+      const choice = await this.mutateProjectStore(slot.projectPath, store => {
+        const previous = store.sessions.find((entry) => entry.id === slot.recordId);
+        const selected = this.defaultAgentChoice("newChat", this.recordAgentChoice(previous, slot.agent));
+        this.applyAgentChoice(record, selected);
+        store.sessions.push(record);
+        return selected;
+      });
       await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId
         ? { ...entry, recordId: record.id, agent: choice.agent } : entry));
       await this.rememberVisibleChoice(choice);
-      this.pruneEmptySessions(store, slot.projectPath);
-      await this.saveProjectStore(slot.projectPath, store);
+      await this.mutateProjectStore(slot.projectPath, store => this.pruneEmptySessions(store, slot.projectPath));
       await this.postMultiState(chatId);
       this.postScoped(slot.projectPath, { type: "info", text: "Новая сессия." }, chatId);
       return;
@@ -3745,40 +3882,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     let keptPrevious = false;
     if (active) {
-      const previousStore = this.getProjectStore(projectKey(active));
-      const store = { ...previousStore, sessions: [...previousStore.sessions] };
-      let current = store.sessions.find((s) => s.id === store.activeId);
-      const choice = this.defaultAgentChoice("newChat", current ? this.recordAgentChoice(current) : undefined);
-      const displayed = this.savedBoardRecordIds(projectKey(active));
-      if (current && !hasUserContent(current.items) && !displayed.has(current.id)) {
-        current = { ...current };
-        store.sessions[store.sessions.findIndex((record) => record.id === current!.id)] = current;
-        // Пустую активную не сохраняем в историю — обнуляем и переиспользуем.
-        current.items = [];
-        current.agentIds = { claude: null, codex: null };
-        current.title = "Новая сессия";
-        current.createdAt = Date.now();
-        current.updatedAt = Date.now();
-        current.context = {};
-        current.models = {};
-        current.chatLog = [];
-        current.chatSeen = {};
-        current.modelOverrides = {};
-        this.applyAgentChoice(current, choice);
-        current.lastPrompts = {};
-      } else {
-        keptPrevious = !!current;
-        const rec = this.createRecord();
-        this.applyAgentChoice(rec, choice);
-        store.sessions.push(rec);
-        store.activeId = rec.id;
-      }
-      this.pruneEmptySessions(store, projectKey(active));
-      // Кап истории: держим самые свежие.
-      store.sessions = [...store.sessions]
-        .sort((a, b) => b.updatedAt - a.updatedAt)
-        .filter((record, index) => index < MAX_SESSIONS_PER_PROJECT || displayed.has(record.id) || record.id === store.activeId);
-      await this.saveProjectStore(projectKey(active), store);
+      const choice = await this.mutateProjectStore(projectKey(active), store => {
+        let current = store.sessions.find((s) => s.id === store.activeId);
+        const selected = this.defaultAgentChoice("newChat", current ? this.recordAgentChoice(current) : undefined);
+        const displayed = this.savedBoardRecordIds(projectKey(active));
+        if (current && !hasUserContent(current.items) && !shouldPreserveTask(current.task) && !displayed.has(current.id)) {
+          current = { ...current };
+          store.sessions[store.sessions.findIndex((record) => record.id === current!.id)] = current;
+          // Пустую активную не сохраняем в историю — обнуляем и переиспользуем.
+          current.items = [];
+          current.agentIds = { claude: null, codex: null };
+          current.title = "Новая сессия";
+          current.createdAt = Math.max(Date.now(), current.createdAt + 1);
+          current.updatedAt = Date.now();
+          current.context = {};
+          current.models = {};
+          current.chatLog = [];
+          current.chatSeen = {};
+          current.modelOverrides = {};
+          this.applyAgentChoice(current, selected);
+          current.lastPrompts = {};
+          delete current.task;
+        } else {
+          keptPrevious = !!current;
+          const rec = this.createRecord();
+          this.applyAgentChoice(rec, selected);
+          store.sessions.push(rec);
+          store.activeId = rec.id;
+        }
+        this.pruneEmptySessions(store, projectKey(active));
+        // Unknown task formats must not be silently discarded by the normal history cap.
+        store.sessions = [...store.sessions]
+          .sort((a, b) => b.updatedAt - a.updatedAt)
+          .filter((record, index) => index < MAX_SESSIONS_PER_PROJECT || displayed.has(record.id) || record.id === store.activeId ||
+            (record.task !== undefined && !isTaskState(record.task)));
+        return selected;
+      });
       await this.rememberVisibleChoice(choice);
     }
     this.postFullState();
@@ -3798,7 +3937,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const chatEvents = new Set([
       "projects", "transcript", "busy", "activity", "sessionInfo", "userMessage",
       "textDelta", "assistantText", "toolUse", "turnResult", "info", "error", "reset",
-      "permissionRequest", "permissionResolved", "contextUsage", "modelInfo", "effortInfo", "agentInfo", "draftHandled",
+      "permissionRequest", "permissionResolved", "contextUsage", "modelInfo", "effortInfo", "agentInfo", "draftHandled", "taskState",
     ]);
     if (!chatEvents.has(msg.type)) this.multiPanel?.webview.postMessage(msg);
     this.remote?.broadcast(msg);
@@ -3861,7 +4000,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     serialized = false,
   ): Promise<void> {
     if (!serialized && (
-      ["selectAgent", "selectProject", "moveProject", "reorderProjects", "openMultiChat", "createChat", "removeChat", "selectChatProject", "selectChatSession", "selectChatAgent", "newSession", "saveTranscript"].includes(msg.type) ||
+      ["selectAgent", "selectProject", "moveProject", "reorderProjects", "openMultiChat", "createChat", "removeChat", "selectChatProject", "selectChatSession", "selectChatAgent", "newSession", "saveTranscript", "saveTaskState"].includes(msg.type) ||
       msg.type === "ready" || (surface === "multi-panel" && msg.type === "multiStateReady")
     )) {
       return this.serializeMultiMutation(() => this.onMessage(msg, source, client, surface, true));
@@ -3887,6 +4026,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     switch (msg.type) {
+      case "saveTaskState":
+        await this.saveTaskState(msg, source, surface);
+        break;
       case "ready":
         if (surface === "multi-panel" && msg.chatId) await this.postMultiState(msg.chatId);
         else if (surface === "multi-panel") await this.ensureMultiChats();
@@ -4084,22 +4226,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.manageProjects(msg.chatId);
         break;
       case "saveTranscript": {
-        const store = this.getProjectStore(msg.path);
-        const slot = this.findChatSlot(msg.chatId);
-        const rec = msg.chatId
-          ? (slot?.projectPath === msg.path && slot.recordId === msg.recordId
-            ? store.sessions.find((s) => s.id === slot.recordId) : undefined)
-          : store.sessions.find((s) => s.id === store.activeId);
-        if (rec) {
+        let titleChanged = false;
+        await this.mutateProjectStore(msg.path, store => {
+          const slot = this.findChatSlot(msg.chatId);
+          const rec = msg.chatId
+            ? (slot?.projectPath === msg.path && slot.recordId === msg.recordId
+              ? store.sessions.find((s) => s.id === slot.recordId) : undefined)
+            : store.sessions.find((s) => s.id === store.activeId);
+          if (!rec) return false;
           const previousTitle = rec.title;
           rec.items = msg.items.slice(-TRANSCRIPT_MAX_ITEMS);
           rec.updatedAt = Date.now();
           if (rec.title === "Новая сессия") {
             rec.title = deriveTitle(rec.items) ?? rec.title;
           }
-          await this.saveProjectStore(msg.path, store);
-          if (msg.chatId && rec.title !== previousTitle) this.postMultiBoardState();
-        }
+          titleChanged = rec.title !== previousTitle;
+        });
+        if (msg.chatId && titleChanged) this.postMultiBoardState();
         break;
       }
       case "showSessions":
@@ -5116,22 +5259,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
   }
 
-  /** Allowlist из настроек: имена инструментов и префиксы bash-команд (раздел 8.5). */
+  /** Bash uses its command policy even when listed in the general tool allowlist. */
   private isAutoAllowed(toolName: string, input: unknown): boolean {
     const cfg = vscode.workspace.getConfiguration("agentHub");
-    const tools = cfg.get<string[]>("autoAllowTools", []);
-    if (tools.includes(toolName)) return true;
-
     if (toolName === "Bash") {
-      const prefixes = cfg.get<string[]>("autoAllowBash", []);
-      const command = (input as { command?: unknown } | null)?.command;
-      if (typeof command === "string") {
-        return prefixes.some(
-          (p) => command === p || command.startsWith(p.endsWith(" ") ? p : p + " "),
-        );
-      }
+      return isBashAutoAllowed(
+        (input as { command?: unknown } | null)?.command,
+        cfg.get<unknown>("autoAllowBash", []),
+      );
     }
-    return false;
+    const tools = cfg.get<unknown>("autoAllowTools", []);
+    return Array.isArray(tools) && tools.includes(toolName);
   }
 
   dispose() {

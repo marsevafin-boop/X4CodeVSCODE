@@ -4,6 +4,7 @@
  */
 
 import type { AgentDefaults } from "./agentDefaults";
+import type { TaskFields, TaskIdentity, TaskState } from "./taskState";
 
 /** Какие агенты доступны в переключателе. */
 export type AgentId = "claude" | "codex";
@@ -56,6 +57,7 @@ export interface SlashCommandInfo {
 /** webview → extension */
 export type WebviewToHost =
   | { type: "ready"; chatId?: string }
+  | { type: "saveTaskState"; identity: TaskIdentity; revision: number; fields: TaskFields; requestId: string; chatId?: string }
   | { type: "openMultiChat" }
   | { type: "setCompactMode"; enabled: boolean }
   | { type: "multiStateReady"; chatIds: string[] }
@@ -167,6 +169,7 @@ export type WebviewToHost =
  * Пустой path трактуется как «активный проект».
  */
 export type HostToWebview =
+  | { type: "taskState"; identity: TaskIdentity | null; revision: number; task?: TaskState; requestId?: string; error?: string; path?: string; chatId?: string }
   | { type: "chatProjectRejected"; chatId: string; requestedProjectPath: string; projectPath: string; recordId: string; agent: AgentId; message: string }
   | { type: "busy"; value: boolean; path?: string; chatId?: string }
   | { type: "activity"; label: string; path?: string; chatId?: string }

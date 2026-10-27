@@ -21,6 +21,8 @@ import type {
 
 import { projectKey } from "../src/shared/projectIdentity";
 import { AgentDefaultsSettings } from "./AgentDefaultsSettings";
+import { TaskCheckpoint, type TaskSnapshot } from "./TaskCheckpoint";
+import { appendTaskCheckpoint, isTaskIdentity } from "../src/shared/taskState";
 
 import {
   beginServerTest, finishServerTest, idleServerTest, reconcileServerTest, serverTestFingerprint,
@@ -44,14 +46,14 @@ const CHAT_COMMAND_TYPES = new Set([
   "ready", "send", "steer", "saveTranscript", "permission", "newSession", "finishSession",
   "showSessions", "showContext", "pickModel", "pickEffort", "stop", "choose",
   "selectChatProject", "selectChatSession", "selectChatAgent", "pickAttachment", "saveAttachment",
-  "manageSecretEnv", "sendSecretEnv", "manageProjects", "getSettings", "saveSettings",
+  "manageSecretEnv", "sendSecretEnv", "manageProjects", "getSettings", "saveSettings", "saveTaskState",
 ]);
 const CHAT_EVENT_TYPES = new Set([
   "busy", "activity", "sessionInfo", "userMessage", "transcript", "contextUsage", "modelInfo",
   "draftHandled", "choices", "attachmentAdded", "ask", "permissionResolved", "toolUse",
   "toolResult", "assistantText", "textDelta", "error", "info", "meta", "turnResult",
   "permissionRequest", "reset", "settings", "configJson", "openSettingsScreen", "chatProjectRejected",
-  "agentInfo", "effortInfo",
+  "agentInfo", "effortInfo", "taskState",
 ]);
 
 interface MultiChatSlotView {
@@ -270,6 +272,12 @@ function ChatTile({
   const [agent, setAgent] = useState<AgentId>(initialAgent ?? "claude");
   const [agentReady, setAgentReady] = useState(initialAgent !== undefined);
   const [draft, setDraft] = useState("");
+  const [taskSnapshot, setTaskSnapshot] = useState<TaskSnapshot | null>(null);
+  const taskSnapshotRef = useRef<TaskSnapshot | null>(null);
+  const updateTaskSnapshot = useCallback((snapshot: TaskSnapshot | null) => {
+    taskSnapshotRef.current = snapshot;
+    setTaskSnapshot(snapshot);
+  }, []);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   /** Что делать с сообщением, отправленным во время хода: сразу / на шаге / после. */
@@ -560,6 +568,7 @@ function ChatTile({
           if (!chatId) break;
           const slot = msg.chats.find((entry) => entry.chatId === chatId);
           if (!slot || (pendingProjectRef.current && slot.projectPath !== pendingProjectRef.current)) break;
+          if (slot.projectPath !== bindingRef.current.projectPath || slot.recordId !== bindingRef.current.recordId) updateTaskSnapshot(null);
           bindingRef.current = { projectPath: slot.projectPath, recordId: slot.recordId };
           pendingProjectRef.current = null;
           setProjectSwitching(false);
@@ -600,7 +609,9 @@ function ChatTile({
               (!pendingProjectRef.current || msg.activePath === pendingProjectRef.current))) {
             if (msg.activePath !== activeRef.current) {
               clearServerTest();
+              updateTaskSnapshot(null);
               if (!chatId) {
+                bindingRef.current = { projectPath: msg.activePath, recordId: undefined };
                 pendingAgentRef.current = null;
                 pendingSessionRef.current = null;
                 setAgentSwitching(false);
@@ -627,6 +638,17 @@ function ChatTile({
           setCtxBy(prune);
           setModelsBy(prune);
           setEffortsBy(prune);
+          break;
+        }
+        case "taskState": {
+          if (p !== activeRef.current) break;
+          if (msg.identity && (!isTaskIdentity(msg.identity) || msg.identity.projectKey !== p ||
+              (bindingRef.current.recordId && msg.identity.recordId !== bindingRef.current.recordId))) break;
+          const previous = taskSnapshotRef.current;
+          if (previous?.identity && msg.identity && previous.identity.recordId === msg.identity.recordId &&
+              (msg.identity.createdAt < previous.identity.createdAt ||
+                (msg.identity.createdAt === previous.identity.createdAt && msg.revision < previous.revision))) break;
+          updateTaskSnapshot(msg);
           break;
         }
         case "transcript": {
@@ -687,11 +709,18 @@ function ChatTile({
           if (chatId && msg.recordId && msg.recordId !== bindingRef.current.recordId) break;
           const pending = pendingAgentRef.current;
           if (pending && (msg.requestedAgent ? msg.requestedAgent !== pending : msg.agent !== pending)) break;
+          const recordChanged = !chatId && !!msg.recordId && bindingRef.current.recordId !== msg.recordId;
+          if (!chatId && msg.recordId) {
+            if (recordChanged) updateTaskSnapshot(null);
+            bindingRef.current = { projectPath: p, recordId: msg.recordId };
+          }
           pendingAgentRef.current = null;
           pendingSessionRef.current = null;
           setAgentSwitching(false);
           setAgentReady(true);
           setAgent(msg.agent);
+          // Earlier hydration was rejected while this session request was pending.
+          if (recordChanged && msg.contextRequestId) post({ type: "ready" });
           if (msg.error) mutateItems(p, (items) => [...items, { id: nextId++, role: "error", text: msg.error! }]);
           break;
         }
@@ -821,7 +850,7 @@ function ChatTile({
     window.addEventListener("message", onMessage);
     post({ type: "ready" });
     return () => window.removeEventListener("message", onMessage);
-  }, [appendDelta, finalizeStreaming, mutateItems, dispatchSend, clearServerTest, updateServerTest, post, chatId]);
+  }, [appendDelta, finalizeStreaming, mutateItems, dispatchSend, clearServerTest, updateServerTest, updateTaskSnapshot, post, chatId]);
 
   // Ленты сохраняются на хосте; шлём ТОЛЬКО изменившиеся (по ссылке) —
   // иначе фоновый стрим мог бы перезаписать только что переключённую сессию
@@ -1016,13 +1045,17 @@ function ChatTile({
     }
     if (value === activeRef.current) return;
     clearServerTest();
+    updateTaskSnapshot(null);
     pendingAgentRef.current = null;
     pendingSessionRef.current = null;
     setAgentSwitching(false);
     if (chatId) {
       pendingProjectRef.current = value;
       setProjectSwitching(true);
-    } else setAgentReady(false);
+    } else {
+      bindingRef.current = { projectPath: value, recordId: undefined };
+      setAgentReady(false);
+    }
     activeRef.current = value;
     setActivePath(value);
     post(chatId
@@ -1085,9 +1118,26 @@ function ChatTile({
     setDraggedProject(null);
   };
 
+  // Keep the same keyed editor mounted on settings/archive screens, including pending save acknowledgements.
+  const taskCard = taskSnapshot && activePath ? (
+    <TaskCheckpoint
+      key={JSON.stringify(taskSnapshot.identity)}
+      snapshot={taskSnapshot}
+      hidden={settingsOpen || archiveOpen}
+      disabled={!agentReady || agentSwitching}
+      onSave={post}
+      onInsert={fields => {
+        setDraft(previous => appendTaskCheckpoint(previous, fields));
+        setSlashDismissed(true);
+        composerRef.current?.focus();
+      }}
+    />
+  ) : null;
+
   if (archiveOpen) {
     return (
       <div className="app">
+        {taskCard}
         <header className="topbar">
           <button className="finish-btn" onClick={() => setArchiveOpen(false)}>← Назад</button>
           <span className="session">Архив Agent Hub</span>
@@ -1102,6 +1152,7 @@ function ChatTile({
   if (settingsOpen) {
     return (
       <div className="app">
+        {taskCard}
         <header className="topbar">
           <button className="finish-btn" onClick={closeSettings}>
             ← Назад
@@ -1882,6 +1933,8 @@ function ChatTile({
           🧠
         </button>
       </div>
+
+      {taskCard}
 
       <main className="feed" ref={feedRef} onScroll={updateAtBottom}>
         {items.length === 0 && (
