@@ -6,9 +6,21 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { after, test } from "node:test";
 import { build } from "esbuild";
 const temp = await mkdtemp(join(tmpdir(), "agent-hub-archive-paths-"));
-after(async () => { await rm(temp, { recursive: true, force: true }); });
+const fsKey = Symbol.for("agent-hub-archive-paths-fs");
+const filesystem = { lstat };
+globalThis[fsKey] = filesystem;
+after(async () => { delete globalThis[fsKey]; await rm(temp, { recursive: true, force: true }); });
 const outfile = join(temp, "paths.mjs");
-await build({ entryPoints: [fileURLToPath(new URL("../src/projectArchive.ts", import.meta.url))], outfile, bundle: true, platform: "node", format: "esm" });
+await build({
+  entryPoints: [fileURLToPath(new URL("../src/projectArchive.ts", import.meta.url))], outfile, bundle: true, platform: "node", format: "esm",
+  plugins: [{ name: "archive-filesystem", setup(b) {
+    b.onResolve({ filter: /^node:fs\/promises$/, namespace: "file" }, ({ path }) => ({ path, namespace: "archive-fs" }));
+    b.onLoad({ filter: /.*/, namespace: "archive-fs" }, () => ({ contents: `
+      export * from "node:fs/promises";
+      export const lstat = (...args) => globalThis[Symbol.for("agent-hub-archive-paths-fs")].lstat(...args);
+    ` }));
+  } }],
+});
 const { normalizeProjectArchive, directoriesOverlap, pathEntryExists, planProjectMove, executeProjectMove } = await import(pathToFileURL(outfile).href);
 async function fixture() { const parent = await mkdtemp(join(temp, "paths-")); const folder = join(parent, "project"); await mkdir(folder); return { parent, folder }; }
 
@@ -74,10 +86,17 @@ test("move rolls back a failed persist and reports preserved paths when rollback
   assert.equal((await lstat(plan.destination)).isDirectory(), true);
 });
 
-test("rollback never overwrites a newly occupied source and path lookup propagates filesystem errors", async () => {
+test("rollback never overwrites a newly occupied source and path lookup propagates filesystem errors", async (t) => {
   const { folder } = await fixture(); const plan = await planProjectMove(folder);
   await assert.rejects(executeProjectMove(plan, { rename, persist: async () => { await mkdir(folder); throw new Error("save failed"); } }), /Исходный путь уже занят/);
   assert.equal((await lstat(plan.destination)).isDirectory(), true);
   const notDirectory = join(folder, "file"); await writeFile(notDirectory, "file");
-  await assert.rejects(pathEntryExists(join(notDirectory, "nested")), { code: "ENOTDIR" });
+  const lookupPath = join(notDirectory, "nested");
+  const lookupError = Object.assign(new Error("lstat failed"), { code: "ENOTDIR" });
+  // A file ancestor yields ENOENT on Windows; inject ENOTDIR to test propagation on every OS.
+  t.mock.method(filesystem, "lstat", async (value) => {
+    if (value === lookupPath) throw lookupError;
+    return lstat(value);
+  });
+  await assert.rejects(pathEntryExists(lookupPath), (error) => error === lookupError);
 });

@@ -20,6 +20,15 @@ await build({
   entryPoints: [fileURLToPath(new URL("../src/ChatViewProvider.ts", import.meta.url))],
   outfile, bundle: true, platform: "node", format: "esm",
   plugins: [{ name: "profile-provider-dependencies", setup(b) {
+    b.onResolve({ filter: /^node:os$/, namespace: "file" }, ({ path }) => ({ path, namespace: "profile-platform" }));
+    b.onLoad({ filter: /.*/, namespace: "profile-platform" }, () => {
+      const h = 'globalThis[Symbol.for("agent-hub-profile-tests")].current';
+      return { contents: `
+        export * from "node:os"; export { default } from "node:os";
+        import { homedir as nativeHomedir } from "node:os";
+        export const homedir = () => ${h}?.homedir ?? nativeHomedir();
+      ` };
+    });
     b.onResolve({ filter: /^(vscode|qrcode|node:child_process)$|^\.\/agents\/|^\.\/remoteServer$|^\.\/journal$|^\.\/serverConnection$/ }, ({ path }) => ({ path, namespace: "stub" }));
     b.onLoad({ filter: /.*/, namespace: "stub" }, ({ path }) => {
       const h = 'globalThis[Symbol.for("agent-hub-profile-tests")].current';
@@ -191,14 +200,56 @@ test("a sibling added during registry cleanup still prevents physical folder del
   assert.ok(p.messages.some((m) => m.type === "info" && /папка сохранена/iu.test(m.text)));
 });
 
-test("legacy configured paths are normalized before identity comparison", async () => {
+test("legacy configured tilde paths use the settings snapshot key for updates", async () => {
   const path = "~/agent-hub-fixture-project";
-  const expanded = join(homedir(), "agent-hub-fixture-project");
+  const expanded = `${homedir()}/agent-hub-fixture-project`;
   const { h, p } = setup([{ path, name: "Legacy" }]);
-  await p.applySettings({ project: { path: expanded, name: "Changed" }, claude: {}, codex: {} });
+  const form = await p.buildSettingsSnapshot();
+  assert.equal(form.project.path, expanded);
+  await p.onMessage({ type: "saveSettings", settings: { ...form, project: { ...form.project, name: "Changed" } } });
   assert.equal(h.settings.projects.length, 1);
   assert.equal(p.getProjects()[0].name, "Changed");
 });
+
+for (const [platform, home] of [["Windows", "C:\\Users\\agent-hub-fixture"], ["POSIX", "/home/agent-hub-fixture"]]) {
+  test(`settings round-trip preserves historical ${platform} keys, history and secrets`, async () => {
+    for (const fixture of [
+      { path: "~/parent/../project", expanded: `${home}/parent/../project` },
+      { path: "~//project", expanded: `${home}//project` },
+      { path: "~/project/", expanded: `${home}/project/` },
+      { path: `${home}/literal/../project//`, expanded: `${home}/literal/../project//` },
+      { id: "project-historical-fixture", path: "~/parent/../project//", expanded: `${home}/parent/../project//` },
+    ]) {
+      const historicalKey = fixture.id ?? fixture.expanded;
+      const { h, p, secrets } = setup([{ ...(fixture.id ? { id: fixture.id } : {}), path: fixture.path, name: "Legacy" }]);
+      h.homedir = home;
+      const record = await p.ensureActiveRecord(historicalKey);
+      const history = [{ role: "user", text: "Historical fixture" }];
+      record.items = history;
+      await p.saveProjectStore(historicalKey, p.getProjectStore(historicalKey));
+      secrets.set(`agentHub.serverPassword:${historicalKey}`, "historical-password-fixture");
+      secrets.set(`agentHub.secretEnv:${historicalKey}`, JSON.stringify({ HISTORICAL: "env-fixture" }));
+      await p.setActivePath(historicalKey);
+
+      const form = await p.buildSettingsSnapshot();
+      assert.equal(form.project.path, fixture.expanded);
+      assert.equal(key(form.project), historicalKey);
+      // The UI changes the name and sends the snapshot's read-only path back unchanged.
+      await p.onMessage({ type: "saveSettings", settings: { ...form, project: { ...form.project, name: "Changed" } } });
+
+      const saved = await p.buildSettingsSnapshot();
+      assert.equal(h.settings.projects.length, 1);
+      assert.equal(saved.project.name, "Changed");
+      assert.equal(saved.project.path, fixture.expanded);
+      assert.equal(key(saved.project), historicalKey);
+      assert.equal(p.getActiveRecord(key(saved.project)).id, record.id);
+      assert.deepEqual(p.getActiveRecord(key(saved.project)).items, history);
+      assert.equal(saved.projectHasPassword, true);
+      assert.equal(secrets.get(`agentHub.serverPassword:${key(saved.project)}`), "historical-password-fixture");
+      assert.deepEqual(await p.getSecretEnv(key(saved.project)), { HISTORICAL: "env-fixture" });
+    }
+  });
+}
 
 test("normalization and import preserve valid IDs and merge by ID instead of folder", async () => {
   const { h, p } = setup([a, b]);
